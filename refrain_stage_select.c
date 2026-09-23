@@ -10,11 +10,11 @@ static volatile int g_StageSelected = 0;
 static volatile int g_CancelToTitle = 0; // set when player cancels back to title
 static volatile int g_MenuCursor = 0;   // 0 to 4 (Stage index)
 static volatile int g_ActiveColumn = 0; // 0=Stage, 1=MEFA, 2=CR Stock, 3=CR Gauge
-static volatile int g_MefaCursor = 2;   // 0 to 6 (default: 2)
-static volatile int g_CrStockCursor = 1; // 0 to 3 (default: 1)
+static volatile int g_MefaCursor = 2;   // 0 to 6 (default: 2 stocks = 200.0f)
+static volatile int g_CrStockCursor = 1; // 0 to 3 (default: 1 stock)
 static volatile int g_CrGaugeCursor = 0; // 0 to 4 (default: 0%)
-static volatile DWORD g_SelectedMefa = 2;
-static volatile DWORD g_SelectedCrDword = 0x42c80000; // 100.0f
+static volatile DWORD g_SelectedMefaDword = 0x43480000; // 200.0f (2 stocks)
+static volatile DWORD g_SelectedCrDword = 0x42c80000;   // 100.0f (1 stock, 0%)
 static volatile int g_PendingStageInitStats = 0;
 static volatile int g_StageInitRenderFrames = 0;
 
@@ -177,6 +177,14 @@ static const CrGaugeItem g_CrGaugeItems[CR_GAUGE_ITEM_COUNT] = {
     { 75.0f,  "75%" },
     { 100.0f, "100%" },
 };
+
+static void UpdateSelectedMefa(void) {
+    float mefaVal = (float)g_MefaItems[g_MefaCursor].value * 100.0f;
+    if (mefaVal > 600.0f) mefaVal = 600.0f;
+    union { float f; DWORD dw; } u;
+    u.f = mefaVal;
+    g_SelectedMefaDword = u.dw;
+}
 
 static void UpdateSelectedCr(void) {
     float total = (float)g_CrStockItems[g_CrStockCursor].stock * 100.0f + g_CrGaugeItems[g_CrGaugeCursor].pct;
@@ -417,24 +425,25 @@ static inline int IsReplayOrDemo(void) {
     return 0;
 }
 
-// Hook for HSF Native SetMefa (0x004625EA) - Native 80 (float at 0x5b8e0c)
-DWORD __cdecl HandleSetMefa80(DWORD origDword) {
+// Hook for HSF Native SetMefa (0x00462430) - Native 54 (M.E.F.A.2 float at 0x5b9770)
+DWORD __cdecl HandleSetMefa(DWORD origDword) {
     if (g_PendingStageInitStats && !IsReplayOrDemo()) {
-        union { float f; DWORD dw; } uMefa;
-        uMefa.f = (float)g_SelectedMefa;
-        LogMessage("SetMefa80: intercepted script call (0x%08X) -> overriding to selected MEFA=%f (dw=0x%08X)",
-                   origDword, uMefa.f, uMefa.dw);
-        return uMefa.dw;
+        union { DWORD dw; float f; } uOrig, uSel;
+        uOrig.dw = origDword;
+        uSel.dw = g_SelectedMefaDword;
+        LogMessage("SetMefa (Native 54): intercepted script call (%f, 0x%08X) -> overriding to selected MEFA=%f (0x%08X)",
+                   uOrig.f, origDword, uSel.f, g_SelectedMefaDword);
+        return g_SelectedMefaDword;
     }
     return origDword;
 }
 
-void __attribute__((naked)) Hook_SetMefa80(void) {
+void __attribute__((naked)) Hook_SetMefa(void) {
     __asm__ __volatile__(
         "pushl 0x8(%%ebp)\n\t"
-        "call _HandleSetMefa80\n\t"
+        "call _HandleSetMefa\n\t"
         "addl $4, %%esp\n\t"
-        "movl %%eax, 0x5b8e0c\n\t"
+        "movl %%eax, 0x5b9770\n\t"
         "popl %%edi\n\t"
         "popl %%esi\n\t"
         "movl %%ebp, %%esp\n\t"
@@ -445,39 +454,13 @@ void __attribute__((naked)) Hook_SetMefa80(void) {
     );
 }
 
-// Hook for HSF Native SetMefa (0x00462543) - Native 78 (legacy / fallback at 0x5b8e50)
-int __cdecl HandleSetMefa78(int origVal) {
-    if (g_PendingStageInitStats && !IsReplayOrDemo()) {
-        LogMessage("SetMefa78: intercepted script call (%d) -> overriding to selected MEFA=%lu",
-                   origVal, g_SelectedMefa);
-        return (int)g_SelectedMefa;
-    }
-    return origVal;
-}
-
-void __attribute__((naked)) Hook_SetMefa78(void) {
-    __asm__ __volatile__(
-        "pushl 0x8(%%ebp)\n\t"
-        "call _HandleSetMefa78\n\t"
-        "addl $4, %%esp\n\t"
-        "movl %%eax, 0x5b8e50\n\t"
-        "popl %%edi\n\t"
-        "popl %%esi\n\t"
-        "movl %%ebp, %%esp\n\t"
-        "popl %%ebp\n\t"
-        "ret\n\t"
-        :
-        :
-    );
-}
-
-// Hook for HSF Native SetCR (0x00462430)
+// Hook for HSF Native SetCR (0x00462443) - Native 55 (Concept Reactor float at 0x5b976c)
 DWORD __cdecl HandleSetCR(DWORD origDword) {
     if (g_PendingStageInitStats && !IsReplayOrDemo()) {
         union { DWORD dw; float f; } uOrig, uSel;
         uOrig.dw = origDword;
         uSel.dw = g_SelectedCrDword;
-        LogMessage("SetCR: intercepted script call (%f, 0x%08X) -> overriding to selected CR=%f (0x%08X)",
+        LogMessage("SetCR (Native 55): intercepted script call (%f, 0x%08X) -> overriding to selected CR=%f (0x%08X)",
                    uOrig.f, origDword, uSel.f, g_SelectedCrDword);
         return g_SelectedCrDword;
     }
@@ -489,7 +472,7 @@ void __attribute__((naked)) Hook_SetCR(void) {
         "pushl 0x8(%%ebp)\n\t"
         "call _HandleSetCR\n\t"
         "addl $4, %%esp\n\t"
-        "movl %%eax, 0x5b9770\n\t"
+        "movl %%eax, 0x5b976c\n\t"
         "popl %%edi\n\t"
         "popl %%esi\n\t"
         "movl %%ebp, %%esp\n\t"
@@ -757,7 +740,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             g_MenuCursor = (g_MenuCursor + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
         } else if (g_ActiveColumn == 1) {
             g_MefaCursor = (g_MefaCursor + MEFA_ITEM_COUNT - 1) % MEFA_ITEM_COUNT;
-            g_SelectedMefa = (DWORD)g_MefaItems[g_MefaCursor].value;
+            UpdateSelectedMefa();
         } else if (g_ActiveColumn == 2) {
             g_CrStockCursor = (g_CrStockCursor + CR_STOCK_ITEM_COUNT - 1) % CR_STOCK_ITEM_COUNT;
             UpdateSelectedCr();
@@ -771,7 +754,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             g_MenuCursor = (g_MenuCursor + 1) % MENU_ITEM_COUNT;
         } else if (g_ActiveColumn == 1) {
             g_MefaCursor = (g_MefaCursor + 1) % MEFA_ITEM_COUNT;
-            g_SelectedMefa = (DWORD)g_MefaItems[g_MefaCursor].value;
+            UpdateSelectedMefa();
         } else if (g_ActiveColumn == 2) {
             g_CrStockCursor = (g_CrStockCursor + 1) % CR_STOCK_ITEM_COUNT;
             UpdateSelectedCr();
@@ -790,7 +773,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         for (int i = 0; i < MEFA_ITEM_COUNT; i++) {
             if (IsKeyTriggered('0' + i)) {
                 g_MefaCursor = i;
-                g_SelectedMefa = (DWORD)g_MefaItems[i].value;
+                UpdateSelectedMefa();
             }
         }
     } else if (g_ActiveColumn == 2) {
@@ -816,17 +799,18 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             PlayGameSE(1040); // Decide SE
             LogMessage("Stage confirmed: %d -> moving to MEFA", g_MenuItems[g_MenuCursor].stage);
         } else if (g_ActiveColumn == 1) {
-            g_SelectedMefa = (DWORD)g_MefaItems[g_MefaCursor].value;
+            UpdateSelectedMefa();
             g_ActiveColumn = 2;
             PlayGameSE(1040); // Decide SE
-            LogMessage("MEFA confirmed: %d -> moving to CR Stock", g_MefaItems[g_MefaCursor].value);
+            LogMessage("MEFA confirmed: %d stocks (0x%08X) -> moving to CR Stock",
+                       g_MefaItems[g_MefaCursor].value, g_SelectedMefaDword);
         } else if (g_ActiveColumn == 2) {
             UpdateSelectedCr();
             g_ActiveColumn = 3;
             PlayGameSE(1040); // Decide SE
             LogMessage("CR Stock confirmed: %d -> moving to CR Gauge", g_CrStockItems[g_CrStockCursor].stock);
         } else if (g_ActiveColumn == 3) {
-            g_SelectedMefa = (DWORD)g_MefaItems[g_MefaCursor].value;
+            UpdateSelectedMefa();
             UpdateSelectedCr();
             int stage = g_MenuItems[g_MenuCursor].stage;
 
@@ -839,8 +823,9 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             ResetStageScore();
             *(volatile DWORD*)0x5c0740 = 2 + stage;
             PlayGameSE(1040); // Decide SE
-            LogMessage("All confirmed -> Starting Stage %d (MEFA=%lu, CR Stock=%d, CR Gauge=%s, CR Total=0x%08X)",
-                       stage, g_SelectedMefa, g_CrStockItems[g_CrStockCursor].stock,
+            LogMessage("All confirmed -> Starting Stage %d (MEFA stocks=%d, dw=0x%08X, CR Stock=%d, CR Gauge=%s, CR Total=0x%08X)",
+                       stage, g_MefaItems[g_MefaCursor].value, g_SelectedMefaDword,
+                       g_CrStockItems[g_CrStockCursor].stock,
                        g_CrGaugeItems[g_CrGaugeCursor].label, g_SelectedCrDword);
         }
     } else if (do_right) {
@@ -848,7 +833,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             g_ActiveColumn = 1;
             PlayGameSE(1040);
         } else if (g_ActiveColumn == 1) {
-            g_SelectedMefa = (DWORD)g_MefaItems[g_MefaCursor].value;
+            UpdateSelectedMefa();
             g_ActiveColumn = 2;
             PlayGameSE(1040);
         } else if (g_ActiveColumn == 2) {
@@ -903,22 +888,20 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
 
 void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
     if (g_PendingStageInitStats && !IsReplayOrDemo()) {
-        union { float f; DWORD dw; } uMefa;
-        uMefa.f = (float)g_SelectedMefa;
+        union { float f; DWORD dw; } uMefa, uCr;
+        uMefa.dw = g_SelectedMefaDword;
+        uCr.dw = g_SelectedCrDword;
 
         // Enforce the values in globals while stage is initializing
-        *(volatile DWORD*)0x5b8e0c = uMefa.dw;
-        *(volatile DWORD*)0x5b8e50 = g_SelectedMefa;
-        *(volatile DWORD*)0x5b9770 = g_SelectedCrDword;
-        *(volatile DWORD*)0x5b976c = g_SelectedCrDword;
+        *(volatile DWORD*)0x5b9770 = g_SelectedMefaDword; // M.E.F.A.2 (float, 0..600)
+        *(volatile DWORD*)0x5b976c = g_SelectedCrDword;   // Concept Reactor (float, 0..300)
 
         // Also enforce in GameState if allocated
         char *pGameState = *(char**)0x5ac9b0;
         if (pGameState && (DWORD)pGameState > 0x10000 && !IsBadReadPtr(pGameState, 0x200)) {
             for (int s = 1; s <= 6; s++) {
-                *(DWORD*)(pGameState + s * 4 + 0xe5)  = uMefa.dw;
-                *(DWORD*)(pGameState + s * 4 + 0x12d) = g_SelectedCrDword;
-                *(DWORD*)(pGameState + s * 4 + 0x145) = g_SelectedCrDword;
+                *(DWORD*)(pGameState + s * 4 + 0x12d) = g_SelectedMefaDword; // stageMefa
+                *(DWORD*)(pGameState + s * 4 + 0x145) = g_SelectedCrDword;   // stageCr
             }
         }
 
@@ -934,8 +917,8 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
             if ((pPlayer != 0 && frameCount >= 30) || g_StageInitRenderFrames >= 120) {
                 g_PendingStageInitStats = 0;
                 g_StageInitRenderFrames = 0;
-                LogMessage("Stage startup stats finalized: MEFA=%f (dw=0x%08X), CR=0x%08X (frameCount=%lu)",
-                           uMefa.f, uMefa.dw, g_SelectedCrDword, frameCount);
+                LogMessage("Stage startup stats finalized: MEFA=%f (dw=0x%08X), CR=%f (dw=0x%08X) (frameCount=%lu)",
+                           uMefa.f, uMefa.dw, uCr.f, uCr.dw, frameCount);
             }
         }
     }
@@ -1185,10 +1168,12 @@ __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion) {
 }
 
 static void ResetStageScore(void) {
+    UpdateSelectedMefa();
     UpdateSelectedCr();
 
-    union { float f; DWORD dw; } uMefa;
-    uMefa.f = (float)g_SelectedMefa;
+    union { float f; DWORD dw; } uMefa, uCr;
+    uMefa.dw = g_SelectedMefaDword;
+    uCr.dw = g_SelectedCrDword;
 
     // 1. Reset frame / FPS counters (mirrors 0x00441332)
     *(volatile DWORD*)0x5abb78 = 0;
@@ -1199,39 +1184,37 @@ static void ResetStageScore(void) {
     *(volatile DWORD*)0x5b8e20 = 0;                 // Score Low (32-bit)
     *(volatile DWORD*)0x5b8e24 = 0;                 // Score High (32-bit)
     *(volatile DWORD*)0x5b8e08 = 2;                 // Lives (2 in reserve)
-    *(volatile DWORD*)0x5b8e0c = uMefa.dw;          // M.E.F.A.2 (float)
-    *(volatile DWORD*)0x5b8e50 = g_SelectedMefa;    // Bombs / M.E.F.A.2 (int)
     *(volatile DWORD*)0x5b8e1c = 0;                 // Score multiplier / rate
     *(volatile DWORD*)0x5b8e14 = 0;                 // Prisms
     *(volatile DWORD*)0x5b8e10 = 0;                 // Miss / continue count
     *(volatile DWORD*)0x5b8e18 = 0;
-    *(volatile DWORD*)0x5b9770 = g_SelectedCrDword; // Concept Reactor % (float)
-    *(volatile DWORD*)0x5b976c = g_SelectedCrDword;
+    *(volatile DWORD*)0x5b9770 = g_SelectedMefaDword;// M.E.F.A.2 (float, 0..600)
+    *(volatile DWORD*)0x5b976c = g_SelectedCrDword;  // Concept Reactor (float, 0..300)
     *(volatile BYTE*)0x5b975d = 0;                  // Force PointTask to re-initialize
 
     // 3. Clear GameState stage records (0x5ac9b0) so 0x431de0 won't restore old scores
     char *pGameState = *(char**)0x5ac9b0;
     if (pGameState && (DWORD)pGameState > 0x10000) {
         for (int s = 1; s <= 6; s++) {
-            *(BYTE*)(pGameState + s + 0x52) = 0;                     // Stage visited flag = 0
-            *(DWORD*)(pGameState + s * 8 + 0x69) = 0;                // Saved Score Low = 0
-            *(DWORD*)(pGameState + s * 8 + 0x6d) = 0;                // Saved Score High = 0
-            *(DWORD*)(pGameState + s * 4 + 0x9d) = 0;                // Saved multiplier = 0
-            *(DWORD*)(pGameState + s * 4 + 0xcd) = 0;                // Saved prisms = 0
-            *(DWORD*)(pGameState + s * 4 + 0x115) = 2;               // Saved lives = 2
-            *(DWORD*)(pGameState + s * 4 + 0x12d) = g_SelectedCrDword;// Saved concept reactor %
-            *(DWORD*)(pGameState + s * 4 + 0x145) = g_SelectedCrDword;// Saved CR display %
+            *(BYTE*)(pGameState + s + 0x52) = 0;                      // Stage visited flag = 0
+            *(DWORD*)(pGameState + s * 8 + 0x69) = 0;                 // Saved Score Low = 0
+            *(DWORD*)(pGameState + s * 8 + 0x6d) = 0;                 // Saved Score High = 0
+            *(DWORD*)(pGameState + s * 4 + 0x9d) = 0;                 // Saved multiplier = 0
+            *(DWORD*)(pGameState + s * 4 + 0xcd) = 0;                 // Saved prisms = 0
+            *(DWORD*)(pGameState + s * 4 + 0x115) = 2;                // Saved lives = 2
+            *(DWORD*)(pGameState + s * 4 + 0x12d) = g_SelectedMefaDword; // Saved stageMefa
+            *(DWORD*)(pGameState + s * 4 + 0x145) = g_SelectedCrDword;   // Saved stageCr
             *(DWORD*)(pGameState + s * 4 + 0x15d) = 0;
             *(DWORD*)(pGameState + s * 4 + 0x17c) = 0;
             *(DWORD*)(pGameState + s * 4 + 0xb5) = 0;
-            *(DWORD*)(pGameState + s * 4 + 0xe5) = uMefa.dw;         // Saved MEFA (float)
+            *(DWORD*)(pGameState + s * 4 + 0xe5) = 0;
             *(DWORD*)(pGameState + s * 4 + 0xfd) = 0;
         }
         *(DWORD*)(pGameState + 0x7a8) = 0; // Total play time = 0
     }
 
-    LogMessage("ResetStageScore: Score and player stats reset (MEFA=%f (dw=0x%08X), CR=0x%08X, GameState=0x%p)",
-               uMefa.f, uMefa.dw, g_SelectedCrDword, pGameState);
+    LogMessage("ResetStageScore: Score and player stats reset (MEFA=%f (dw=0x%08X), CR=%f (dw=0x%08X), GameState=0x%p)",
+               uMefa.f, uMefa.dw, uCr.f, uCr.dw, pGameState);
 }
 
 // In-game F1-F5 hotkeys thread (for practice stage warp anytime)
@@ -1372,54 +1355,33 @@ static void InstallHooks(void) {
         LogMessage("[Error] EndScene signature at 0x%08X did not match!", endSceneAddr);
     }
 
-    // 5a. SetMefa80 Hook at 0x004625EA (13 bytes: F3 0F 10 45 08 F3 0F 11 05 0C 8E 5B 00)
-    void *setMefa80Addr = (void*)0x004625EA;
-    unsigned char expectedSetMefa80[13] = {
-        0xF3, 0x0F, 0x10, 0x45, 0x08,
-        0xF3, 0x0F, 0x11, 0x05, 0x0C, 0x8E, 0x5B, 0x00
-    };
-    if (memcmp(setMefa80Addr, expectedSetMefa80, 13) == 0) {
-        if (VirtualProtect(setMefa80Addr, 13, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            unsigned char patch[13];
-            patch[0] = 0xE9; // JMP rel32
-            DWORD relOffset = (DWORD)Hook_SetMefa80 - ((DWORD)setMefa80Addr + 5);
-            memcpy(&patch[1], &relOffset, 4);
-            memset(&patch[5], 0x90, 8); // 8 NOPs
-            memcpy(setMefa80Addr, patch, 13);
-            VirtualProtect(setMefa80Addr, 13, oldProtect, &oldProtect);
-            FlushInstructionCache(GetCurrentProcess(), setMefa80Addr, 13);
-            LogMessage("SetMefa80 hook installed successfully at 0x%08X", setMefa80Addr);
-        }
-    } else {
-        LogMessage("[Error] SetMefa80 signature at 0x%08X did not match!", setMefa80Addr);
-    }
-
-    // 5b. SetMefa78 Hook at 0x00462543 (8 bytes: 8B 45 08 A3 50 8E 5B 00)
-    void *setMefa78Addr = (void*)0x00462543;
-    unsigned char expectedSetMefa78[8] = { 0x8B, 0x45, 0x08, 0xA3, 0x50, 0x8E, 0x5B, 0x00 };
-    if (memcmp(setMefa78Addr, expectedSetMefa78, 8) == 0) {
-        if (VirtualProtect(setMefa78Addr, 8, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            unsigned char patch[8];
-            patch[0] = 0xE9; // JMP rel32
-            DWORD relOffset = (DWORD)Hook_SetMefa78 - ((DWORD)setMefa78Addr + 5);
-            memcpy(&patch[1], &relOffset, 4);
-            patch[5] = 0x90; // NOP
-            patch[6] = 0x90; // NOP
-            patch[7] = 0x90; // NOP
-            memcpy(setMefa78Addr, patch, 8);
-            VirtualProtect(setMefa78Addr, 8, oldProtect, &oldProtect);
-            FlushInstructionCache(GetCurrentProcess(), setMefa78Addr, 8);
-            LogMessage("SetMefa78 hook installed successfully at 0x%08X", setMefa78Addr);
-        }
-    } else {
-        LogMessage("[Error] SetMefa78 signature at 0x%08X did not match!", setMefa78Addr);
-    }
-
-    // 6. SetCR Hook at 0x00462430 (13 bytes: F3 0F 10 45 08 F3 0F 11 05 70 97 5B 00)
-    void *setCrAddr = (void*)0x00462430;
-    unsigned char expectedSetCr[13] = {
+    // 5. SetMefa Hook at 0x00462430 (13 bytes: F3 0F 10 45 08 F3 0F 11 05 70 97 5B 00) - Native 54
+    void *setMefaAddr = (void*)0x00462430;
+    unsigned char expectedSetMefa[13] = {
         0xF3, 0x0F, 0x10, 0x45, 0x08,
         0xF3, 0x0F, 0x11, 0x05, 0x70, 0x97, 0x5B, 0x00
+    };
+    if (memcmp(setMefaAddr, expectedSetMefa, 13) == 0) {
+        if (VirtualProtect(setMefaAddr, 13, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            unsigned char patch[13];
+            patch[0] = 0xE9; // JMP rel32
+            DWORD relOffset = (DWORD)Hook_SetMefa - ((DWORD)setMefaAddr + 5);
+            memcpy(&patch[1], &relOffset, 4);
+            memset(&patch[5], 0x90, 8); // 8 NOPs
+            memcpy(setMefaAddr, patch, 13);
+            VirtualProtect(setMefaAddr, 13, oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), setMefaAddr, 13);
+            LogMessage("SetMefa hook installed successfully at 0x%08X", setMefaAddr);
+        }
+    } else {
+        LogMessage("[Error] SetMefa signature at 0x%08X did not match!", setMefaAddr);
+    }
+
+    // 6. SetCR Hook at 0x00462443 (13 bytes: F3 0F 10 45 08 F3 0F 11 05 6C 97 5B 00) - Native 55
+    void *setCrAddr = (void*)0x00462443;
+    unsigned char expectedSetCr[13] = {
+        0xF3, 0x0F, 0x10, 0x45, 0x08,
+        0xF3, 0x0F, 0x11, 0x05, 0x6C, 0x97, 0x5B, 0x00
     };
     if (memcmp(setCrAddr, expectedSetCr, 13) == 0) {
         if (VirtualProtect(setCrAddr, 13, PAGE_EXECUTE_READWRITE, &oldProtect)) {
