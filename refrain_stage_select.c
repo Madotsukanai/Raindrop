@@ -9,7 +9,9 @@ static volatile int g_ShowStageMenu = 0;
 static volatile int g_StageSelected = 0;
 static volatile int g_CancelToTitle = 0; // set when player cancels back to title
 static volatile int g_MenuCursor = 0;   // 0 to 4 (Stage index)
-static volatile int g_ActiveColumn = 0; // 0=Stage, 1=MEFA, 2=CR Stock, 3=CR Gauge
+static volatile int g_ActiveColumn = 0; // 0=Stage, 1=Lives, 2=MEFA, 3=CR Stock, 4=CR Gauge
+static volatile int g_LifeCursor = 2;   // 0 to 5 (default: 2 in reserve)
+static volatile int g_SelectedLives = 2;
 static volatile int g_MefaCursor = 2;   // 0 to 6 (default: 2 stocks = 200.0f)
 static volatile int g_CrStockCursor = 1; // 0 to 3 (default: 1 stock)
 static volatile int g_CrGaugeCursor = 0; // 0 to 4 (default: 0%)
@@ -131,6 +133,26 @@ static const MenuItem g_MenuItems[MENU_ITEM_COUNT] = {
     { 4, "ST.4: COUNTERMEASURE" },
     { 5, "ST.5: CORE PRISM" },
 };
+
+typedef struct {
+    int lives;
+    const char *label;
+} LifeItem;
+
+#define LIFE_ITEM_COUNT 6
+
+static const LifeItem g_LifeItems[LIFE_ITEM_COUNT] = {
+    { 0, "0" },
+    { 1, "1" },
+    { 2, "2 (DEF)" },
+    { 3, "3" },
+    { 4, "4" },
+    { 5, "5 (MAX)" },
+};
+
+static void UpdateSelectedLives(void) {
+    g_SelectedLives = g_LifeItems[g_LifeCursor].lives;
+}
 
 typedef struct {
     int value;
@@ -425,6 +447,32 @@ static inline int IsReplayOrDemo(void) {
     return 0;
 }
 
+// Hook for HSF Native SetLives (0x00462535) - Native 77 (Player lives at 0x5b8e08)
+DWORD __cdecl HandleSetLives(DWORD origLives) {
+    if (g_PendingStageInitStats && !IsReplayOrDemo()) {
+        LogMessage("SetLives (Native 77): intercepted script call (%lu) -> overriding to %d",
+                   origLives, g_SelectedLives);
+        return (DWORD)g_SelectedLives;
+    }
+    return origLives;
+}
+
+void __attribute__((naked)) Hook_SetLives(void) {
+    __asm__ __volatile__(
+        "pushl 0x8(%%ebp)\n\t"
+        "call _HandleSetLives\n\t"
+        "addl $4, %%esp\n\t"
+        "movl %%eax, 0x5b8e08\n\t"
+        "popl %%edi\n\t"
+        "popl %%esi\n\t"
+        "movl %%ebp, %%esp\n\t"
+        "popl %%ebp\n\t"
+        "ret\n\t"
+        :
+        :
+    );
+}
+
 // Hook for HSF Native SetMefa (0x00462430) - Native 54 (M.E.F.A.2 float at 0x5b9770)
 DWORD __cdecl HandleSetMefa(DWORD origDword) {
     if (g_PendingStageInitStats && !IsReplayOrDemo()) {
@@ -513,19 +561,21 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_CULLMODE, D3DCULL_NONE);
     pDevice->lpVtbl->SetTexture(pDevice, 0, NULL);
 
-    // Layout configuration: 4 panels side by side + bottom footer
-    float w0 = 190.0f; // Stage
-    float w1 = 100.0f; // M.E.F.A.2
-    float w2 = 125.0f; // CR Stock
-    float w3 = 145.0f; // CR Gauge
-    float gap = 8.0f;
-    float totalW = w0 + gap + w1 + gap + w2 + gap + w3; // 584.0f
+    // Layout configuration: 5 panels side by side + bottom footer
+    float w0 = 170.0f; // Stage
+    float w1 = 76.0f;  // Lives
+    float w2 = 94.0f;  // M.E.F.2
+    float w3 = 110.0f; // CR Stock
+    float w4 = 126.0f; // CR Gauge
+    float gap = 6.0f;
+    float totalW = w0 + gap + w1 + gap + w2 + gap + w3 + gap + w4; // 594.0f
 
     float startX = ((float)vp.Width - totalW) * 0.5f;
     float x0 = startX;
     float x1 = x0 + w0 + gap;
     float x2 = x1 + w1 + gap;
     float x3 = x2 + w2 + gap;
+    float x4 = x3 + w3 + gap;
 
     float boxH = 218.0f;
     float footerH = 46.0f;
@@ -538,16 +588,19 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     DWORD borderCol1 = (g_ActiveColumn == 1) ? 0xFF00BFFF : 0xFF335577;
     DWORD borderCol2 = (g_ActiveColumn == 2) ? 0xFF00BFFF : 0xFF335577;
     DWORD borderCol3 = (g_ActiveColumn == 3) ? 0xFF00BFFF : 0xFF335577;
+    DWORD borderCol4 = (g_ActiveColumn == 4) ? 0xFF00BFFF : 0xFF335577;
 
     DWORD headerBg0  = (g_ActiveColumn == 0) ? 0x88004488 : 0x55112233;
     DWORD headerBg1  = (g_ActiveColumn == 1) ? 0x88004488 : 0x55112233;
     DWORD headerBg2  = (g_ActiveColumn == 2) ? 0x88004488 : 0x55112233;
     DWORD headerBg3  = (g_ActiveColumn == 3) ? 0x88004488 : 0x55112233;
+    DWORD headerBg4  = (g_ActiveColumn == 4) ? 0x88004488 : 0x55112233;
 
     DWORD titleCol0  = (g_ActiveColumn == 0) ? 0xFFFFCC00 : 0xFF88AABB;
     DWORD titleCol1  = (g_ActiveColumn == 1) ? 0xFFFFCC00 : 0xFF88AABB;
     DWORD titleCol2  = (g_ActiveColumn == 2) ? 0xFFFFCC00 : 0xFF88AABB;
     DWORD titleCol3  = (g_ActiveColumn == 3) ? 0xFFFFCC00 : 0xFF88AABB;
+    DWORD titleCol4  = (g_ActiveColumn == 4) ? 0xFFFFCC00 : 0xFF88AABB;
 
     // Panel 0: STAGE
     DrawSolidRect(pDevice, x0 - 3.0f, boxY - 3.0f, w0 + 6.0f, boxH + 6.0f, borderCol0);
@@ -555,23 +608,29 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     DrawSolidRect(pDevice, x0 + 6.0f, boxY + 6.0f, w0 - 12.0f, 28.0f, headerBg0);
     DrawShadowText(g_pTitleFont, "STAGE", (int)x0 + 14, (int)boxY + 10, titleCol0);
 
-    // Panel 1: M.E.F.A.2
+    // Panel 1: LIVES
     DrawSolidRect(pDevice, x1 - 3.0f, boxY - 3.0f, w1 + 6.0f, boxH + 6.0f, borderCol1);
     DrawSolidRect(pDevice, x1, boxY, w1, boxH, 0xEE0D111A);
     DrawSolidRect(pDevice, x1 + 6.0f, boxY + 6.0f, w1 - 12.0f, 28.0f, headerBg1);
-    DrawShadowText(g_pTitleFont, "M.E.F.A.2", (int)x1 + 10, (int)boxY + 10, titleCol1);
+    DrawShadowText(g_pTitleFont, "LIVES", (int)x1 + 10, (int)boxY + 10, titleCol1);
 
-    // Panel 2: CR STOCK
+    // Panel 2: M.E.F.A.2
     DrawSolidRect(pDevice, x2 - 3.0f, boxY - 3.0f, w2 + 6.0f, boxH + 6.0f, borderCol2);
     DrawSolidRect(pDevice, x2, boxY, w2, boxH, 0xEE0D111A);
     DrawSolidRect(pDevice, x2 + 6.0f, boxY + 6.0f, w2 - 12.0f, 28.0f, headerBg2);
-    DrawShadowText(g_pTitleFont, "CR STOCK", (int)x2 + 10, (int)boxY + 10, titleCol2);
+    DrawShadowText(g_pTitleFont, "M.E.F.A.2", (int)x2 + 10, (int)boxY + 10, titleCol2);
 
-    // Panel 3: CR GAUGE
+    // Panel 3: CR STOCK
     DrawSolidRect(pDevice, x3 - 3.0f, boxY - 3.0f, w3 + 6.0f, boxH + 6.0f, borderCol3);
     DrawSolidRect(pDevice, x3, boxY, w3, boxH, 0xEE0D111A);
     DrawSolidRect(pDevice, x3 + 6.0f, boxY + 6.0f, w3 - 12.0f, 28.0f, headerBg3);
-    DrawShadowText(g_pTitleFont, "CR GAUGE", (int)x3 + 10, (int)boxY + 10, titleCol3);
+    DrawShadowText(g_pTitleFont, "CR STOCK", (int)x3 + 10, (int)boxY + 10, titleCol3);
+
+    // Panel 4: CR GAUGE
+    DrawSolidRect(pDevice, x4 - 3.0f, boxY - 3.0f, w4 + 6.0f, boxH + 6.0f, borderCol4);
+    DrawSolidRect(pDevice, x4, boxY, w4, boxH, 0xEE0D111A);
+    DrawSolidRect(pDevice, x4 + 6.0f, boxY + 6.0f, w4 - 12.0f, 28.0f, headerBg4);
+    DrawShadowText(g_pTitleFont, "CR GAUGE", (int)x4 + 10, (int)boxY + 10, titleCol4);
 
     // Draw items
     int startY = (int)boxY + 44;
@@ -597,71 +656,95 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         }
     }
 
-    // Items for Column 1 (M.E.F.A.2)
+    // Items for Column 1 (Lives)
+    for (int i = 0; i < LIFE_ITEM_COUNT; i++) {
+        int itemY = startY + i * lineSpacing;
+        char buf[128];
+        if (i == g_LifeCursor) {
+            if (g_ActiveColumn == 1) {
+                DrawSolidRect(pDevice, x1 + 6.0f, (float)itemY - 2.0f, w1 - 12.0f, 22.0f, 0x660077CC);
+                snprintf(buf, sizeof(buf), ">> %s", g_LifeItems[i].label);
+                DrawShadowText(g_pFont, buf, (int)x1 + 8, itemY, 0xFFFFFF00);
+            } else if (g_ActiveColumn > 1) {
+                DrawSolidRect(pDevice, x1 + 6.0f, (float)itemY - 2.0f, w1 - 12.0f, 22.0f, 0x44005588);
+                snprintf(buf, sizeof(buf), ">> %s", g_LifeItems[i].label);
+                DrawShadowText(g_pFont, buf, (int)x1 + 8, itemY, 0xFF00FFCC);
+            } else {
+                DrawSolidRect(pDevice, x1 + 6.0f, (float)itemY - 2.0f, w1 - 12.0f, 22.0f, 0x22112233);
+                snprintf(buf, sizeof(buf), ">  %s", g_LifeItems[i].label);
+                DrawShadowText(g_pFont, buf, (int)x1 + 8, itemY, 0xFF888888);
+            }
+        } else {
+            snprintf(buf, sizeof(buf), "   %s", g_LifeItems[i].label);
+            DrawShadowText(g_pFont, buf, (int)x1 + 8, itemY, (g_ActiveColumn == 1) ? 0xFFAAAAAA : 0xFF555555);
+        }
+    }
+
+    // Items for Column 2 (M.E.F.A.2)
     for (int i = 0; i < MEFA_ITEM_COUNT; i++) {
         int itemY = startY + i * lineSpacing;
         char buf[128];
         if (i == g_MefaCursor) {
-            if (g_ActiveColumn == 1) {
-                DrawSolidRect(pDevice, x1 + 6.0f, (float)itemY - 2.0f, w1 - 12.0f, 22.0f, 0x660077CC);
-                snprintf(buf, sizeof(buf), ">> %s", g_MefaItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x1 + 10, itemY, 0xFFFFFF00);
-            } else if (g_ActiveColumn > 1) {
-                DrawSolidRect(pDevice, x1 + 6.0f, (float)itemY - 2.0f, w1 - 12.0f, 22.0f, 0x44005588);
-                snprintf(buf, sizeof(buf), ">> %s", g_MefaItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x1 + 10, itemY, 0xFF00FFCC);
-            } else {
-                DrawSolidRect(pDevice, x1 + 6.0f, (float)itemY - 2.0f, w1 - 12.0f, 22.0f, 0x22112233);
-                snprintf(buf, sizeof(buf), ">  %s", g_MefaItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x1 + 10, itemY, 0xFF888888);
-            }
-        } else {
-            snprintf(buf, sizeof(buf), "   %s", g_MefaItems[i].label);
-            DrawShadowText(g_pFont, buf, (int)x1 + 10, itemY, (g_ActiveColumn == 1) ? 0xFFAAAAAA : 0xFF555555);
-        }
-    }
-
-    // Items for Column 2 (CR Stock)
-    for (int i = 0; i < CR_STOCK_ITEM_COUNT; i++) {
-        int itemY = startY + i * lineSpacing;
-        char buf[128];
-        if (i == g_CrStockCursor) {
             if (g_ActiveColumn == 2) {
                 DrawSolidRect(pDevice, x2 + 6.0f, (float)itemY - 2.0f, w2 - 12.0f, 22.0f, 0x660077CC);
-                snprintf(buf, sizeof(buf), ">> %s", g_CrStockItems[i].label);
+                snprintf(buf, sizeof(buf), ">> %s", g_MefaItems[i].label);
                 DrawShadowText(g_pFont, buf, (int)x2 + 10, itemY, 0xFFFFFF00);
             } else if (g_ActiveColumn > 2) {
                 DrawSolidRect(pDevice, x2 + 6.0f, (float)itemY - 2.0f, w2 - 12.0f, 22.0f, 0x44005588);
-                snprintf(buf, sizeof(buf), ">> %s", g_CrStockItems[i].label);
+                snprintf(buf, sizeof(buf), ">> %s", g_MefaItems[i].label);
                 DrawShadowText(g_pFont, buf, (int)x2 + 10, itemY, 0xFF00FFCC);
             } else {
                 DrawSolidRect(pDevice, x2 + 6.0f, (float)itemY - 2.0f, w2 - 12.0f, 22.0f, 0x22112233);
-                snprintf(buf, sizeof(buf), ">  %s", g_CrStockItems[i].label);
+                snprintf(buf, sizeof(buf), ">  %s", g_MefaItems[i].label);
                 DrawShadowText(g_pFont, buf, (int)x2 + 10, itemY, 0xFF888888);
             }
         } else {
-            snprintf(buf, sizeof(buf), "   %s", g_CrStockItems[i].label);
+            snprintf(buf, sizeof(buf), "   %s", g_MefaItems[i].label);
             DrawShadowText(g_pFont, buf, (int)x2 + 10, itemY, (g_ActiveColumn == 2) ? 0xFFAAAAAA : 0xFF555555);
         }
     }
 
-    // Items for Column 3 (CR Gauge)
+    // Items for Column 3 (CR Stock)
+    for (int i = 0; i < CR_STOCK_ITEM_COUNT; i++) {
+        int itemY = startY + i * lineSpacing;
+        char buf[128];
+        if (i == g_CrStockCursor) {
+            if (g_ActiveColumn == 3) {
+                DrawSolidRect(pDevice, x3 + 6.0f, (float)itemY - 2.0f, w3 - 12.0f, 22.0f, 0x660077CC);
+                snprintf(buf, sizeof(buf), ">> %s", g_CrStockItems[i].label);
+                DrawShadowText(g_pFont, buf, (int)x3 + 10, itemY, 0xFFFFFF00);
+            } else if (g_ActiveColumn > 3) {
+                DrawSolidRect(pDevice, x3 + 6.0f, (float)itemY - 2.0f, w3 - 12.0f, 22.0f, 0x44005588);
+                snprintf(buf, sizeof(buf), ">> %s", g_CrStockItems[i].label);
+                DrawShadowText(g_pFont, buf, (int)x3 + 10, itemY, 0xFF00FFCC);
+            } else {
+                DrawSolidRect(pDevice, x3 + 6.0f, (float)itemY - 2.0f, w3 - 12.0f, 22.0f, 0x22112233);
+                snprintf(buf, sizeof(buf), ">  %s", g_CrStockItems[i].label);
+                DrawShadowText(g_pFont, buf, (int)x3 + 10, itemY, 0xFF888888);
+            }
+        } else {
+            snprintf(buf, sizeof(buf), "   %s", g_CrStockItems[i].label);
+            DrawShadowText(g_pFont, buf, (int)x3 + 10, itemY, (g_ActiveColumn == 3) ? 0xFFAAAAAA : 0xFF555555);
+        }
+    }
+
+    // Items for Column 4 (CR Gauge)
     for (int i = 0; i < CR_GAUGE_ITEM_COUNT; i++) {
         int itemY = startY + i * lineSpacing;
         char buf[128];
         if (i == g_CrGaugeCursor) {
-            if (g_ActiveColumn == 3) {
-                DrawSolidRect(pDevice, x3 + 6.0f, (float)itemY - 2.0f, w3 - 12.0f, 22.0f, 0x660077CC);
+            if (g_ActiveColumn == 4) {
+                DrawSolidRect(pDevice, x4 + 6.0f, (float)itemY - 2.0f, w4 - 12.0f, 22.0f, 0x660077CC);
                 snprintf(buf, sizeof(buf), ">> %s", g_CrGaugeItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x3 + 10, itemY, 0xFFFFFF00);
+                DrawShadowText(g_pFont, buf, (int)x4 + 10, itemY, 0xFFFFFF00);
             } else {
-                DrawSolidRect(pDevice, x3 + 6.0f, (float)itemY - 2.0f, w3 - 12.0f, 22.0f, 0x22112233);
+                DrawSolidRect(pDevice, x4 + 6.0f, (float)itemY - 2.0f, w4 - 12.0f, 22.0f, 0x22112233);
                 snprintf(buf, sizeof(buf), ">  %s", g_CrGaugeItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x3 + 10, itemY, 0xFF888888);
+                DrawShadowText(g_pFont, buf, (int)x4 + 10, itemY, 0xFF888888);
             }
         } else {
             snprintf(buf, sizeof(buf), "   %s", g_CrGaugeItems[i].label);
-            DrawShadowText(g_pFont, buf, (int)x3 + 10, itemY, (g_ActiveColumn == 3) ? 0xFFAAAAAA : 0xFF555555);
+            DrawShadowText(g_pFont, buf, (int)x4 + 10, itemY, (g_ActiveColumn == 4) ? 0xFFAAAAAA : 0xFF555555);
         }
     }
 
@@ -675,12 +758,15 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         help1 = "[UP/DOWN] Select Stage    [Z/ENTER/RIGHT] Next    [1-5] Quick Select";
         help2 = "[X/ESC] Return to Title";
     } else if (g_ActiveColumn == 1) {
-        help1 = "[UP/DOWN] Select MEFA     [Z/ENTER/RIGHT] Next    [0-6] Quick Select";
+        help1 = "[UP/DOWN] Select Lives    [Z/ENTER/RIGHT] Next    [0-5] Quick Select";
         help2 = "[X/ESC/LEFT] Back to Stage Select";
     } else if (g_ActiveColumn == 2) {
+        help1 = "[UP/DOWN] Select MEFA     [Z/ENTER/RIGHT] Next    [0-6] Quick Select";
+        help2 = "[X/ESC/LEFT] Back to Lives Select";
+    } else if (g_ActiveColumn == 3) {
         help1 = "[UP/DOWN] Select Stock    [Z/ENTER/RIGHT] Next    [0-3] Quick Select";
         help2 = "[X/ESC/LEFT] Back to M.E.F.A.2 Select";
-    } else if (g_ActiveColumn == 3) {
+    } else if (g_ActiveColumn == 4) {
         help1 = "[UP/DOWN] Select Gauge    [Z/ENTER] START GAME    [0-4] Quick Select";
         help2 = "[X/ESC/LEFT] Back to CR Stock Select";
     }
@@ -739,12 +825,15 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         if (g_ActiveColumn == 0) {
             g_MenuCursor = (g_MenuCursor + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
         } else if (g_ActiveColumn == 1) {
+            g_LifeCursor = (g_LifeCursor + LIFE_ITEM_COUNT - 1) % LIFE_ITEM_COUNT;
+            UpdateSelectedLives();
+        } else if (g_ActiveColumn == 2) {
             g_MefaCursor = (g_MefaCursor + MEFA_ITEM_COUNT - 1) % MEFA_ITEM_COUNT;
             UpdateSelectedMefa();
-        } else if (g_ActiveColumn == 2) {
+        } else if (g_ActiveColumn == 3) {
             g_CrStockCursor = (g_CrStockCursor + CR_STOCK_ITEM_COUNT - 1) % CR_STOCK_ITEM_COUNT;
             UpdateSelectedCr();
-        } else if (g_ActiveColumn == 3) {
+        } else if (g_ActiveColumn == 4) {
             g_CrGaugeCursor = (g_CrGaugeCursor + CR_GAUGE_ITEM_COUNT - 1) % CR_GAUGE_ITEM_COUNT;
             UpdateSelectedCr();
         }
@@ -753,12 +842,15 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         if (g_ActiveColumn == 0) {
             g_MenuCursor = (g_MenuCursor + 1) % MENU_ITEM_COUNT;
         } else if (g_ActiveColumn == 1) {
+            g_LifeCursor = (g_LifeCursor + 1) % LIFE_ITEM_COUNT;
+            UpdateSelectedLives();
+        } else if (g_ActiveColumn == 2) {
             g_MefaCursor = (g_MefaCursor + 1) % MEFA_ITEM_COUNT;
             UpdateSelectedMefa();
-        } else if (g_ActiveColumn == 2) {
+        } else if (g_ActiveColumn == 3) {
             g_CrStockCursor = (g_CrStockCursor + 1) % CR_STOCK_ITEM_COUNT;
             UpdateSelectedCr();
-        } else if (g_ActiveColumn == 3) {
+        } else if (g_ActiveColumn == 4) {
             g_CrGaugeCursor = (g_CrGaugeCursor + 1) % CR_GAUGE_ITEM_COUNT;
             UpdateSelectedCr();
         }
@@ -770,20 +862,27 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             if (IsKeyTriggered('1' + i)) g_MenuCursor = i;
         }
     } else if (g_ActiveColumn == 1) {
+        for (int i = 0; i < LIFE_ITEM_COUNT; i++) {
+            if (IsKeyTriggered('0' + i)) {
+                g_LifeCursor = i;
+                UpdateSelectedLives();
+            }
+        }
+    } else if (g_ActiveColumn == 2) {
         for (int i = 0; i < MEFA_ITEM_COUNT; i++) {
             if (IsKeyTriggered('0' + i)) {
                 g_MefaCursor = i;
                 UpdateSelectedMefa();
             }
         }
-    } else if (g_ActiveColumn == 2) {
+    } else if (g_ActiveColumn == 3) {
         for (int i = 0; i < CR_STOCK_ITEM_COUNT; i++) {
             if (IsKeyTriggered('0' + i)) {
                 g_CrStockCursor = i;
                 UpdateSelectedCr();
             }
         }
-    } else if (g_ActiveColumn == 3) {
+    } else if (g_ActiveColumn == 4) {
         for (int i = 0; i < CR_GAUGE_ITEM_COUNT; i++) {
             if (IsKeyTriggered('0' + i)) {
                 g_CrGaugeCursor = i;
@@ -797,19 +896,25 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         if (g_ActiveColumn == 0) {
             g_ActiveColumn = 1;
             PlayGameSE(1040); // Decide SE
-            LogMessage("Stage confirmed: %d -> moving to MEFA", g_MenuItems[g_MenuCursor].stage);
+            LogMessage("Stage confirmed: %d -> moving to Lives", g_MenuItems[g_MenuCursor].stage);
         } else if (g_ActiveColumn == 1) {
-            UpdateSelectedMefa();
+            UpdateSelectedLives();
             g_ActiveColumn = 2;
+            PlayGameSE(1040); // Decide SE
+            LogMessage("Lives confirmed: %d -> moving to MEFA", g_SelectedLives);
+        } else if (g_ActiveColumn == 2) {
+            UpdateSelectedMefa();
+            g_ActiveColumn = 3;
             PlayGameSE(1040); // Decide SE
             LogMessage("MEFA confirmed: %d stocks (0x%08X) -> moving to CR Stock",
                        g_MefaItems[g_MefaCursor].value, g_SelectedMefaDword);
-        } else if (g_ActiveColumn == 2) {
+        } else if (g_ActiveColumn == 3) {
             UpdateSelectedCr();
-            g_ActiveColumn = 3;
+            g_ActiveColumn = 4;
             PlayGameSE(1040); // Decide SE
             LogMessage("CR Stock confirmed: %d -> moving to CR Gauge", g_CrStockItems[g_CrStockCursor].stock);
-        } else if (g_ActiveColumn == 3) {
+        } else if (g_ActiveColumn == 4) {
+            UpdateSelectedLives();
             UpdateSelectedMefa();
             UpdateSelectedCr();
             int stage = g_MenuItems[g_MenuCursor].stage;
@@ -823,8 +928,8 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             ResetStageScore();
             *(volatile DWORD*)0x5c0740 = 2 + stage;
             PlayGameSE(1040); // Decide SE
-            LogMessage("All confirmed -> Starting Stage %d (MEFA stocks=%d, dw=0x%08X, CR Stock=%d, CR Gauge=%s, CR Total=0x%08X)",
-                       stage, g_MefaItems[g_MefaCursor].value, g_SelectedMefaDword,
+            LogMessage("All confirmed -> Starting Stage %d (Lives=%d, MEFA stocks=%d, dw=0x%08X, CR Stock=%d, CR Gauge=%s, CR Total=0x%08X)",
+                       stage, g_SelectedLives, g_MefaItems[g_MefaCursor].value, g_SelectedMefaDword,
                        g_CrStockItems[g_CrStockCursor].stock,
                        g_CrGaugeItems[g_CrGaugeCursor].label, g_SelectedCrDword);
         }
@@ -833,19 +938,26 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             g_ActiveColumn = 1;
             PlayGameSE(1040);
         } else if (g_ActiveColumn == 1) {
-            UpdateSelectedMefa();
+            UpdateSelectedLives();
             g_ActiveColumn = 2;
             PlayGameSE(1040);
         } else if (g_ActiveColumn == 2) {
-            UpdateSelectedCr();
+            UpdateSelectedMefa();
             g_ActiveColumn = 3;
+            PlayGameSE(1040);
+        } else if (g_ActiveColumn == 3) {
+            UpdateSelectedCr();
+            g_ActiveColumn = 4;
             PlayGameSE(1040);
         }
     }
 
     // Cancel or Left navigation
     if (do_cancel) {
-        if (g_ActiveColumn == 3) {
+        if (g_ActiveColumn == 4) {
+            g_ActiveColumn = 3;
+            PlayGameSE(1048); // Cancel SE
+        } else if (g_ActiveColumn == 3) {
             g_ActiveColumn = 2;
             PlayGameSE(1048); // Cancel SE
         } else if (g_ActiveColumn == 2) {
@@ -864,7 +976,10 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             LogMessage("Stage Menu Cancel -> Return to Title");
         }
     } else if (do_left) {
-        if (g_ActiveColumn == 3) {
+        if (g_ActiveColumn == 4) {
+            g_ActiveColumn = 3;
+            PlayGameSE(1048);
+        } else if (g_ActiveColumn == 3) {
             g_ActiveColumn = 2;
             PlayGameSE(1048);
         } else if (g_ActiveColumn == 2) {
@@ -893,15 +1008,17 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
         uCr.dw = g_SelectedCrDword;
 
         // Enforce the values in globals while stage is initializing
-        *(volatile DWORD*)0x5b9770 = g_SelectedMefaDword; // M.E.F.A.2 (float, 0..600)
-        *(volatile DWORD*)0x5b976c = g_SelectedCrDword;   // Concept Reactor (float, 0..300)
+        *(volatile DWORD*)0x5b8e08 = (DWORD)g_SelectedLives; // Lives (0..5)
+        *(volatile DWORD*)0x5b9770 = g_SelectedMefaDword;     // M.E.F.A.2 (float, 0..600)
+        *(volatile DWORD*)0x5b976c = g_SelectedCrDword;       // Concept Reactor (float, 0..300)
 
         // Also enforce in GameState if allocated
         char *pGameState = *(char**)0x5ac9b0;
         if (pGameState && (DWORD)pGameState > 0x10000 && !IsBadReadPtr(pGameState, 0x200)) {
             for (int s = 1; s <= 6; s++) {
-                *(DWORD*)(pGameState + s * 4 + 0x12d) = g_SelectedMefaDword; // stageMefa
-                *(DWORD*)(pGameState + s * 4 + 0x145) = g_SelectedCrDword;   // stageCr
+                *(DWORD*)(pGameState + s * 4 + 0x115) = (DWORD)g_SelectedLives; // stageLives
+                *(DWORD*)(pGameState + s * 4 + 0x12d) = g_SelectedMefaDword;    // stageMefa
+                *(DWORD*)(pGameState + s * 4 + 0x145) = g_SelectedCrDword;      // stageCr
             }
         }
 
@@ -917,8 +1034,8 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
             if ((pPlayer != 0 && frameCount >= 30) || g_StageInitRenderFrames >= 120) {
                 g_PendingStageInitStats = 0;
                 g_StageInitRenderFrames = 0;
-                LogMessage("Stage startup stats finalized: MEFA=%f (dw=0x%08X), CR=%f (dw=0x%08X) (frameCount=%lu)",
-                           uMefa.f, uMefa.dw, uCr.f, uCr.dw, frameCount);
+                LogMessage("Stage startup stats finalized: Lives=%d, MEFA=%f (dw=0x%08X), CR=%f (dw=0x%08X) (frameCount=%lu)",
+                           g_SelectedLives, uMefa.f, uMefa.dw, uCr.f, uCr.dw, frameCount);
             }
         }
     }
@@ -1168,6 +1285,7 @@ __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion) {
 }
 
 static void ResetStageScore(void) {
+    UpdateSelectedLives();
     UpdateSelectedMefa();
     UpdateSelectedCr();
 
@@ -1183,7 +1301,7 @@ static void ResetStageScore(void) {
     // 2. Reset score & player status globals (mirrors Title scene start at 0x00441718)
     *(volatile DWORD*)0x5b8e20 = 0;                 // Score Low (32-bit)
     *(volatile DWORD*)0x5b8e24 = 0;                 // Score High (32-bit)
-    *(volatile DWORD*)0x5b8e08 = 2;                 // Lives (2 in reserve)
+    *(volatile DWORD*)0x5b8e08 = (DWORD)g_SelectedLives; // Lives (0..5 in reserve)
     *(volatile DWORD*)0x5b8e1c = 0;                 // Score multiplier / rate
     *(volatile DWORD*)0x5b8e14 = 0;                 // Prisms
     *(volatile DWORD*)0x5b8e10 = 0;                 // Miss / continue count
@@ -1201,7 +1319,7 @@ static void ResetStageScore(void) {
             *(DWORD*)(pGameState + s * 8 + 0x6d) = 0;                 // Saved Score High = 0
             *(DWORD*)(pGameState + s * 4 + 0x9d) = 0;                 // Saved multiplier = 0
             *(DWORD*)(pGameState + s * 4 + 0xcd) = 0;                 // Saved prisms = 0
-            *(DWORD*)(pGameState + s * 4 + 0x115) = 2;                // Saved lives = 2
+            *(DWORD*)(pGameState + s * 4 + 0x115) = (DWORD)g_SelectedLives; // Saved lives
             *(DWORD*)(pGameState + s * 4 + 0x12d) = g_SelectedMefaDword; // Saved stageMefa
             *(DWORD*)(pGameState + s * 4 + 0x145) = g_SelectedCrDword;   // Saved stageCr
             *(DWORD*)(pGameState + s * 4 + 0x15d) = 0;
@@ -1213,8 +1331,8 @@ static void ResetStageScore(void) {
         *(DWORD*)(pGameState + 0x7a8) = 0; // Total play time = 0
     }
 
-    LogMessage("ResetStageScore: Score and player stats reset (MEFA=%f (dw=0x%08X), CR=%f (dw=0x%08X), GameState=0x%p)",
-               uMefa.f, uMefa.dw, uCr.f, uCr.dw, pGameState);
+    LogMessage("ResetStageScore: Score and player stats reset (Lives=%d, MEFA=%f (dw=0x%08X), CR=%f (dw=0x%08X), GameState=0x%p)",
+               g_SelectedLives, uMefa.f, uMefa.dw, uCr.f, uCr.dw, pGameState);
 }
 
 // In-game F1-F5 hotkeys thread (for practice stage warp anytime)
@@ -1397,6 +1515,30 @@ static void InstallHooks(void) {
         }
     } else {
         LogMessage("[Error] SetCR signature at 0x%08X did not match!", setCrAddr);
+    }
+
+    // 7. SetLives Hook at 0x00462535 (8 bytes: 8B 45 08 A3 08 8E 5B 00) - Native 77
+    void *setLivesAddr = (void*)0x00462535;
+    unsigned char expectedSetLives[8] = {
+        0x8B, 0x45, 0x08,
+        0xA3, 0x08, 0x8E, 0x5B, 0x00
+    };
+    if (memcmp(setLivesAddr, expectedSetLives, 8) == 0) {
+        if (VirtualProtect(setLivesAddr, 8, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            unsigned char patch[8];
+            patch[0] = 0xE9; // JMP rel32
+            DWORD relOffset = (DWORD)Hook_SetLives - ((DWORD)setLivesAddr + 5);
+            memcpy(&patch[1], &relOffset, 4);
+            patch[5] = 0x90; // NOP
+            patch[6] = 0x90; // NOP
+            patch[7] = 0x90; // NOP
+            memcpy(setLivesAddr, patch, 8);
+            VirtualProtect(setLivesAddr, 8, oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), setLivesAddr, 8);
+            LogMessage("SetLives hook installed successfully at 0x%08X", setLivesAddr);
+        }
+    } else {
+        LogMessage("[Error] SetLives signature at 0x%08X did not match!", setLivesAddr);
     }
 
     // Leave the script entry point alone: the stage-select logic only needs the scene
