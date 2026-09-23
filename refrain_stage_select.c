@@ -936,16 +936,14 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
     }
 
     DWORD currentScene = *(volatile DWORD*)0x5c073c;
-    if (g_ReturnToStageMenu && currentScene <= 2) {
+    if (g_ReturnToStageMenu && currentScene == 1) {
         g_ReturnToStageMenu = 0;
         g_ShowStageMenu = 1;
         g_ActiveColumn = 0;
         g_StageSelected = 0;
         g_PracticeMode = 1;
-        int targetStage = g_MenuItems[g_MenuCursor].stage;
-        *(volatile DWORD*)0x5c0740 = 2 + targetStage;
-        LogMessage("Practice stage finished -> Title/Menu reached (scene=%lu), showing Stage Menu for stage %d",
-                   currentScene, targetStage);
+        LogMessage("Practice stage finished -> Title reached (scene=%lu), showing Stage Menu for stage %d",
+                   currentScene, g_MenuItems[g_MenuCursor].stage);
     }
 
     if (g_ShowStageMenu) {
@@ -975,10 +973,10 @@ void __attribute__((naked)) Hook_EndScene(void) {
 void __cdecl HandleSceneCheck(DWORD *pEdx) {
     DWORD nextScene = *pEdx;
 
-    if (nextScene <= 2) {
+    if (nextScene == 1) {
         g_StageSelected = 0;
         if (!g_ReturnToStageMenu) {
-            g_PracticeMode = 0; // reset practice mode when returning to Title or Menu without practice return
+            g_PracticeMode = 0; // reset practice mode when returning to Title without practice return
         }
         g_LastResetTargetScene = 0;
         g_PendingStageInitStats = 0;
@@ -1058,9 +1056,9 @@ DWORD __cdecl HandleTrans(void) {
 
     // Practice Mode: when a stage finishes (clear, game over, quit to title, etc.), redirect transition to Title
     // and flag g_ReturnToStageMenu so the Stage Menu re-opens upon arrival.
-    // Note: In RefRain, in-game gameplay scene is 10. Transitions out of scene 10 signify stage end.
-    if (((prevScene >= 3 && prevScene <= 7) || prevScene == 10) &&
-        prevScene != nextScene && nextScene != 10 &&
+    // In RefRain, in-game gameplay scene is 2 (CGameScene). Transitions out of scene 2 signify stage end.
+    if ((prevScene == 2 || (prevScene >= 3 && prevScene <= 10)) &&
+        prevScene != nextScene &&
         g_PracticeMode && g_PendingReset == 0) {
         LogMessage("Practice stage end (prev=%lu next=%lu) -> redirecting to Title", prevScene, nextScene);
         g_ReturnToStageMenu = 1;
@@ -1069,17 +1067,15 @@ DWORD __cdecl HandleTrans(void) {
         return prevScene;
     }
 
-    // Practice Mode: once arrived at Title/Menu after stage end, open the Stage Menu
-    if (prevScene <= 2 && g_ReturnToStageMenu) {
+    // Practice Mode: once arrived at Title after stage end, open the Stage Menu
+    if (prevScene == 1 && g_ReturnToStageMenu) {
         g_ReturnToStageMenu = 0;
         g_ShowStageMenu = 1;
         g_ActiveColumn = 0;
         g_StageSelected = 0;
         g_PracticeMode = 1;
-        int targetStage = g_MenuItems[g_MenuCursor].stage;
-        *(volatile DWORD*)0x5c0740 = 2 + targetStage;
-        LogMessage("Arrived at Title after practice stage -> opening Stage Menu for stage %d", targetStage);
-        return 2 + targetStage;
+        LogMessage("Arrived at Title after practice stage -> opening Stage Menu for stage %d", g_MenuItems[g_MenuCursor].stage);
+        return prevScene;
     }
 
     // When the game is about to enter a stage scene (Stages 1-5 = scenes 3-7) and no stage has been selected yet
