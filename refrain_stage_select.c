@@ -1125,7 +1125,7 @@ void __attribute__((naked)) Hook_EndScene(void) {
 void __cdecl HandleSceneCheck(DWORD *pEdx) {
     DWORD nextScene = *pEdx;
 
-    if (nextScene == 1) {
+    if (nextScene <= 2) {
         g_StageSelected = 0;
         g_LastResetTargetScene = 0;
         g_PendingStageInitStats = 0;
@@ -1204,13 +1204,25 @@ DWORD __cdecl HandleTrans(void) {
     // When the game is about to enter a stage scene (Stages 1-5 = scenes 3-7) and no stage has been selected yet
     // Note: Scene 8 is Stage 6 (Tutorial), which is excluded from the stage select menu
     if (nextScene >= 3 && nextScene <= 7 && !g_StageSelected) {
-        if (!g_ShowStageMenu) {
+        if (g_ShowStageMenu) {
+            // Stage select menu is already open; keep suppressing transition
+            return nextScene;
+        }
+
+        // Only show stage select menu if Shift was held when starting the game
+        int isShift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (isShift) {
             g_ShowStageMenu = 1;
             g_ActiveColumn = 0;
-            LogMessage("Trans intercepted: prev=%lu next=%lu -> showing stage select menu", prevScene, nextScene);
+            LogMessage("Trans intercepted with SHIFT: prev=%lu next=%lu -> showing stage select menu", prevScene, nextScene);
+            // Return nextScene so eax == [0x5c0740] -> equality check passes -> skip transition
+            return nextScene;
+        } else {
+            // Normal game start without Shift: pass through directly to original game start
+            g_StageSelected = 1;
+            LogMessage("Game started normally (without Shift): prev=%lu next=%lu -> starting stage directly", prevScene, nextScene);
+            return prevScene;
         }
-        // Return nextScene so eax == [0x5c0740] -> equality check passes -> skip transition
-        return nextScene;
     }
 
     // Run this on the game's transition thread, immediately before the
@@ -1269,12 +1281,20 @@ int __cdecl HandleLoadStart(void) {
     }
 
     if (!g_StageSelected) {
-        if (!g_ShowStageMenu) {
+        if (g_ShowStageMenu) {
+            return 1; // suppressed while menu is open
+        }
+        int isShift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (isShift) {
             g_ShowStageMenu = 1;
             g_ActiveColumn = 0;
-            LogMessage("LoadStart intercepted -> showing stage select menu");
+            LogMessage("LoadStart intercepted with SHIFT -> showing stage select menu");
+            return 1; // suppressed
+        } else {
+            g_StageSelected = 1;
+            LogMessage("LoadStart passed through normally (without Shift)");
+            return 0; // allow
         }
-        return 1; // suppressed
     }
     // Fallback: if transition hook was bypassed, reset score here too
     if (InterlockedExchange(&g_PendingReset, 0)) {
