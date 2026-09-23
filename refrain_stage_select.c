@@ -241,20 +241,7 @@ static void UpdateSelectedCr(void) {
     g_SelectedCrDword = u.dw;
 }
 
-// ---- Sound Effect (SE) Structures and Functions ----
-typedef struct {
-    int seId;
-    char name[128];
-    DWORD pSoundObj;
-} SeEntry;
-
-#define MAX_SE_ENTRIES 512
-static SeEntry g_SeEntries[MAX_SE_ENTRIES];
-static int g_TotalSeCount = 0;
-static int g_CurrentSeIndex = -1;
-static volatile int g_SeNotifyTimer = 0;
-static char g_SeNotifyText[160] = {0};
-
+// ---- Sound Effect (SE) Functions for Menu ----
 static void PlaySoundDirect(DWORD pSoundObj) {
     if (!pSoundObj || pSoundObj < 0x10000 || pSoundObj > 0x7fff0000) return;
 
@@ -304,159 +291,6 @@ static void PlayGameSE(int seIndex) {
         PlaySoundDirect(pSoundObj);
         LogMessage("PlayGameSE(%d): played OK", seIndex);
     }
-}
-
-// Scans loaded SE arrays (Range 0..999, Range 1000..9999, Range 10000+)
-static int RefreshSeList(void) {
-    g_TotalSeCount = 0;
-
-    static const struct {
-        DWORD startAddr;
-        DWORD endAddr;
-        int baseId;
-    } ranges[3] = {
-        { 0x5c0710, 0x5c0714, 0 },
-        { 0x5c071c, 0x5c0720, 1000 },
-        { 0x5c0728, 0x5c072c, 10000 }
-    };
-
-    for (int r = 0; r < 3; r++) {
-        DWORD start = *(volatile DWORD*)ranges[r].startAddr;
-        DWORD end   = *(volatile DWORD*)ranges[r].endAddr;
-        if (!start || !end || end <= start || (end - start) > 0x100000) continue;
-
-        int count = (int)((end - start) / 8);
-        for (int i = 0; i < count; i++) {
-            DWORD pObj = *(DWORD*)(start + i * 8);
-            if (!pObj || pObj < 0x10000 || pObj > 0x7fff0000) continue;
-
-            // Check if sound buffers exist
-            DWORD bufCount = *(DWORD*)(pObj + 0x108);
-            if (bufCount == 0 || bufCount > 16) continue;
-
-            DWORD bufIdx = *(DWORD*)(pObj + 0x134);
-            if (bufIdx >= bufCount) bufIdx = 0;
-
-            DWORD pDSBuf = *(DWORD*)(pObj + 0x10c + bufIdx * 4);
-            if (!pDSBuf || pDSBuf < 0x10000 || pDSBuf > 0x7fff0000) continue;
-
-            if (g_TotalSeCount < MAX_SE_ENTRIES) {
-                g_SeEntries[g_TotalSeCount].seId = ranges[r].baseId + i;
-                g_SeEntries[g_TotalSeCount].pSoundObj = pObj;
-
-                const char *pName = (const char*)(pObj + 4);
-                int validName = 0;
-                if (pName) {
-                    int len = 0;
-                    while (len < 64 && pName[len] != '\0') {
-                        unsigned char c = (unsigned char)pName[len];
-                        if (c < 32 || c >= 127) {
-                            len = 0;
-                            break;
-                        }
-                        len++;
-                    }
-                    if (len > 0) {
-                        memcpy(g_SeEntries[g_TotalSeCount].name, pName, len);
-                        g_SeEntries[g_TotalSeCount].name[len] = '\0';
-                        validName = 1;
-                    }
-                }
-                if (!validName) {
-                    snprintf(g_SeEntries[g_TotalSeCount].name, sizeof(g_SeEntries[g_TotalSeCount].name), "SE_%d", ranges[r].baseId + i);
-                }
-                g_TotalSeCount++;
-            }
-        }
-    }
-
-    return g_TotalSeCount;
-}
-
-// Sequential SE playback: direction = +1 (next, F8), -1 (prev, Shift+F8)
-static void PlayNextSE(int direction) {
-    int count = RefreshSeList();
-    if (count == 0) {
-        LogMessage("[F8 Sound Test] No loaded sound effects found in memory");
-        snprintf(g_SeNotifyText, sizeof(g_SeNotifyText), "SE Test: No loaded SE found");
-        g_SeNotifyTimer = 120;
-        return;
-    }
-
-    if (g_CurrentSeIndex < 0 || g_CurrentSeIndex >= count) {
-        g_CurrentSeIndex = (direction < 0) ? (count - 1) : 0;
-    } else {
-        if (direction < 0) {
-            g_CurrentSeIndex = (g_CurrentSeIndex - 1 + count) % count;
-        } else {
-            g_CurrentSeIndex = (g_CurrentSeIndex + 1) % count;
-        }
-    }
-
-    SeEntry *entry = &g_SeEntries[g_CurrentSeIndex];
-
-    // Play the sound directly
-    PlaySoundDirect(entry->pSoundObj);
-
-    // Prepare OSD notification text
-    char tempBuf[160];
-    snprintf(tempBuf, sizeof(tempBuf), "SE %d: %s [%d/%d]",
-             entry->seId, entry->name, g_CurrentSeIndex + 1, count);
-    strncpy(g_SeNotifyText, tempBuf, sizeof(g_SeNotifyText) - 1);
-    g_SeNotifyText[sizeof(g_SeNotifyText) - 1] = '\0';
-    g_SeNotifyTimer = 180; // 3 seconds at 60fps
-
-    LogMessage("[F8 Sound Test] [%d/%d] Playing SE %d ('%s')",
-               g_CurrentSeIndex + 1, count, entry->seId, entry->name);
-}
-
-// OSD banner rendering for SE Sound Test
-static void OnRenderSeNotification(IDirect3DDevice9 *pDevice) {
-    if (g_SeNotifyTimer <= 0) return;
-    g_SeNotifyTimer--;
-
-    D3DVIEWPORT9 vp;
-    if (FAILED(pDevice->lpVtbl->GetViewport(pDevice, &vp))) {
-        vp.Width = 640;
-        vp.Height = 480;
-    }
-
-    EnsureFont(pDevice, vp.Width);
-    if (!g_pFont) return;
-
-    DWORD fvf, alphaBlend, srcBlend, destBlend, zEnable, lighting, cullMode;
-    pDevice->lpVtbl->GetFVF(pDevice, &fvf);
-    pDevice->lpVtbl->GetRenderState(pDevice, D3DRS_ALPHABLENDENABLE, &alphaBlend);
-    pDevice->lpVtbl->GetRenderState(pDevice, D3DRS_SRCBLEND, &srcBlend);
-    pDevice->lpVtbl->GetRenderState(pDevice, D3DRS_DESTBLEND, &destBlend);
-    pDevice->lpVtbl->GetRenderState(pDevice, D3DRS_ZENABLE, &zEnable);
-    pDevice->lpVtbl->GetRenderState(pDevice, D3DRS_LIGHTING, &lighting);
-    pDevice->lpVtbl->GetRenderState(pDevice, D3DRS_CULLMODE, &cullMode);
-
-    pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_ALPHABLENDENABLE, TRUE);
-    pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-    pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-    pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_ZENABLE, FALSE);
-    pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_LIGHTING, FALSE);
-    pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_CULLMODE, D3DCULL_NONE);
-    pDevice->lpVtbl->SetTexture(pDevice, 0, NULL);
-
-    float notifW = 420.0f;
-    float notifH = 28.0f;
-    float notifX = ((float)vp.Width - notifW) * 0.5f;
-    float notifY = 12.0f;
-
-    DrawSolidRect(pDevice, notifX - 2.0f, notifY - 2.0f, notifW + 4.0f, notifH + 4.0f, 0xFF00BFFF);
-    DrawSolidRect(pDevice, notifX, notifY, notifW, notifH, 0xEE0D111A);
-    DrawShadowText(g_pFont, g_SeNotifyText, (int)notifX + 12, (int)notifY + 5, 0xFFFFCC00);
-
-    pDevice->lpVtbl->SetFVF(pDevice, fvf);
-    pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_ALPHABLENDENABLE, alphaBlend);
-    pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_SRCBLEND, srcBlend);
-    pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_DESTBLEND, destBlend);
-    pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_ZENABLE, zEnable);
-    pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_LIGHTING, lighting);
-    pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_CULLMODE, cullMode);
 }
 
 // Check if the game is currently loading or playing a replay, demo, or tutorial
@@ -1101,9 +935,6 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
     if (g_ShowStageMenu) {
         OnRenderMenu(pDevice);
     }
-    if (g_SeNotifyTimer > 0) {
-        OnRenderSeNotification(pDevice);
-    }
 }
 
 void __attribute__((naked)) Hook_EndScene(void) {
@@ -1469,17 +1300,6 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
                 }
             }
             key_state[i] = is_down;
-        }
-
-        // F8 hotkey: Sequential SE playback (Shift+F8: previous SE) - only enabled in Practice Mode
-        if (g_PracticeMode) {
-            static int f8_down = 0;
-            int is_f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-            if (is_f8 && !f8_down) {
-                int is_shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-                PlayNextSE(is_shift ? -1 : 1);
-            }
-            f8_down = is_f8;
         }
     }
     return 0;
