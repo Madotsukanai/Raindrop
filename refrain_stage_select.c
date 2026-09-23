@@ -923,9 +923,9 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
 
         g_StageInitRenderFrames++;
 
-        // Once in game scene (scene 2..7), player object exists, and at least 30 frames elapsed
+        // Once in game scene (scene 2..7, 10), player object exists, and at least 30 frames elapsed
         // Or if 120 render frames have elapsed in the game scene (safety fallback)
-        if (currentScene >= 2 && currentScene <= 7) {
+        if ((currentScene >= 2 && currentScene <= 7) || currentScene == 10) {
             if ((pPlayer != 0 && frameCount >= 30) || g_StageInitRenderFrames >= 120) {
                 g_PendingStageInitStats = 0;
                 g_StageInitRenderFrames = 0;
@@ -1058,9 +1058,13 @@ DWORD __cdecl HandleTrans(void) {
 
     // Practice Mode: when a stage finishes (clear, game over, quit to title, etc.), redirect transition to Title
     // and flag g_ReturnToStageMenu so the Stage Menu re-opens upon arrival.
-    if (prevScene >= 3 && prevScene <= 7 && g_PracticeMode && g_PendingReset == 0) {
+    // Note: In RefRain, in-game gameplay scene is 10. Transitions out of scene 10 signify stage end.
+    if (((prevScene >= 3 && prevScene <= 7) || prevScene == 10) &&
+        prevScene != nextScene && nextScene != 10 &&
+        g_PracticeMode && g_PendingReset == 0) {
         LogMessage("Practice stage end (prev=%lu next=%lu) -> redirecting to Title", prevScene, nextScene);
         g_ReturnToStageMenu = 1;
+        g_StageSelected = 0;
         *(volatile DWORD*)0x5c0740 = 1; // redirect scene transition to Title
         return prevScene;
     }
@@ -1316,9 +1320,9 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
             int is_down = (GetAsyncKeyState(VK_F1 + i) & 0x8000) != 0;
             if (is_down && !key_state[i]) {
                 int stage = i + 1;
-                // Allow warp during menu (scene 2) and gameplay (scene 3-7).
+                // Allow warp during menu (scene 2) and gameplay (scene 10 or 3-7).
                 // Block while our custom stage menu is showing.
-                if (!g_ShowStageMenu && currentScene >= 2 && currentScene <= 7) {
+                if (!g_ShowStageMenu && ((currentScene >= 2 && currentScene <= 7) || currentScene == 10)) {
                     if (IsReplayOrDemo()) {
                         // Replay mode: check if the replay contains this stage
                         if (!ReplayHasStage(stage)) {
