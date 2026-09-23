@@ -47,6 +47,7 @@ typedef HRESULT (WINAPI *PFN_D3DXCreateFontA)(
 );
 
 static ID3DXFont *g_pFont = NULL;
+static ID3DXFont *g_pStageFont = NULL;
 static ID3DXFont *g_pTitleFont = NULL;
 static ID3DXFont *g_pFooterFont = NULL;
 static DWORD g_CurrentFontWidth = 0;
@@ -90,6 +91,7 @@ static void DrawSolidRect(IDirect3DDevice9 *pDevice, float x, float y, float w, 
 static void EnsureFont(IDirect3DDevice9 *pDevice, DWORD screenW) {
     if (g_pFont && g_CurrentFontWidth != screenW) {
         if (g_pFont) { g_pFont->lpVtbl->Release(g_pFont); g_pFont = NULL; }
+        if (g_pStageFont) { g_pStageFont->lpVtbl->Release(g_pStageFont); g_pStageFont = NULL; }
         if (g_pTitleFont) { g_pTitleFont->lpVtbl->Release(g_pTitleFont); g_pTitleFont = NULL; }
         if (g_pFooterFont) { g_pFooterFont->lpVtbl->Release(g_pFooterFont); g_pFooterFont = NULL; }
     }
@@ -100,12 +102,16 @@ static void EnsureFont(IDirect3DDevice9 *pDevice, DWORD screenW) {
             PFN_D3DXCreateFontA pfnCreateFont = (PFN_D3DXCreateFontA)GetProcAddress(hD3DX, "D3DXCreateFontA");
             if (pfnCreateFont) {
                 int itemH = (screenW >= 1000) ? 22 : 14;
-                int titleH = (screenW >= 1000) ? 26 : 17;
-                int footerH = (screenW >= 1000) ? 18 : 13;
+                int stageH = (screenW >= 1000) ? 20 : 13;
+                int titleH = (screenW >= 1000) ? 26 : 16;
+                int footerH = (screenW >= 1000) ? 18 : 12;
 
                 pfnCreateFont(pDevice, itemH, 0, FW_BOLD, 1, FALSE, DEFAULT_CHARSET,
                               OUT_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
                               "Arial", &g_pFont);
+                pfnCreateFont(pDevice, stageH, 0, FW_BOLD, 1, FALSE, DEFAULT_CHARSET,
+                              OUT_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                              "Arial", &g_pStageFont);
                 pfnCreateFont(pDevice, titleH, 0, FW_HEAVY, 1, FALSE, DEFAULT_CHARSET,
                               OUT_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
                               "Arial", &g_pTitleFont);
@@ -113,8 +119,8 @@ static void EnsureFont(IDirect3DDevice9 *pDevice, DWORD screenW) {
                               OUT_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
                               "Arial", &g_pFooterFont);
                 g_CurrentFontWidth = screenW;
-                LogMessage("Fonts created for screenW=%lu: itemH=%d, titleH=%d, footerH=%d",
-                           screenW, itemH, titleH, footerH);
+                LogMessage("Fonts created for screenW=%lu: itemH=%d, stageH=%d, titleH=%d, footerH=%d",
+                           screenW, itemH, stageH, titleH, footerH);
             }
         }
     }
@@ -145,11 +151,11 @@ typedef struct {
 #define MENU_ITEM_COUNT 5
 
 static const MenuItem g_MenuItems[MENU_ITEM_COUNT] = {
-    { 1, "ST.1: PRISM SYSTEM" },
-    { 2, "ST.2: MEMORIES" },
-    { 3, "ST.3: DEEP ZONE" },
-    { 4, "ST.4: COUNTERMEASURE" },
-    { 5, "ST.5: CORE PRISM" },
+    { 1, "Central 01 - The way to UTOPIA / Natural Landscape -" },
+    { 2, "Central 02 - DATA Flow / Artificial Landscape -" },
+    { 3, "Central 03 - Virtual-Labo-Factory / Virtual Reality-" },
+    { 4, "Central 04 - Divergence layer of higher level data / Haze in dezert-" },
+    { 5, "Central 05 - The Central Nervous System / M.R.S. Central Core-" },
 };
 
 typedef struct {
@@ -579,48 +585,61 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_CULLMODE, D3DCULL_NONE);
     pDevice->lpVtbl->SetTexture(pDevice, 0, NULL);
 
-    // Layout configuration: 5 panels side by side + bottom footer
+    // Layout configuration: 2-Row Layout
+    // Row 1 (Top): STAGE SELECT (Full width)
+    // Row 2 (Bottom): 4 parameter columns (LIVES, M.E.F.A.2, CR STOCK, CR GAUGE)
+    // Footer: Navigation guide
     int isHD = (vp.Width >= 1000);
 
-    float w0, w1, w2, w3, w4, gap, totalW, boxH, footerH, headerH, lineSpacing;
+    float totalW, startX;
+    float stageBoxH, paramBoxH, footerH, rowGap;
+    float headerH, stageLineSpacing, paramLineSpacing;
+    float colW, colGap;
+    float stageHighlightH, paramHighlightH;
 
     if (isHD) {
-        w0 = 310.0f; // Stage
-        w1 = 150.0f; // Lives
-        w2 = 180.0f; // M.E.F.A.2
-        w3 = 194.0f; // CR Stock
-        w4 = 214.0f; // CR Gauge
-        gap = 8.0f;
-        totalW = w0 + gap + w1 + gap + w2 + gap + w3 + gap + w4; // 1080.0f
-        boxH = 350.0f;
-        footerH = 68.0f;
-        headerH = 38.0f;
-        lineSpacing = 38.0f;
+        totalW = 1200.0f;
+        stageBoxH = 200.0f;
+        paramBoxH = 280.0f;
+        footerH = 64.0f;
+        rowGap = 10.0f;
+        headerH = 34.0f;
+        stageLineSpacing = 28.0f;
+        paramLineSpacing = 32.0f;
+        colGap = 16.0f;
+        colW = (totalW - (3.0f * colGap)) / 4.0f; // (1200 - 48) / 4 = 288.0f
+        stageHighlightH = 24.0f;
+        paramHighlightH = 24.0f;
     } else {
-        w0 = 190.0f; // Stage
-        w1 = 86.0f;  // Lives
-        w2 = 110.0f; // M.E.F.A.2
-        w3 = 112.0f; // CR Stock
-        w4 = 110.0f; // CR Gauge
-        gap = 4.0f;
-        totalW = w0 + gap + w1 + gap + w2 + gap + w3 + gap + w4; // 624.0f
-        boxH = 264.0f;
-        footerH = 52.0f;
-        headerH = 28.0f;
-        lineSpacing = 28.0f;
+        totalW = 616.0f;
+        stageBoxH = 136.0f;
+        paramBoxH = 176.0f;
+        footerH = 46.0f;
+        rowGap = 6.0f;
+        headerH = 24.0f;
+        stageLineSpacing = 20.0f;
+        paramLineSpacing = 20.0f;
+        colGap = 8.0f;
+        colW = (totalW - (3.0f * colGap)) / 4.0f; // (616 - 24) / 4 = 148.0f
+        stageHighlightH = 18.0f;
+        paramHighlightH = 18.0f;
     }
 
-    float totalH = boxH + (isHD ? 12.0f : 8.0f) + footerH;
-    float startX = ((float)vp.Width - totalW) * 0.5f;
+    float totalH = stageBoxH + rowGap + paramBoxH + rowGap + footerH;
+    startX = ((float)vp.Width - totalW) * 0.5f;
     if (startX < 8.0f) startX = 8.0f;
-    float x0 = startX;
-    float x1 = x0 + w0 + gap;
-    float x2 = x1 + w1 + gap;
-    float x3 = x2 + w2 + gap;
-    float x4 = x3 + w3 + gap;
 
-    float boxY = ((float)vp.Height - totalH) * 0.5f;
-    float footerY = boxY + boxH + (isHD ? 12.0f : 8.0f);
+    float startY = ((float)vp.Height - totalH) * 0.5f;
+    if (startY < 4.0f) startY = 4.0f;
+
+    float stageBoxY = startY;
+    float paramBoxY = stageBoxY + stageBoxH + rowGap;
+    float footerY   = paramBoxY + paramBoxH + rowGap;
+
+    float xLives   = startX;
+    float xMefa    = xLives + colW + colGap;
+    float xCrStock = xMefa + colW + colGap;
+    float xCrGauge = xCrStock + colW + colGap;
 
     // Active/Inactive visual styles
     DWORD borderCol0 = (g_ActiveColumn == 0) ? 0xFF00BFFF : 0xFF335577;
@@ -641,154 +660,150 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     DWORD titleCol3  = (g_ActiveColumn == 3) ? 0xFFFFCC00 : 0xFF88AABB;
     DWORD titleCol4  = (g_ActiveColumn == 4) ? 0xFFFFCC00 : 0xFF88AABB;
 
-    // Panel 0: STAGE
-    DrawSolidRect(pDevice, x0 - 3.0f, boxY - 3.0f, w0 + 6.0f, boxH + 6.0f, borderCol0);
-    DrawSolidRect(pDevice, x0, boxY, w0, boxH, 0xEE0D111A);
-    DrawSolidRect(pDevice, x0 + 6.0f, boxY + 6.0f, w0 - 12.0f, headerH, headerBg0);
-    DrawShadowText(g_pTitleFont, "STAGE", (int)x0 + (isHD ? 16 : 10), (int)boxY + (isHD ? 12 : 8), titleCol0);
-
-    // Panel 1: LIVES
-    DrawSolidRect(pDevice, x1 - 3.0f, boxY - 3.0f, w1 + 6.0f, boxH + 6.0f, borderCol1);
-    DrawSolidRect(pDevice, x1, boxY, w1, boxH, 0xEE0D111A);
-    DrawSolidRect(pDevice, x1 + 6.0f, boxY + 6.0f, w1 - 12.0f, headerH, headerBg1);
-    DrawShadowText(g_pTitleFont, "LIVES", (int)x1 + (isHD ? 14 : 8), (int)boxY + (isHD ? 12 : 8), titleCol1);
-
-    // Panel 2: M.E.F.A.2
-    DrawSolidRect(pDevice, x2 - 3.0f, boxY - 3.0f, w2 + 6.0f, boxH + 6.0f, borderCol2);
-    DrawSolidRect(pDevice, x2, boxY, w2, boxH, 0xEE0D111A);
-    DrawSolidRect(pDevice, x2 + 6.0f, boxY + 6.0f, w2 - 12.0f, headerH, headerBg2);
-    DrawShadowText(g_pTitleFont, "M.E.F.A.2", (int)x2 + (isHD ? 14 : 8), (int)boxY + (isHD ? 12 : 8), titleCol2);
-
-    // Panel 3: CR STOCK
-    DrawSolidRect(pDevice, x3 - 3.0f, boxY - 3.0f, w3 + 6.0f, boxH + 6.0f, borderCol3);
-    DrawSolidRect(pDevice, x3, boxY, w3, boxH, 0xEE0D111A);
-    DrawSolidRect(pDevice, x3 + 6.0f, boxY + 6.0f, w3 - 12.0f, headerH, headerBg3);
-    DrawShadowText(g_pTitleFont, "CR STOCK", (int)x3 + (isHD ? 14 : 8), (int)boxY + (isHD ? 12 : 8), titleCol3);
-
-    // Panel 4: CR GAUGE
-    DrawSolidRect(pDevice, x4 - 3.0f, boxY - 3.0f, w4 + 6.0f, boxH + 6.0f, borderCol4);
-    DrawSolidRect(pDevice, x4, boxY, w4, boxH, 0xEE0D111A);
-    DrawSolidRect(pDevice, x4 + 6.0f, boxY + 6.0f, w4 - 12.0f, headerH, headerBg4);
-    DrawShadowText(g_pTitleFont, "CR GAUGE", (int)x4 + (isHD ? 14 : 8), (int)boxY + (isHD ? 12 : 8), titleCol4);
-
-    // Draw items
-    int startY = (int)boxY + (isHD ? 56 : 42);
-    float highlightH = isHD ? 30.0f : 24.0f;
+    // Top Panel: STAGE SELECT (Full width)
+    DrawSolidRect(pDevice, startX - 2.0f, stageBoxY - 2.0f, totalW + 4.0f, stageBoxH + 4.0f, borderCol0);
+    DrawSolidRect(pDevice, startX, stageBoxY, totalW, stageBoxH, 0xEE0D111A);
+    DrawSolidRect(pDevice, startX + 4.0f, stageBoxY + 4.0f, totalW - 8.0f, headerH, headerBg0);
+    DrawShadowText(g_pTitleFont, "STAGE SELECT", (int)startX + (isHD ? 14 : 10), (int)stageBoxY + (isHD ? 8 : 5), titleCol0);
 
     // Items for Column 0 (Stage)
+    int stageStartY = (int)stageBoxY + (isHD ? 44 : 30);
     for (int i = 0; i < MENU_ITEM_COUNT; i++) {
-        int itemY = startY + (int)(i * lineSpacing);
+        int itemY = stageStartY + (int)(i * stageLineSpacing);
         char buf[128];
         if (i == g_MenuCursor) {
             if (g_ActiveColumn == 0) {
-                DrawSolidRect(pDevice, x0 + 6.0f, (float)itemY - 2.0f, w0 - 12.0f, highlightH, 0x660077CC);
+                DrawSolidRect(pDevice, startX + 4.0f, (float)itemY - 1.0f, totalW - 8.0f, stageHighlightH, 0x660077CC);
                 snprintf(buf, sizeof(buf), ">> %s", g_MenuItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x0 + 8, itemY, 0xFFFFFF00);
+                DrawShadowText(g_pStageFont ? g_pStageFont : g_pFont, buf, (int)startX + (isHD ? 12 : 8), itemY, 0xFFFFFF00);
             } else {
-                DrawSolidRect(pDevice, x0 + 6.0f, (float)itemY - 2.0f, w0 - 12.0f, highlightH, 0x44005588);
+                DrawSolidRect(pDevice, startX + 4.0f, (float)itemY - 1.0f, totalW - 8.0f, stageHighlightH, 0x44005588);
                 snprintf(buf, sizeof(buf), ">> %s", g_MenuItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x0 + 8, itemY, 0xFF00FFCC);
+                DrawShadowText(g_pStageFont ? g_pStageFont : g_pFont, buf, (int)startX + (isHD ? 12 : 8), itemY, 0xFF00FFCC);
             }
         } else {
             snprintf(buf, sizeof(buf), "   %s", g_MenuItems[i].label);
-            DrawShadowText(g_pFont, buf, (int)x0 + 8, itemY, (g_ActiveColumn == 0) ? 0xFFAAAAAA : 0xFF666666);
+            DrawShadowText(g_pStageFont ? g_pStageFont : g_pFont, buf, (int)startX + (isHD ? 12 : 8), itemY, (g_ActiveColumn == 0) ? 0xFFAAAAAA : 0xFF666666);
         }
     }
 
-    // Items for Column 1 (Lives)
+    // Bottom Row: 4 parameter columns
+    int paramStartY = (int)paramBoxY + (isHD ? 44 : 30);
+
+    // Column 1: LIVES
+    DrawSolidRect(pDevice, xLives - 2.0f, paramBoxY - 2.0f, colW + 4.0f, paramBoxH + 4.0f, borderCol1);
+    DrawSolidRect(pDevice, xLives, paramBoxY, colW, paramBoxH, 0xEE0D111A);
+    DrawSolidRect(pDevice, xLives + 4.0f, paramBoxY + 4.0f, colW - 8.0f, headerH, headerBg1);
+    DrawShadowText(g_pTitleFont, "LIVES", (int)xLives + (isHD ? 12 : 8), (int)paramBoxY + (isHD ? 8 : 5), titleCol1);
+
     for (int i = 0; i < LIFE_ITEM_COUNT; i++) {
-        int itemY = startY + (int)(i * lineSpacing);
-        char buf[128];
+        int itemY = paramStartY + (int)(i * paramLineSpacing);
+        char buf[64];
         if (i == g_LifeCursor) {
             if (g_ActiveColumn == 1) {
-                DrawSolidRect(pDevice, x1 + 6.0f, (float)itemY - 2.0f, w1 - 12.0f, highlightH, 0x660077CC);
+                DrawSolidRect(pDevice, xLives + 4.0f, (float)itemY - 1.0f, colW - 8.0f, paramHighlightH, 0x660077CC);
                 snprintf(buf, sizeof(buf), ">> %s", g_LifeItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x1 + 6, itemY, 0xFFFFFF00);
+                DrawShadowText(g_pFont, buf, (int)xLives + 6, itemY, 0xFFFFFF00);
             } else if (g_ActiveColumn > 1) {
-                DrawSolidRect(pDevice, x1 + 6.0f, (float)itemY - 2.0f, w1 - 12.0f, highlightH, 0x44005588);
+                DrawSolidRect(pDevice, xLives + 4.0f, (float)itemY - 1.0f, colW - 8.0f, paramHighlightH, 0x44005588);
                 snprintf(buf, sizeof(buf), ">> %s", g_LifeItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x1 + 6, itemY, 0xFF00FFCC);
+                DrawShadowText(g_pFont, buf, (int)xLives + 6, itemY, 0xFF00FFCC);
             } else {
-                DrawSolidRect(pDevice, x1 + 6.0f, (float)itemY - 2.0f, w1 - 12.0f, highlightH, 0x22112233);
+                DrawSolidRect(pDevice, xLives + 4.0f, (float)itemY - 1.0f, colW - 8.0f, paramHighlightH, 0x22112233);
                 snprintf(buf, sizeof(buf), ">  %s", g_LifeItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x1 + 6, itemY, 0xFF888888);
+                DrawShadowText(g_pFont, buf, (int)xLives + 6, itemY, 0xFF888888);
             }
         } else {
             snprintf(buf, sizeof(buf), "   %s", g_LifeItems[i].label);
-            DrawShadowText(g_pFont, buf, (int)x1 + 6, itemY, (g_ActiveColumn == 1) ? 0xFFAAAAAA : 0xFF555555);
+            DrawShadowText(g_pFont, buf, (int)xLives + 6, itemY, (g_ActiveColumn == 1) ? 0xFFAAAAAA : 0xFF555555);
         }
     }
 
-    // Items for Column 2 (M.E.F.A.2)
+    // Column 2: M.E.F.A.2
+    DrawSolidRect(pDevice, xMefa - 2.0f, paramBoxY - 2.0f, colW + 4.0f, paramBoxH + 4.0f, borderCol2);
+    DrawSolidRect(pDevice, xMefa, paramBoxY, colW, paramBoxH, 0xEE0D111A);
+    DrawSolidRect(pDevice, xMefa + 4.0f, paramBoxY + 4.0f, colW - 8.0f, headerH, headerBg2);
+    DrawShadowText(g_pTitleFont, "M.E.F.A.2", (int)xMefa + (isHD ? 12 : 8), (int)paramBoxY + (isHD ? 8 : 5), titleCol2);
+
     for (int i = 0; i < MEFA_ITEM_COUNT; i++) {
-        int itemY = startY + (int)(i * lineSpacing);
-        char buf[128];
+        int itemY = paramStartY + (int)(i * paramLineSpacing);
+        char buf[64];
         if (i == g_MefaCursor) {
             if (g_ActiveColumn == 2) {
-                DrawSolidRect(pDevice, x2 + 6.0f, (float)itemY - 2.0f, w2 - 12.0f, highlightH, 0x660077CC);
+                DrawSolidRect(pDevice, xMefa + 4.0f, (float)itemY - 1.0f, colW - 8.0f, paramHighlightH, 0x660077CC);
                 snprintf(buf, sizeof(buf), ">> %s", g_MefaItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x2 + 8, itemY, 0xFFFFFF00);
+                DrawShadowText(g_pFont, buf, (int)xMefa + 6, itemY, 0xFFFFFF00);
             } else if (g_ActiveColumn > 2) {
-                DrawSolidRect(pDevice, x2 + 6.0f, (float)itemY - 2.0f, w2 - 12.0f, highlightH, 0x44005588);
+                DrawSolidRect(pDevice, xMefa + 4.0f, (float)itemY - 1.0f, colW - 8.0f, paramHighlightH, 0x44005588);
                 snprintf(buf, sizeof(buf), ">> %s", g_MefaItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x2 + 8, itemY, 0xFF00FFCC);
+                DrawShadowText(g_pFont, buf, (int)xMefa + 6, itemY, 0xFF00FFCC);
             } else {
-                DrawSolidRect(pDevice, x2 + 6.0f, (float)itemY - 2.0f, w2 - 12.0f, highlightH, 0x22112233);
+                DrawSolidRect(pDevice, xMefa + 4.0f, (float)itemY - 1.0f, colW - 8.0f, paramHighlightH, 0x22112233);
                 snprintf(buf, sizeof(buf), ">  %s", g_MefaItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x2 + 8, itemY, 0xFF888888);
+                DrawShadowText(g_pFont, buf, (int)xMefa + 6, itemY, 0xFF888888);
             }
         } else {
             snprintf(buf, sizeof(buf), "   %s", g_MefaItems[i].label);
-            DrawShadowText(g_pFont, buf, (int)x2 + 8, itemY, (g_ActiveColumn == 2) ? 0xFFAAAAAA : 0xFF555555);
+            DrawShadowText(g_pFont, buf, (int)xMefa + 6, itemY, (g_ActiveColumn == 2) ? 0xFFAAAAAA : 0xFF555555);
         }
     }
 
-    // Items for Column 3 (CR Stock)
+    // Column 3: CR STOCK
+    DrawSolidRect(pDevice, xCrStock - 2.0f, paramBoxY - 2.0f, colW + 4.0f, paramBoxH + 4.0f, borderCol3);
+    DrawSolidRect(pDevice, xCrStock, paramBoxY, colW, paramBoxH, 0xEE0D111A);
+    DrawSolidRect(pDevice, xCrStock + 4.0f, paramBoxY + 4.0f, colW - 8.0f, headerH, headerBg3);
+    DrawShadowText(g_pTitleFont, "CR STOCK", (int)xCrStock + (isHD ? 12 : 8), (int)paramBoxY + (isHD ? 8 : 5), titleCol3);
+
     for (int i = 0; i < CR_STOCK_ITEM_COUNT; i++) {
-        int itemY = startY + (int)(i * lineSpacing);
-        char buf[128];
+        int itemY = paramStartY + (int)(i * paramLineSpacing);
+        char buf[64];
         if (i == g_CrStockCursor) {
             if (g_ActiveColumn == 3) {
-                DrawSolidRect(pDevice, x3 + 6.0f, (float)itemY - 2.0f, w3 - 12.0f, highlightH, 0x660077CC);
+                DrawSolidRect(pDevice, xCrStock + 4.0f, (float)itemY - 1.0f, colW - 8.0f, paramHighlightH, 0x660077CC);
                 snprintf(buf, sizeof(buf), ">> %s", g_CrStockItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x3 + 8, itemY, 0xFFFFFF00);
+                DrawShadowText(g_pFont, buf, (int)xCrStock + 6, itemY, 0xFFFFFF00);
             } else if (g_ActiveColumn > 3) {
-                DrawSolidRect(pDevice, x3 + 6.0f, (float)itemY - 2.0f, w3 - 12.0f, highlightH, 0x44005588);
+                DrawSolidRect(pDevice, xCrStock + 4.0f, (float)itemY - 1.0f, colW - 8.0f, paramHighlightH, 0x44005588);
                 snprintf(buf, sizeof(buf), ">> %s", g_CrStockItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x3 + 8, itemY, 0xFF00FFCC);
+                DrawShadowText(g_pFont, buf, (int)xCrStock + 6, itemY, 0xFF00FFCC);
             } else {
-                DrawSolidRect(pDevice, x3 + 6.0f, (float)itemY - 2.0f, w3 - 12.0f, highlightH, 0x22112233);
+                DrawSolidRect(pDevice, xCrStock + 4.0f, (float)itemY - 1.0f, colW - 8.0f, paramHighlightH, 0x22112233);
                 snprintf(buf, sizeof(buf), ">  %s", g_CrStockItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x3 + 8, itemY, 0xFF888888);
+                DrawShadowText(g_pFont, buf, (int)xCrStock + 6, itemY, 0xFF888888);
             }
         } else {
             snprintf(buf, sizeof(buf), "   %s", g_CrStockItems[i].label);
-            DrawShadowText(g_pFont, buf, (int)x3 + 8, itemY, (g_ActiveColumn == 3) ? 0xFFAAAAAA : 0xFF555555);
+            DrawShadowText(g_pFont, buf, (int)xCrStock + 6, itemY, (g_ActiveColumn == 3) ? 0xFFAAAAAA : 0xFF555555);
         }
     }
 
-    // Items for Column 4 (CR Gauge)
+    // Column 4: CR GAUGE
+    DrawSolidRect(pDevice, xCrGauge - 2.0f, paramBoxY - 2.0f, colW + 4.0f, paramBoxH + 4.0f, borderCol4);
+    DrawSolidRect(pDevice, xCrGauge, paramBoxY, colW, paramBoxH, 0xEE0D111A);
+    DrawSolidRect(pDevice, xCrGauge + 4.0f, paramBoxY + 4.0f, colW - 8.0f, headerH, headerBg4);
+    DrawShadowText(g_pTitleFont, "CR GAUGE", (int)xCrGauge + (isHD ? 12 : 8), (int)paramBoxY + (isHD ? 8 : 5), titleCol4);
+
     for (int i = 0; i < CR_GAUGE_ITEM_COUNT; i++) {
-        int itemY = startY + (int)(i * lineSpacing);
-        char buf[128];
+        int itemY = paramStartY + (int)(i * paramLineSpacing);
+        char buf[64];
         if (i == g_CrGaugeCursor) {
             if (g_ActiveColumn == 4) {
-                DrawSolidRect(pDevice, x4 + 6.0f, (float)itemY - 2.0f, w4 - 12.0f, highlightH, 0x660077CC);
+                DrawSolidRect(pDevice, xCrGauge + 4.0f, (float)itemY - 1.0f, colW - 8.0f, paramHighlightH, 0x660077CC);
                 snprintf(buf, sizeof(buf), ">> %s", g_CrGaugeItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x4 + 8, itemY, 0xFFFFFF00);
+                DrawShadowText(g_pFont, buf, (int)xCrGauge + 6, itemY, 0xFFFFFF00);
             } else {
-                DrawSolidRect(pDevice, x4 + 6.0f, (float)itemY - 2.0f, w4 - 12.0f, highlightH, 0x22112233);
+                DrawSolidRect(pDevice, xCrGauge + 4.0f, (float)itemY - 1.0f, colW - 8.0f, paramHighlightH, 0x22112233);
                 snprintf(buf, sizeof(buf), ">  %s", g_CrGaugeItems[i].label);
-                DrawShadowText(g_pFont, buf, (int)x4 + 8, itemY, 0xFF888888);
+                DrawShadowText(g_pFont, buf, (int)xCrGauge + 6, itemY, 0xFF888888);
             }
         } else {
             snprintf(buf, sizeof(buf), "   %s", g_CrGaugeItems[i].label);
-            DrawShadowText(g_pFont, buf, (int)x4 + 8, itemY, (g_ActiveColumn == 4) ? 0xFFAAAAAA : 0xFF555555);
+            DrawShadowText(g_pFont, buf, (int)xCrGauge + 6, itemY, (g_ActiveColumn == 4) ? 0xFFAAAAAA : 0xFF555555);
         }
     }
 
     // Footer panel
-    DrawSolidRect(pDevice, startX - 3.0f, footerY - 3.0f, totalW + 6.0f, footerH + 6.0f, 0xFF335577);
+    DrawSolidRect(pDevice, startX - 2.0f, footerY - 2.0f, totalW + 4.0f, footerH + 4.0f, 0xFF335577);
     DrawSolidRect(pDevice, startX, footerY, totalW, footerH, 0xEE0D111A);
 
     const char *help1 = "";
@@ -811,8 +826,8 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     }
 
     ID3DXFont *pFootFont = g_pFooterFont ? g_pFooterFont : g_pFont;
-    DrawShadowText(pFootFont, help1, (int)startX + (isHD ? 20 : 12), (int)footerY + (isHD ? 10 : 6), 0xFF88DDFF);
-    DrawShadowText(pFootFont, help2, (int)startX + (isHD ? 20 : 12), (int)footerY + (isHD ? 36 : 26), 0xFF6699BB);
+    DrawShadowText(pFootFont, help1, (int)startX + (isHD ? 16 : 10), (int)footerY + (isHD ? 8 : 5), 0xFF88DDFF);
+    DrawShadowText(pFootFont, help2, (int)startX + (isHD ? 16 : 10), (int)footerY + (isHD ? 32 : 23), 0xFF6699BB);
 
     // Joypad input polling
     int trig_up = 0, trig_down = 0, trig_left = 0, trig_right = 0;
