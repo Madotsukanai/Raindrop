@@ -7,6 +7,7 @@
 // Global states
 static volatile int g_ShowStageMenu = 0;
 static volatile int g_StageSelected = 0;
+static volatile int g_PracticeMode = 0;   // 1 if started via Shift menu (practice mode), 0 if normal game start
 static volatile int g_CancelToTitle = 0; // set when player cancels back to title
 static volatile int g_MenuCursor = 0;   // 0 to 4 (Stage index)
 static volatile int g_ActiveColumn = 0; // 0=Stage, 1=Lives, 2=MEFA, 3=CR Stock, 4=CR Gauge
@@ -976,6 +977,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
 
             g_ShowStageMenu = 0;
             g_StageSelected = 1;
+            g_PracticeMode = 1;
             g_ActiveColumn = 0;
             g_PendingStageInitStats = 1;
             g_StageInitRenderFrames = 0;
@@ -1024,6 +1026,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         } else if (g_ActiveColumn == 0) {
             g_ShowStageMenu = 0;
             g_StageSelected = 0;
+            g_PracticeMode = 0;
             g_CancelToTitle = 1;
             g_ActiveColumn = 0;
             *(volatile DWORD*)0x5c0740 = 1; // Return to Title
@@ -1127,6 +1130,7 @@ void __cdecl HandleSceneCheck(DWORD *pEdx) {
 
     if (nextScene <= 2) {
         g_StageSelected = 0;
+        g_PracticeMode = 0; // reset practice mode when returning to Title or Menu
         g_LastResetTargetScene = 0;
         g_PendingStageInitStats = 0;
         g_StageInitRenderFrames = 0;
@@ -1190,6 +1194,7 @@ DWORD __cdecl HandleTrans(void) {
     // and the transition logic actually runs.
     if (g_CancelToTitle) {
         g_CancelToTitle = 0;
+        g_PracticeMode = 0;
         LogMessage("Trans: cancel to title allowed (prev=%lu next=%lu)", prevScene, nextScene);
         return nextScene - 1; // guaranteed != nextScene, triggers the transition
     }
@@ -1214,13 +1219,15 @@ DWORD __cdecl HandleTrans(void) {
         if (isShift) {
             g_ShowStageMenu = 1;
             g_ActiveColumn = 0;
-            LogMessage("Trans intercepted with SHIFT: prev=%lu next=%lu -> showing stage select menu", prevScene, nextScene);
+            g_PracticeMode = 1;
+            LogMessage("Trans intercepted with SHIFT: prev=%lu next=%lu -> showing stage select menu (practice mode)", prevScene, nextScene);
             // Return nextScene so eax == [0x5c0740] -> equality check passes -> skip transition
             return nextScene;
         } else {
             // Normal game start without Shift: pass through directly to original game start
             g_StageSelected = 1;
-            LogMessage("Game started normally (without Shift): prev=%lu next=%lu -> starting stage directly", prevScene, nextScene);
+            g_PracticeMode = 0; // Not practice mode: hotkeys disabled!
+            LogMessage("Game started normally (without Shift): prev=%lu next=%lu -> starting stage directly (hotkeys disabled)", prevScene, nextScene);
             return prevScene;
         }
     }
@@ -1288,11 +1295,13 @@ int __cdecl HandleLoadStart(void) {
         if (isShift) {
             g_ShowStageMenu = 1;
             g_ActiveColumn = 0;
-            LogMessage("LoadStart intercepted with SHIFT -> showing stage select menu");
+            g_PracticeMode = 1;
+            LogMessage("LoadStart intercepted with SHIFT -> showing stage select menu (practice mode)");
             return 1; // suppressed
         } else {
             g_StageSelected = 1;
-            LogMessage("LoadStart passed through normally (without Shift)");
+            g_PracticeMode = 0;
+            LogMessage("LoadStart passed through normally (without Shift, hotkeys disabled)");
             return 0; // allow
         }
     }
@@ -1418,6 +1427,12 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
     while (1) {
         Sleep(50);
 
+        // Hotkeys are disabled during normal game start (only active in Practice Mode or Replay playback)
+        if (!g_PracticeMode && !IsReplayOrDemo()) {
+            memset(key_state, 0, sizeof(key_state));
+            continue;
+        }
+
         DWORD currentScene = *(volatile DWORD*)0x5c073c; // 0x5c073c = current scene
 
         // F1-F5 for Stages 1-5 (Stage 6 is Tutorial, excluded)
@@ -1440,8 +1455,8 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
                             *(volatile DWORD*)0x5c0740 = 2 + stage;
                             PlayGameSE(1040); // Decide SE
                         }
-                    } else {
-                        // Normal play mode: warp and reset score/stats
+                    } else if (g_PracticeMode) {
+                        // Practice mode: warp and reset score/stats
                         LogMessage("Hotkey F%d -> Warping to Stage %d (currentScene=%lu)", stage, stage, currentScene);
                         g_StageSelected = 1;
                         g_PendingStageInitStats = 1;
@@ -1456,14 +1471,16 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
             key_state[i] = is_down;
         }
 
-        // F8 hotkey: Sequential SE playback (Shift+F8: previous SE)
-        static int f8_down = 0;
-        int is_f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-        if (is_f8 && !f8_down) {
-            int is_shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            PlayNextSE(is_shift ? -1 : 1);
+        // F8 hotkey: Sequential SE playback (Shift+F8: previous SE) - only enabled in Practice Mode
+        if (g_PracticeMode) {
+            static int f8_down = 0;
+            int is_f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+            if (is_f8 && !f8_down) {
+                int is_shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                PlayNextSE(is_shift ? -1 : 1);
+            }
+            f8_down = is_f8;
         }
-        f8_down = is_f8;
     }
     return 0;
 }
