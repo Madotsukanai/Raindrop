@@ -7,7 +7,7 @@
 // Global states
 static volatile int g_ShowStageMenu = 0;
 static volatile int g_StageSelected = 0;
-static volatile int g_PracticeMode = 0;   // 1 if started via Shift menu (practice mode), 0 if normal game start
+static volatile int g_PracticeMode = 0;   // 1 if started via C key menu (practice mode), 0 if normal game start
 static volatile int g_ReturnToStageMenu = 0; // set when practice stage ends to return to stage menu
 static volatile int g_CancelToTitle = 0; // set when player cancels back to title
 static volatile int g_MenuCursor = 0;   // 0 to 4 (Stage index)
@@ -1086,20 +1086,20 @@ DWORD __cdecl HandleTrans(void) {
             return nextScene;
         }
 
-        // Only show stage select menu if Shift was held when starting the game
-        int isShift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-        if (isShift) {
+        // Only show stage select menu if 'C' was held when starting the game
+        int isC = (GetAsyncKeyState('C') & 0x8000) != 0;
+        if (isC) {
             g_ShowStageMenu = 1;
             g_ActiveColumn = 0;
             g_PracticeMode = 1;
-            LogMessage("Trans intercepted with SHIFT: prev=%lu next=%lu -> showing stage select menu (practice mode)", prevScene, nextScene);
+            LogMessage("Trans intercepted with C key: prev=%lu next=%lu -> showing stage select menu (practice mode)", prevScene, nextScene);
             // Return nextScene so eax == [0x5c0740] -> equality check passes -> skip transition
             return nextScene;
         } else {
-            // Normal game start without Shift: pass through directly to original game start
+            // Normal game start without C key: pass through directly to original game start
             g_StageSelected = 1;
             g_PracticeMode = 0; // Not practice mode: hotkeys disabled!
-            LogMessage("Game started normally (without Shift): prev=%lu next=%lu -> starting stage directly (hotkeys disabled)", prevScene, nextScene);
+            LogMessage("Game started normally (without C key): prev=%lu next=%lu -> starting stage directly (hotkeys disabled)", prevScene, nextScene);
             return prevScene;
         }
     }
@@ -1167,17 +1167,17 @@ int __cdecl HandleLoadStart(void) {
         if (g_ShowStageMenu) {
             return 1; // suppressed while menu is open
         }
-        int isShift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-        if (isShift) {
+        int isC = (GetAsyncKeyState('C') & 0x8000) != 0;
+        if (isC) {
             g_ShowStageMenu = 1;
             g_ActiveColumn = 0;
             g_PracticeMode = 1;
-            LogMessage("LoadStart intercepted with SHIFT -> showing stage select menu (practice mode)");
+            LogMessage("LoadStart intercepted with C key -> showing stage select menu (practice mode)");
             return 1; // suppressed
         } else {
             g_StageSelected = 1;
             g_PracticeMode = 0;
-            LogMessage("LoadStart passed through normally (without Shift, hotkeys disabled)");
+            LogMessage("LoadStart passed through normally (without C key, hotkeys disabled)");
             return 0; // allow
         }
     }
