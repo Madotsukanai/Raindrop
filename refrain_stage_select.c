@@ -8,6 +8,7 @@
 static volatile int g_ShowStageMenu = 0;
 static volatile int g_StageSelected = 0;
 static volatile int g_PracticeMode = 0;   // 1 if started via Shift menu (practice mode), 0 if normal game start
+static volatile int g_ReturnToStageMenu = 0; // set when practice stage ends to return to stage menu
 static volatile int g_CancelToTitle = 0; // set when player cancels back to title
 static volatile int g_MenuCursor = 0;   // 0 to 4 (Stage index)
 static volatile int g_ActiveColumn = 0; // 0=Stage, 1=Lives, 2=MEFA, 3=CR Stock, 4=CR Gauge
@@ -812,6 +813,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             g_ShowStageMenu = 0;
             g_StageSelected = 1;
             g_PracticeMode = 1;
+            g_ReturnToStageMenu = 0;
             g_ActiveColumn = 0;
             g_PendingStageInitStats = 1;
             g_StageInitRenderFrames = 0;
@@ -861,6 +863,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             g_ShowStageMenu = 0;
             g_StageSelected = 0;
             g_PracticeMode = 0;
+            g_ReturnToStageMenu = 0;
             g_CancelToTitle = 1;
             g_ActiveColumn = 0;
             *(volatile DWORD*)0x5c0740 = 1; // Return to Title
@@ -932,6 +935,19 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
         }
     }
 
+    DWORD currentScene = *(volatile DWORD*)0x5c073c;
+    if (g_ReturnToStageMenu && currentScene <= 2) {
+        g_ReturnToStageMenu = 0;
+        g_ShowStageMenu = 1;
+        g_ActiveColumn = 0;
+        g_StageSelected = 0;
+        g_PracticeMode = 1;
+        int targetStage = g_MenuItems[g_MenuCursor].stage;
+        *(volatile DWORD*)0x5c0740 = 2 + targetStage;
+        LogMessage("Practice stage finished -> Title/Menu reached (scene=%lu), showing Stage Menu for stage %d",
+                   currentScene, targetStage);
+    }
+
     if (g_ShowStageMenu) {
         OnRenderMenu(pDevice);
     }
@@ -961,7 +977,9 @@ void __cdecl HandleSceneCheck(DWORD *pEdx) {
 
     if (nextScene <= 2) {
         g_StageSelected = 0;
-        g_PracticeMode = 0; // reset practice mode when returning to Title or Menu
+        if (!g_ReturnToStageMenu) {
+            g_PracticeMode = 0; // reset practice mode when returning to Title or Menu without practice return
+        }
         g_LastResetTargetScene = 0;
         g_PendingStageInitStats = 0;
         g_StageInitRenderFrames = 0;
@@ -1026,6 +1044,7 @@ DWORD __cdecl HandleTrans(void) {
     if (g_CancelToTitle) {
         g_CancelToTitle = 0;
         g_PracticeMode = 0;
+        g_ReturnToStageMenu = 0;
         LogMessage("Trans: cancel to title allowed (prev=%lu next=%lu)", prevScene, nextScene);
         return nextScene - 1; // guaranteed != nextScene, triggers the transition
     }
@@ -1035,6 +1054,28 @@ DWORD __cdecl HandleTrans(void) {
         LogMessage("Trans: Replay/Demo playback detected (replaySlot=%ld, mode=%lu) -> passing through without menu",
                    (long)*(volatile DWORD*)0x4d237c, *(volatile DWORD*)0x4d2378);
         return prevScene;
+    }
+
+    // Practice Mode: when a stage finishes (clear, game over, quit to title, etc.), redirect transition to Title
+    // and flag g_ReturnToStageMenu so the Stage Menu re-opens upon arrival.
+    if (prevScene >= 3 && prevScene <= 7 && g_PracticeMode && g_PendingReset == 0) {
+        LogMessage("Practice stage end (prev=%lu next=%lu) -> redirecting to Title", prevScene, nextScene);
+        g_ReturnToStageMenu = 1;
+        *(volatile DWORD*)0x5c0740 = 1; // redirect scene transition to Title
+        return prevScene;
+    }
+
+    // Practice Mode: once arrived at Title/Menu after stage end, open the Stage Menu
+    if (prevScene <= 2 && g_ReturnToStageMenu) {
+        g_ReturnToStageMenu = 0;
+        g_ShowStageMenu = 1;
+        g_ActiveColumn = 0;
+        g_StageSelected = 0;
+        g_PracticeMode = 1;
+        int targetStage = g_MenuItems[g_MenuCursor].stage;
+        *(volatile DWORD*)0x5c0740 = 2 + targetStage;
+        LogMessage("Arrived at Title after practice stage -> opening Stage Menu for stage %d", targetStage);
+        return 2 + targetStage;
     }
 
     // When the game is about to enter a stage scene (Stages 1-5 = scenes 3-7) and no stage has been selected yet
@@ -1116,6 +1157,10 @@ void __attribute__((naked)) Hook_SceneCheck(void) {
 int __cdecl HandleLoadStart(void) {
     if (IsReplayOrDemo()) {
         return 0; // allow stage load for replay/demo without menu
+    }
+
+    if (g_ReturnToStageMenu) {
+        return 0; // allow transition to Title
     }
 
     if (!g_StageSelected) {
@@ -1289,6 +1334,7 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
                     } else if (g_PracticeMode) {
                         // Practice mode: warp and reset score/stats
                         LogMessage("Hotkey F%d -> Warping to Stage %d (currentScene=%lu)", stage, stage, currentScene);
+                        g_MenuCursor = stage - 1;
                         g_StageSelected = 1;
                         g_PendingStageInitStats = 1;
                         g_StageInitRenderFrames = 0;
