@@ -462,35 +462,21 @@ static int IsConceptReactorHeld(void) {
 // 0 = Difficulty Selection screen
 // 1 = Post-Difficulty screen ("DIVE 2 M.R.S.")
 static volatile int g_RefrainWindowState = 0;
-static volatile int g_RefrainWindowOpenFrames = 0;
 static volatile int g_RefrainSubMenuCursor = 0;
 static volatile int g_SelectedReMode = 0;
+static volatile int g_CancelDebounceFrames = 0;
 
-static void SetGameInfoInt(const char *key, int val) {
-    __asm__ __volatile__(
-        "pushl %0\n\t"
-        "movl %1, %%ecx\n\t"
-        "movl $0xFFFFFFFF, %%edx\n\t"
-        "call 0x0044FCA0\n\t"
-        "addl $4, %%esp\n\t"
-        :
-        : "r"(val), "r"(key)
-        : "eax", "ecx", "edx", "memory"
-    );
-}
-
-static int GetGameInfoInt(const char *key) {
-    int result;
-    __asm__ __volatile__(
-        "movl %1, %%ecx\n\t"
-        "movl $0xFFFFFFFF, %%edx\n\t"
-        "call 0x0044FB80\n\t"
-        "movl %%eax, %0\n\t"
-        : "=r"(result)
-        : "r"(key)
-        : "ecx", "edx", "memory"
-    );
-    return result;
+static int IsCancelHeld(void) {
+    if ((GetAsyncKeyState('X') & 0x8000) || (GetAsyncKeyState(VK_ESCAPE) & 0x8000)) return 1;
+    for (UINT jid = 0; jid < 4; jid++) {
+        JOYINFOEX joy;
+        joy.dwSize = sizeof(joy);
+        joy.dwFlags = JOY_RETURNBUTTONS;
+        if (joyGetPosEx(jid, &joy) == JOYERR_NOERROR) {
+            if (joy.dwButtons & 2) return 1;
+        }
+    }
+    return 0;
 }
 
 static int IsRefrainWindowOpen(void) {
@@ -517,8 +503,8 @@ int __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key) {
     if (currentScene == 1 && nextScene == 1 && !g_ShowStageMenu && !g_AutoAdvanceToDifficulty && !IsReplayOrDemo()) {
         if (IsConceptReactorTriggered()) {
             if (!IsRefrainWindowOpen() || g_RefrainWindowState != 1) {
-                LogMessage("Concept Reactor blocked on Title (windowOpen=%d, frames=%d, state=%d) -> only allowed on post-difficulty screen (DIVE 2 M.R.S.)",
-                           IsRefrainWindowOpen(), g_RefrainWindowOpenFrames, g_RefrainWindowState);
+                LogMessage("Concept Reactor blocked on Title (windowOpen=%d, state=%d) -> only allowed on post-difficulty screen (DIVE 2 M.R.S.)",
+                           IsRefrainWindowOpen(), g_RefrainWindowState);
                 return 0;
             }
             DWORD diff = *(volatile DWORD*)0x5b8e28;
@@ -542,6 +528,10 @@ int __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key) {
 
     if (g_ShowStageMenu) return 0;
 
+    if (g_CancelDebounceFrames > 0 && MatchSimulatedKey(SIMKEY_CANCEL, key)) {
+        return 0;
+    }
+
     if (g_AutoAdvanceToDifficulty && currentScene == 1) {
         if (g_SimulatedKeyAction != SIMKEY_NONE && MatchSimulatedKey(g_SimulatedKeyAction, key)) {
             LogMessage("Hook_IsKeyTriggered: SIMULATED MATCH action=%d key=0x%02X", g_SimulatedKeyAction, key);
@@ -550,62 +540,9 @@ int __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key) {
         return 0;
     }
 
-    int res = orig_IsKeyTriggered(this, key);
-
-    // Track navigation inside REFRAIN window
-    if (currentScene == 1 && res) {
-        if (IsRefrainWindowOpen()) {
-            DWORD diff = *(volatile DWORD*)0x5b8e28;
-            if (MatchSimulatedKey(SIMKEY_DECIDE, key) && g_RefrainWindowOpenFrames >= 20) {
-                if (g_RefrainWindowState == 0) {
-                    g_RefrainWindowState = 1;
-                    g_RefrainSubMenuCursor = 0;
-                    g_SelectedReMode = 0;
-                    LogMessage("REFRAIN window: Confirmed Difficulty (diff=%lu) -> advanced to Post-Difficulty menu (DIVE 2 M.R.S.) [frames=%d]",
-                               diff, g_RefrainWindowOpenFrames);
-                }
-            } else if (MatchSimulatedKey(SIMKEY_CANCEL, key)) {
-                if (g_RefrainWindowState == 1) {
-                    g_RefrainWindowState = 0;
-                    g_RefrainSubMenuCursor = 0;
-                    g_SelectedReMode = 0;
-                    LogMessage("REFRAIN window: Cancelled from Post-Difficulty -> back to Difficulty Selection");
-                } else if (g_RefrainWindowState == 0) {
-                    g_RefrainWindowState = 0;
-                    g_RefrainSubMenuCursor = 0;
-                    g_SelectedReMode = 0;
-                    LogMessage("REFRAIN window: Cancelled from Difficulty Selection -> closing window");
-                }
-            } else if (g_RefrainWindowState == 1) {
-                if (MatchSimulatedKey(SIMKEY_DOWN, key)) {
-                    g_RefrainSubMenuCursor++;
-                    if (g_RefrainSubMenuCursor > 2) g_RefrainSubMenuCursor = 2;
-                    if (g_RefrainSubMenuCursor == 1 && diff >= 2) {
-                        g_SelectedReMode = 1;
-                    } else {
-                        g_SelectedReMode = 0;
-                    }
-                    LogMessage("REFRAIN sub-menu: DOWN -> cursor=%d, ReMode=%d", g_RefrainSubMenuCursor, g_SelectedReMode);
-                } else if (MatchSimulatedKey(SIMKEY_UP, key)) {
-                    if (g_RefrainSubMenuCursor > 0) g_RefrainSubMenuCursor--;
-                    if (g_RefrainSubMenuCursor == 1 && diff >= 2) {
-                        g_SelectedReMode = 1;
-                    } else {
-                        g_SelectedReMode = 0;
-                    }
-                    LogMessage("REFRAIN sub-menu: UP -> cursor=%d, ReMode=%d", g_RefrainSubMenuCursor, g_SelectedReMode);
-                }
-            }
-        } else {
-            g_RefrainWindowOpenFrames = 0;
-            g_RefrainWindowState = 0;
-            g_RefrainSubMenuCursor = 0;
-            g_SelectedReMode = 0;
-        }
-    }
-
-    return res;
+    return orig_IsKeyTriggered(this, key);
 }
+
 
 DWORD __cdecl HandleSetLives(DWORD origLives) {
     if (g_PendingStageInitStats && !IsReplayOrDemo()) {
@@ -682,6 +619,101 @@ void __attribute__((naked)) Hook_SetCR(void) {
         "popl %%esi\n\t"
         "movl %%ebp, %%esp\n\t"
         "popl %%ebp\n\t"
+        "ret\n\t"
+        :
+        :
+    );
+}
+
+DWORD __cdecl HandleSetDifficulty(DWORD diff) {
+    g_RefrainWindowState = 1;
+    DWORD lastRefRain = 0;
+    if (!IsBadReadPtr((void*)0x5ac674, 4)) {
+        lastRefRain = *(volatile DWORD*)0x5ac674;
+    }
+    if (diff >= 2 && lastRefRain == 1) {
+        g_RefrainSubMenuCursor = 1;
+        g_SelectedReMode = 1;
+    } else {
+        g_RefrainSubMenuCursor = 0;
+        g_SelectedReMode = 0;
+    }
+    LogMessage("SetDifficulty (Native 79): intercepted diff=%lu (lastRefRain=%lu) -> ReMode=%d, subCursor=%d",
+               diff, lastRefRain, g_SelectedReMode, g_RefrainSubMenuCursor);
+    return diff;
+}
+
+void __attribute__((naked)) Hook_SetDifficulty(void) {
+    __asm__ __volatile__(
+        "pushl 0x8(%%ebp)\n\t"
+        "call _HandleSetDifficulty\n\t"
+        "addl $4, %%esp\n\t"
+        "movl %%eax, 0x5b8e28\n\t"
+        "popl %%edi\n\t"
+        "popl %%esi\n\t"
+        "movl %%ebp, %%esp\n\t"
+        "popl %%ebp\n\t"
+        "ret\n\t"
+        :
+        :
+    );
+}
+
+DWORD __cdecl HandleGetGameInfoRefRainPractice(void) {
+    DWORD diff = *(volatile DWORD*)0x5b8e28;
+    if (g_SelectedReMode && diff >= 2) {
+        LogMessage("HandleGetGameInfoRefRain (0x0043078E): Practice Re:MODE -> returning 1 (diff=%lu)", diff);
+        return 1;
+    } else {
+        LogMessage("HandleGetGameInfoRefRain (0x0043078E): Practice Normal MODE -> returning 0 (diff=%lu)", diff);
+        return 0;
+    }
+}
+
+void __attribute__((naked)) Hook_GetGameInfoRefRain(void) {
+    __asm__ __volatile__(
+        "cmpl $0, _g_PracticeMode\n\t"
+        "jz 1f\n\t"
+        "pushal\n\t"
+        "call _HandleGetGameInfoRefRainPractice\n\t"
+        "movl %%eax, 28(%%esp)\n\t"
+        "popal\n\t"
+        "ret\n\t"
+        "1:\n\t"
+        "movl $0x0044fb80, %%eax\n\t"
+        "jmp *%%eax\n\t"
+        :
+        :
+    );
+}
+
+DWORD __cdecl HandleGetRefRainConfig(DWORD *pVal) {
+    DWORD diff = *(volatile DWORD*)0x5b8e28;
+    if (g_PracticeMode) {
+        if (g_SelectedReMode && diff >= 2) {
+            LogMessage("HandleGetRefRainConfig (0x00441229): Practice Re:MODE -> overriding to 1 (diff=%lu)", diff);
+            return 1;
+        } else {
+            LogMessage("HandleGetRefRainConfig (0x00441229): Practice Normal MODE -> overriding to 0 (diff=%lu)", diff);
+            return 0;
+        }
+    }
+    if (pVal && !IsBadReadPtr(pVal, 4)) {
+        return *pVal;
+    }
+    return 0;
+}
+
+void __attribute__((naked)) Hook_GetRefRainConfig(void) {
+    __asm__ __volatile__(
+        "pushal\n\t"
+        "pushl %%eax\n\t"
+        "call _HandleGetRefRainConfig\n\t"
+        "addl $4, %%esp\n\t"
+        "movl %%eax, 28(%%esp)\n\t"
+        "popal\n\t"
+        "movl $0xffffffff, -0x4(%%ebp)\n\t"
+        "pushl $0x00441232\n\t"
         "ret\n\t"
         :
         :
@@ -1013,6 +1045,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
 
     if (diff >= 2 && (IsKeyTriggered('R') || IsKeyTriggered('r'))) {
         g_SelectedReMode = !g_SelectedReMode;
+        g_RefrainSubMenuCursor = g_SelectedReMode;
         PlayGameSE(1040);
         LogMessage("Stage Menu: Toggled Re:Mode -> %d", g_SelectedReMode);
     }
@@ -1120,22 +1153,10 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             if (diff < 1 || diff > 4) diff = 2;
 
             if (g_SelectedReMode && diff >= 2) {
-                SetGameInfoInt("GameInfo_RefRain", 1);
-                char *pGameState = *(char**)0x5ac9b0;
-                if (pGameState && (DWORD)pGameState > 0x10000) {
-                    *(BYTE*)(pGameState + 0x52) = 1;
-                }
-                *(volatile DWORD*)0x5abb80 = (g_PracticeChar - 1) + ((diff - 1) + 4) * 3;
                 LogMessage("All confirmed -> Starting Stage %d in Re:MODE (char=%lu, diff=%lu, Lives=%d, MEFA=0x%08X, CR Stock=%d, CR Gauge=%s)",
                            stage, g_PracticeChar, diff, g_SelectedLives, g_SelectedMefaDword,
                            g_CrStockItems[g_CrStockCursor].stock, g_CrGaugeItems[g_CrGaugeCursor].label);
             } else {
-                SetGameInfoInt("GameInfo_RefRain", 0);
-                char *pGameState = *(char**)0x5ac9b0;
-                if (pGameState && (DWORD)pGameState > 0x10000) {
-                    *(BYTE*)(pGameState + 0x52) = 0;
-                }
-                *(volatile DWORD*)0x5abb80 = (g_PracticeChar - 1) + (diff - 1) * 3;
                 LogMessage("All confirmed -> Starting Stage %d in Normal MODE (char=%lu, diff=%lu, Lives=%d, MEFA=0x%08X, CR Stock=%d, CR Gauge=%s)",
                            stage, g_PracticeChar, diff, g_SelectedLives, g_SelectedMefaDword,
                            g_CrStockItems[g_CrStockCursor].stock, g_CrGaugeItems[g_CrGaugeCursor].label);
@@ -1192,6 +1213,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             PlayGameSE(1048);
         } else if (g_ActiveColumn == 0) {
             g_ShowStageMenu = 0;
+            g_CancelDebounceFrames = 25;
             g_StageSelected = 0;
             g_PracticeMode = 0;
             g_ReturnToStageMenu = 0;
@@ -1208,8 +1230,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
                 LogMessage("Stage Menu Cancel -> Redirecting to Title (prevScene=%lu)", prevScene);
             } else {
                 g_CancelToTitle = 0;
-                *(volatile DWORD*)0x5c0740 = 1;
-                LogMessage("Stage Menu Cancel -> Closed menu on Title screen");
+                LogMessage("Stage Menu Cancel -> Closed menu on Title screen (DIVE 2 M.R.S. preserved)");
             }
         }
     } else if (do_left) {
@@ -1254,7 +1275,18 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
                 *(DWORD*)(pGameState + s * 4 + 0x12d) = g_SelectedMefaDword;
                 *(DWORD*)(pGameState + s * 4 + 0x145) = g_SelectedCrDword;
             }
+            DWORD diff = *(volatile DWORD*)0x5b8e28;
+            if (diff < 1 || diff > 4) diff = 2;
+            BYTE isRe = (g_SelectedReMode && diff >= 2) ? 1 : 0;
+            *(BYTE*)(pGameState + 0x52) = isRe;
         }
+
+        DWORD diff = *(volatile DWORD*)0x5b8e28;
+        if (diff < 1 || diff > 4) diff = 2;
+        DWORD isRefRain = (g_SelectedReMode && diff >= 2) ? 1 : 0;
+        DWORD charIdx = g_PracticeChar;
+        if (charIdx > 2) charIdx = 0;
+        *(volatile DWORD*)0x5abb80 = (diff - 1) + 3 * (charIdx + 4 * isRefRain);
 
         DWORD pPlayer = *(volatile DWORD*)0x5b9778;
         DWORD frameCount = *(volatile DWORD*)0x5abb78;
@@ -1292,11 +1324,58 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
         }
     }
     if (currentScene == 1) {
-        if (IsRefrainWindowOpen()) {
-            g_RefrainWindowOpenFrames++;
-        } else {
-            g_RefrainWindowOpenFrames = 0;
+        if (!IsRefrainWindowOpen()) {
             g_RefrainWindowState = 0;
+        } else if (g_RefrainWindowState == 1 && !g_ShowStageMenu && !g_AutoAdvanceToDifficulty) {
+            int joy_up = 0, joy_down = 0, joy_cancel = 0;
+            static int prev_joy_y[4] = {0};
+            static DWORD prev_joy_btn[4] = {0};
+            for (UINT jid = 0; jid < 4; jid++) {
+                JOYINFOEX joy;
+                joy.dwSize = sizeof(joy);
+                joy.dwFlags = JOY_RETURNBUTTONS | JOY_RETURNPOV | JOY_RETURNY;
+                if (joyGetPosEx(jid, &joy) == JOYERR_NOERROR) {
+                    int curr_y = 0;
+                    if (joy.dwYpos < 0x3000) curr_y = -1;
+                    else if (joy.dwYpos > 0xD000) curr_y = 1;
+                    if (joy.dwPOV != JOY_POVCENTERED) {
+                        if (joy.dwPOV == JOY_POVFORWARD || joy.dwPOV == 4500 || joy.dwPOV == 31500) curr_y = -1;
+                        if (joy.dwPOV == JOY_POVBACKWARD || joy.dwPOV == 13500 || joy.dwPOV == 22500) curr_y = 1;
+                    }
+                    if (curr_y == -1 && prev_joy_y[jid] != -1) joy_up = 1;
+                    if (curr_y == 1 && prev_joy_y[jid] != 1) joy_down = 1;
+                    prev_joy_y[jid] = curr_y;
+
+                    if ((joy.dwButtons & 2) && !(prev_joy_btn[jid] & 2)) joy_cancel = 1;
+                    prev_joy_btn[jid] = joy.dwButtons;
+                    break;
+                }
+            }
+
+            int do_up = IsKeyTriggered(VK_UP) || IsKeyTriggered('W') || joy_up;
+            int do_down = IsKeyTriggered(VK_DOWN) || IsKeyTriggered('S') || joy_down;
+            int do_cancel = IsKeyTriggered('X') || IsKeyTriggered(VK_ESCAPE) || joy_cancel;
+            if (g_CancelDebounceFrames > 0) {
+                if (IsCancelHeld()) {
+                    g_CancelDebounceFrames = 15;
+                } else {
+                    g_CancelDebounceFrames--;
+                }
+            } else if (do_cancel) {
+                g_RefrainWindowState = 0;
+                LogMessage("Post-difficulty menu: CANCEL -> returning to Difficulty Selection (state=0, preserved ReMode=%d)", g_SelectedReMode);
+            } else if (do_down) {
+                DWORD diff = *(volatile DWORD*)0x5b8e28;
+                if (diff >= 2) {
+                    g_RefrainSubMenuCursor = 1;
+                    g_SelectedReMode = 1;
+                    LogMessage("Post-difficulty menu: DOWN -> cursor=1, Re:MODE selected");
+                }
+            } else if (do_up) {
+                g_RefrainSubMenuCursor = 0;
+                g_SelectedReMode = 0;
+                LogMessage("Post-difficulty menu: UP -> cursor=0, Normal MODE selected");
+            }
         }
     }
 
@@ -1365,8 +1444,8 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
     if (currentScene == 1 && nextScene == 1 && !g_ShowStageMenu && !g_AutoAdvanceToDifficulty && !IsReplayOrDemo()) {
         if (IsConceptReactorTriggered()) {
             if (!IsRefrainWindowOpen() || g_RefrainWindowState != 1) {
-                LogMessage("Concept Reactor blocked on Title (render loop: windowOpen=%d, frames=%d, state=%d) -> only allowed on post-difficulty screen",
-                           IsRefrainWindowOpen(), g_RefrainWindowOpenFrames, g_RefrainWindowState);
+                LogMessage("Concept Reactor blocked on Title (render loop: windowOpen=%d, state=%d) -> only allowed on post-difficulty screen",
+                           IsRefrainWindowOpen(), g_RefrainWindowState);
             } else {
                 DWORD diff = *(volatile DWORD*)0x5b8e28;
                 if (g_RefrainSubMenuCursor == 1 && diff >= 2) {
@@ -1509,7 +1588,6 @@ DWORD __cdecl HandleTrans(void) {
 
         int isC = IsConceptReactorHeld();
         if (isC) {
-            g_SelectedReMode = (GetGameInfoInt("GameInfo_RefRain") == 1);
             g_ShowStageMenu = 1;
             g_ActiveColumn = 0;
             g_PracticeMode = 1;
@@ -1670,8 +1748,16 @@ static void ResetStageScore(void) {
     *(volatile DWORD*)0x5b976c = g_SelectedCrDword;
     *(volatile BYTE*)0x5b975d = 0;
 
+    DWORD diff = *(volatile DWORD*)0x5b8e28;
+    if (diff < 1 || diff > 4) diff = 2;
+    DWORD isRefRain = (g_SelectedReMode && diff >= 2) ? 1 : 0;
+    DWORD charIdx = g_PracticeChar;
+    if (charIdx > 2) charIdx = 0;
+    *(volatile DWORD*)0x5abb80 = (diff - 1) + 3 * (charIdx + 4 * isRefRain);
+
     char *pGameState = *(char**)0x5ac9b0;
     if (pGameState && (DWORD)pGameState > 0x10000) {
+        *(BYTE*)(pGameState + 0x52) = (BYTE)isRefRain;
         for (int s = 1; s <= 6; s++) {
             *(BYTE*)(pGameState + s + 0x52) = 0;
             *(DWORD*)(pGameState + s * 8 + 0x69) = 0;
@@ -1730,13 +1816,6 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
                         g_StageInitRenderFrames = 0;
                         InterlockedExchange(&g_PendingReset, 1);
                         ResetStageScore();
-                        DWORD diff = *(volatile DWORD*)0x5b8e28;
-                        if (diff < 1 || diff > 4) diff = 2;
-                        if (g_SelectedReMode && diff >= 2) {
-                            SetGameInfoInt("GameInfo_RefRain", 1);
-                        } else {
-                            SetGameInfoInt("GameInfo_RefRain", 0);
-                        }
                         *(volatile DWORD*)0x5c0740 = 2 + stage;
                         PlayGameSE(1040);
                     }
@@ -1886,6 +1965,64 @@ static void InstallHooks(void) {
         }
     } else {
         LogMessage("[Error] SetLives signature at 0x%08X did not match!", setLivesAddr);
+    }
+
+    void *setDiffAddr = (void*)0x004625dc;
+    unsigned char expectedSetDiff[8] = {
+        0x8B, 0x45, 0x08,
+        0xA3, 0x28, 0x8E, 0x5B, 0x00
+    };
+    if (memcmp(setDiffAddr, expectedSetDiff, 8) == 0) {
+        if (VirtualProtect(setDiffAddr, 8, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            unsigned char patch[8];
+            patch[0] = 0xE9;
+            DWORD relOffset = (DWORD)Hook_SetDifficulty - ((DWORD)setDiffAddr + 5);
+            memcpy(&patch[1], &relOffset, 4);
+            patch[5] = 0x90;
+            patch[6] = 0x90;
+            patch[7] = 0x90;
+            memcpy(setDiffAddr, patch, 8);
+            VirtualProtect(setDiffAddr, 8, oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), setDiffAddr, 8);
+            LogMessage("SetDifficulty (Native 79) hook installed successfully at 0x%08X", setDiffAddr);
+        }
+    } else {
+        LogMessage("[Error] SetDifficulty signature at 0x%08X did not match!", setDiffAddr);
+    }
+
+    void *refRainCfgAddr = (void*)0x00441229;
+    unsigned char expectedRefRainCfg[9] = { 0x8B, 0x00, 0xC7, 0x45, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF };
+    if (memcmp(refRainCfgAddr, expectedRefRainCfg, 9) == 0) {
+        if (VirtualProtect(refRainCfgAddr, 9, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            unsigned char patch[9];
+            patch[0] = 0xE9;
+            DWORD relOffset = (DWORD)Hook_GetRefRainConfig - ((DWORD)refRainCfgAddr + 5);
+            memcpy(&patch[1], &relOffset, 4);
+            memset(&patch[5], 0x90, 4);
+            memcpy(refRainCfgAddr, patch, 9);
+            VirtualProtect(refRainCfgAddr, 9, oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), refRainCfgAddr, 9);
+            LogMessage("GetRefRainConfig hook installed successfully at 0x%08X", refRainCfgAddr);
+        }
+    } else {
+        LogMessage("[Error] GetRefRainConfig signature at 0x%08X did not match!", refRainCfgAddr);
+    }
+
+    void *refRainGameInfoAddr = (void*)0x0043078e;
+    unsigned char expectedRefRainGameInfo[5] = { 0xE8, 0xED, 0xF3, 0x01, 0x00 };
+    if (memcmp(refRainGameInfoAddr, expectedRefRainGameInfo, 5) == 0) {
+        if (VirtualProtect(refRainGameInfoAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            unsigned char patch[5];
+            patch[0] = 0xE8;
+            DWORD relOffset = (DWORD)Hook_GetGameInfoRefRain - ((DWORD)refRainGameInfoAddr + 5);
+            memcpy(&patch[1], &relOffset, 4);
+            memcpy(refRainGameInfoAddr, patch, 5);
+            VirtualProtect(refRainGameInfoAddr, 5, oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), refRainGameInfoAddr, 5);
+            LogMessage("GetGameInfoRefRain hook installed successfully at 0x%08X", refRainGameInfoAddr);
+        }
+    } else {
+        LogMessage("[Error] GetGameInfoRefRain signature at 0x%08X did not match!", refRainGameInfoAddr);
     }
 
     void *inputVtableAddr = (void*)0x004b80c4;
