@@ -463,6 +463,35 @@ static int IsConceptReactorHeld(void) {
 // 1 = Post-Difficulty screen ("DIVE 2 M.R.S.")
 static volatile int g_RefrainWindowState = 0;
 static volatile int g_RefrainWindowOpenFrames = 0;
+static volatile int g_RefrainSubMenuCursor = 0;
+static volatile int g_SelectedReMode = 0;
+
+static void SetGameInfoInt(const char *key, int val) {
+    __asm__ __volatile__(
+        "pushl %0\n\t"
+        "movl %1, %%ecx\n\t"
+        "movl $0xFFFFFFFF, %%edx\n\t"
+        "call 0x0044FCA0\n\t"
+        "addl $4, %%esp\n\t"
+        :
+        : "r"(val), "r"(key)
+        : "eax", "ecx", "edx", "memory"
+    );
+}
+
+static int GetGameInfoInt(const char *key) {
+    int result;
+    __asm__ __volatile__(
+        "movl %1, %%ecx\n\t"
+        "movl $0xFFFFFFFF, %%edx\n\t"
+        "call 0x0044FB80\n\t"
+        "movl %%eax, %0\n\t"
+        : "=r"(result)
+        : "r"(key)
+        : "ecx", "edx", "memory"
+    );
+    return result;
+}
 
 static int IsRefrainWindowOpen(void) {
     DWORD *pTasks = (DWORD*)0x5ba0a8;
@@ -481,28 +510,22 @@ static int IsRefrainWindowOpen(void) {
     return 0;
 }
 
-static int IsDifficultyMenuOpen(void) {
-    int open = IsRefrainWindowOpen();
-    if (!open) {
-        g_RefrainWindowOpenFrames = 0;
-        g_RefrainWindowState = 0;
-        return 0;
-    }
-    return (g_RefrainWindowState == 0);
-}
-
 int __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key) {
     DWORD currentScene = *(volatile DWORD*)0x5c073c;
     DWORD nextScene = *(volatile DWORD*)0x5c0740;
 
     if (currentScene == 1 && nextScene == 1 && !g_ShowStageMenu && !g_AutoAdvanceToDifficulty && !IsReplayOrDemo()) {
         if (IsConceptReactorTriggered()) {
-            int isDiff = IsDifficultyMenuOpen();
-            LogMessage("Concept Reactor triggered on Title: isDiff=%d (windowOpen=%d, frames=%d, state=%d)",
-                       isDiff, IsRefrainWindowOpen(), g_RefrainWindowOpenFrames, g_RefrainWindowState);
-            if (isDiff) {
-                LogMessage("Concept Reactor blocked during Difficulty Selection (input hook)");
+            if (!IsRefrainWindowOpen() || g_RefrainWindowState != 1) {
+                LogMessage("Concept Reactor blocked on Title (windowOpen=%d, frames=%d, state=%d) -> only allowed on post-difficulty screen (DIVE 2 M.R.S.)",
+                           IsRefrainWindowOpen(), g_RefrainWindowOpenFrames, g_RefrainWindowState);
                 return 0;
+            }
+            DWORD diff = *(volatile DWORD*)0x5b8e28;
+            if (g_RefrainSubMenuCursor == 1 && diff >= 2) {
+                g_SelectedReMode = 1;
+            } else {
+                g_SelectedReMode = 0;
             }
             g_ShowStageMenu = 1;
             g_ActiveColumn = 0;
@@ -511,7 +534,8 @@ int __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key) {
             DWORD curChar = *(volatile DWORD*)0x5b9774;
             if (curChar <= 2) g_PracticeChar = curChar;
             PlayGameSE(1040);
-            LogMessage("Concept Reactor triggered on Title screen (input hook) -> opening Stage Menu directly (practice mode, char=%lu)", g_PracticeChar);
+            LogMessage("Concept Reactor opened Stage Menu on post-difficulty screen (char=%lu, diff=%lu, subCursor=%d, ReMode=%d)",
+                       g_PracticeChar, diff, g_RefrainSubMenuCursor, g_SelectedReMode);
             return 0;
         }
     }
@@ -531,22 +555,52 @@ int __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key) {
     // Track navigation inside REFRAIN window
     if (currentScene == 1 && res) {
         if (IsRefrainWindowOpen()) {
+            DWORD diff = *(volatile DWORD*)0x5b8e28;
             if (MatchSimulatedKey(SIMKEY_DECIDE, key) && g_RefrainWindowOpenFrames >= 20) {
                 if (g_RefrainWindowState == 0) {
                     g_RefrainWindowState = 1;
-                    LogMessage("REFRAIN window: Confirmed Difficulty -> advanced to Post-Difficulty menu (DIVE 2 M.R.S.) [frames=%d]", g_RefrainWindowOpenFrames);
+                    g_RefrainSubMenuCursor = 0;
+                    g_SelectedReMode = 0;
+                    LogMessage("REFRAIN window: Confirmed Difficulty (diff=%lu) -> advanced to Post-Difficulty menu (DIVE 2 M.R.S.) [frames=%d]",
+                               diff, g_RefrainWindowOpenFrames);
                 }
             } else if (MatchSimulatedKey(SIMKEY_CANCEL, key)) {
                 if (g_RefrainWindowState == 1) {
                     g_RefrainWindowState = 0;
+                    g_RefrainSubMenuCursor = 0;
+                    g_SelectedReMode = 0;
                     LogMessage("REFRAIN window: Cancelled from Post-Difficulty -> back to Difficulty Selection");
                 } else if (g_RefrainWindowState == 0) {
+                    g_RefrainWindowState = 0;
+                    g_RefrainSubMenuCursor = 0;
+                    g_SelectedReMode = 0;
                     LogMessage("REFRAIN window: Cancelled from Difficulty Selection -> closing window");
+                }
+            } else if (g_RefrainWindowState == 1) {
+                if (MatchSimulatedKey(SIMKEY_DOWN, key)) {
+                    g_RefrainSubMenuCursor++;
+                    if (g_RefrainSubMenuCursor > 2) g_RefrainSubMenuCursor = 2;
+                    if (g_RefrainSubMenuCursor == 1 && diff >= 2) {
+                        g_SelectedReMode = 1;
+                    } else {
+                        g_SelectedReMode = 0;
+                    }
+                    LogMessage("REFRAIN sub-menu: DOWN -> cursor=%d, ReMode=%d", g_RefrainSubMenuCursor, g_SelectedReMode);
+                } else if (MatchSimulatedKey(SIMKEY_UP, key)) {
+                    if (g_RefrainSubMenuCursor > 0) g_RefrainSubMenuCursor--;
+                    if (g_RefrainSubMenuCursor == 1 && diff >= 2) {
+                        g_SelectedReMode = 1;
+                    } else {
+                        g_SelectedReMode = 0;
+                    }
+                    LogMessage("REFRAIN sub-menu: UP -> cursor=%d, ReMode=%d", g_RefrainSubMenuCursor, g_SelectedReMode);
                 }
             }
         } else {
             g_RefrainWindowOpenFrames = 0;
             g_RefrainWindowState = 0;
+            g_RefrainSubMenuCursor = 0;
+            g_SelectedReMode = 0;
         }
     }
 
@@ -733,10 +787,22 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     DWORD titleCol3  = (g_ActiveColumn == 3) ? 0xFFFFCC00 : 0xFF88AABB;
     DWORD titleCol4  = (g_ActiveColumn == 4) ? 0xFFFFCC00 : 0xFF88AABB;
 
+    DWORD diff = *(volatile DWORD*)0x5b8e28;
+    const char *diffLabel = "NORMAL";
+    if (diff == 1) diffLabel = "EASY";
+    else if (diff == 2) diffLabel = (g_SelectedReMode ? "Re:NORMAL" : "NORMAL");
+    else if (diff == 3) diffLabel = (g_SelectedReMode ? "Re:ADVANCED" : "ADVANCED");
+    else if (diff == 4) diffLabel = (g_SelectedReMode ? "Re:EXTREME" : "EXTREME");
+
+    char titleBuf[128];
+    snprintf(titleBuf, sizeof(titleBuf), "STAGE SELECT [%s]", diffLabel);
+    DWORD titleCol = (g_SelectedReMode && diff >= 2) ? 0xFFFF4444 : titleCol0;
+    DWORD hBg0 = (g_SelectedReMode && diff >= 2) ? 0x88661122 : headerBg0;
+
     DrawSolidRect(pDevice, startX - 2.0f, stageBoxY - 2.0f, totalW + 4.0f, stageBoxH + 4.0f, borderCol0);
     DrawSolidRect(pDevice, startX, stageBoxY, totalW, stageBoxH, 0xEE0D111A);
-    DrawSolidRect(pDevice, startX + 4.0f, stageBoxY + 4.0f, totalW - 8.0f, headerH, headerBg0);
-    DrawShadowText(g_pTitleFont, "STAGE SELECT", (int)startX + (isHD ? 14 : 10), (int)stageBoxY + (isHD ? 8 : 5), titleCol0);
+    DrawSolidRect(pDevice, startX + 4.0f, stageBoxY + 4.0f, totalW - 8.0f, headerH, hBg0);
+    DrawShadowText(g_pTitleFont, titleBuf, (int)startX + (isHD ? 14 : 10), (int)stageBoxY + (isHD ? 8 : 5), titleCol);
 
     int stageStartY = (int)stageBoxY + (isHD ? 36 : 24);
     for (int i = 0; i < MENU_ITEM_COUNT; i++) {
@@ -891,6 +957,12 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     }
 
     ID3DXFont *pFootFont = g_pFooterFont ? g_pFooterFont : g_pFont;
+    char help2Buf[256];
+    if (diff >= 2) {
+        snprintf(help2Buf, sizeof(help2Buf), "%s    [R] Mode: %s",
+                 help2, g_SelectedReMode ? "Re:MODE" : "NORMAL");
+        help2 = help2Buf;
+    }
     DrawShadowText(pFootFont, help1, (int)startX + (isHD ? 16 : 10), (int)footerY + (isHD ? 8 : 5), 0xFF88DDFF);
     DrawShadowText(pFootFont, help2, (int)startX + (isHD ? 16 : 10), (int)footerY + (isHD ? 32 : 23), 0xFF6699BB);
 
@@ -938,6 +1010,12 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     int do_right = IsKeyTriggered(VK_RIGHT) || IsKeyTriggered('D') || trig_right;
     int do_decide = IsKeyTriggered('Z') || IsKeyTriggered(VK_RETURN) || IsKeyTriggered(VK_SPACE) || trig_btn1;
     int do_cancel = IsKeyTriggered('X') || IsKeyTriggered(VK_ESCAPE) || trig_btn2;
+
+    if (diff >= 2 && (IsKeyTriggered('R') || IsKeyTriggered('r'))) {
+        g_SelectedReMode = !g_SelectedReMode;
+        PlayGameSE(1040);
+        LogMessage("Stage Menu: Toggled Re:Mode -> %d", g_SelectedReMode);
+    }
 
     if (do_up) {
         if (g_ActiveColumn == 0) {
@@ -1037,6 +1115,31 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
 
             DWORD curChar = *(volatile DWORD*)0x5b9774;
             if (curChar <= 2) g_PracticeChar = curChar;
+
+            DWORD diff = *(volatile DWORD*)0x5b8e28;
+            if (diff < 1 || diff > 4) diff = 2;
+
+            if (g_SelectedReMode && diff >= 2) {
+                SetGameInfoInt("GameInfo_RefRain", 1);
+                char *pGameState = *(char**)0x5ac9b0;
+                if (pGameState && (DWORD)pGameState > 0x10000) {
+                    *(BYTE*)(pGameState + 0x52) = 1;
+                }
+                *(volatile DWORD*)0x5abb80 = (g_PracticeChar - 1) + ((diff - 1) + 4) * 3;
+                LogMessage("All confirmed -> Starting Stage %d in Re:MODE (char=%lu, diff=%lu, Lives=%d, MEFA=0x%08X, CR Stock=%d, CR Gauge=%s)",
+                           stage, g_PracticeChar, diff, g_SelectedLives, g_SelectedMefaDword,
+                           g_CrStockItems[g_CrStockCursor].stock, g_CrGaugeItems[g_CrGaugeCursor].label);
+            } else {
+                SetGameInfoInt("GameInfo_RefRain", 0);
+                char *pGameState = *(char**)0x5ac9b0;
+                if (pGameState && (DWORD)pGameState > 0x10000) {
+                    *(BYTE*)(pGameState + 0x52) = 0;
+                }
+                *(volatile DWORD*)0x5abb80 = (g_PracticeChar - 1) + (diff - 1) * 3;
+                LogMessage("All confirmed -> Starting Stage %d in Normal MODE (char=%lu, diff=%lu, Lives=%d, MEFA=0x%08X, CR Stock=%d, CR Gauge=%s)",
+                           stage, g_PracticeChar, diff, g_SelectedLives, g_SelectedMefaDword,
+                           g_CrStockItems[g_CrStockCursor].stock, g_CrGaugeItems[g_CrGaugeCursor].label);
+            }
 
             g_ShowStageMenu = 0;
             g_StageSelected = 1;
@@ -1236,6 +1339,14 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
                 LogMessage("AutoNav: Advancing to Phase 2 (Waiting for menu after Difficulty Selection)");
             }
         } else if (g_AutoNavPhase == 2) {
+            if (g_SelectedReMode) {
+                if (g_AutoNavTimer == 15) {
+                    g_SimulatedKeyAction = SIMKEY_DOWN;
+                    g_RefrainSubMenuCursor = 1;
+                } else if (g_AutoNavTimer == 16) {
+                    g_SimulatedKeyAction = SIMKEY_NONE;
+                }
+            }
             if (g_AutoNavTimer >= 35) {
                 g_AutoAdvanceToDifficulty = 0;
                 g_AutoNavPhase = 0;
@@ -1245,20 +1356,24 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
                 g_ActiveColumn = 0;
                 g_StageSelected = 0;
                 g_PracticeMode = 1;
-                LogMessage("AutoNav: Menu after Difficulty ready! Stage Menu opened on top of sub-menu for stage %d.",
-                           g_MenuItems[g_MenuCursor].stage);
+                LogMessage("AutoNav: Menu after Difficulty ready! Stage Menu opened on top of sub-menu for stage %d (ReMode=%d).",
+                           g_MenuItems[g_MenuCursor].stage, g_SelectedReMode);
             }
         }
     }
 
     if (currentScene == 1 && nextScene == 1 && !g_ShowStageMenu && !g_AutoAdvanceToDifficulty && !IsReplayOrDemo()) {
         if (IsConceptReactorTriggered()) {
-            int isDiff = IsDifficultyMenuOpen();
-            LogMessage("Concept Reactor triggered on Title (render loop): isDiff=%d (windowOpen=%d, frames=%d, state=%d)",
-                       isDiff, IsRefrainWindowOpen(), g_RefrainWindowOpenFrames, g_RefrainWindowState);
-            if (isDiff) {
-                LogMessage("Concept Reactor blocked during Difficulty Selection (render loop)");
+            if (!IsRefrainWindowOpen() || g_RefrainWindowState != 1) {
+                LogMessage("Concept Reactor blocked on Title (render loop: windowOpen=%d, frames=%d, state=%d) -> only allowed on post-difficulty screen",
+                           IsRefrainWindowOpen(), g_RefrainWindowOpenFrames, g_RefrainWindowState);
             } else {
+                DWORD diff = *(volatile DWORD*)0x5b8e28;
+                if (g_RefrainSubMenuCursor == 1 && diff >= 2) {
+                    g_SelectedReMode = 1;
+                } else {
+                    g_SelectedReMode = 0;
+                }
                 g_ShowStageMenu = 1;
                 g_ActiveColumn = 0;
                 g_StageSelected = 0;
@@ -1266,7 +1381,8 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
                 DWORD curChar = *(volatile DWORD*)0x5b9774;
                 if (curChar <= 2) g_PracticeChar = curChar;
                 PlayGameSE(1040);
-                LogMessage("Concept Reactor triggered on Title screen (render loop) -> opening Stage Menu directly (practice mode, char=%lu)", g_PracticeChar);
+                LogMessage("Concept Reactor opened Stage Menu (render loop: char=%lu, diff=%lu, subCursor=%d, ReMode=%d)",
+                           g_PracticeChar, diff, g_RefrainSubMenuCursor, g_SelectedReMode);
             }
         }
     }
@@ -1393,10 +1509,12 @@ DWORD __cdecl HandleTrans(void) {
 
         int isC = IsConceptReactorHeld();
         if (isC) {
+            g_SelectedReMode = (GetGameInfoInt("GameInfo_RefRain") == 1);
             g_ShowStageMenu = 1;
             g_ActiveColumn = 0;
             g_PracticeMode = 1;
-            LogMessage("Trans intercepted with Concept Reactor: prev=%lu next=%lu -> showing stage select menu (practice mode)", prevScene, nextScene);
+            LogMessage("Trans intercepted with Concept Reactor: prev=%lu next=%lu -> showing stage select menu (practice mode, ReMode=%d)",
+                       prevScene, nextScene, g_SelectedReMode);
             return nextScene;
         } else {
             g_StageSelected = 1;
@@ -1612,6 +1730,13 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
                         g_StageInitRenderFrames = 0;
                         InterlockedExchange(&g_PendingReset, 1);
                         ResetStageScore();
+                        DWORD diff = *(volatile DWORD*)0x5b8e28;
+                        if (diff < 1 || diff > 4) diff = 2;
+                        if (g_SelectedReMode && diff >= 2) {
+                            SetGameInfoInt("GameInfo_RefRain", 1);
+                        } else {
+                            SetGameInfoInt("GameInfo_RefRain", 0);
+                        }
                         *(volatile DWORD*)0x5c0740 = 2 + stage;
                         PlayGameSE(1040);
                     }
