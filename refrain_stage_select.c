@@ -458,48 +458,37 @@ static int IsConceptReactorHeld(void) {
     return 0;
 }
 
-static int IsDifficultyMenuOpen(void) {
-    int foundDiff = 0;
+// Track state inside REFRAIN window:
+// 0 = Difficulty Selection screen
+// 1 = Post-Difficulty screen ("DIVE 2 M.R.S.")
+static volatile int g_RefrainWindowState = 0;
+static volatile int g_RefrainWindowOpenFrames = 0;
 
-    DWORD *pStart = (DWORD*)0x5b99c8;
-    DWORD *pEnd = (DWORD*)0x5ba0a4;
-    for (DWORD *pGrp = pStart; pGrp < pEnd; pGrp++) {
-        DWORD pMgr = *pGrp;
-        if (!pMgr || (pMgr < 0x10000) || IsBadReadPtr((void*)(pMgr + 0x1d4c8), 4)) continue;
-        DWORD pNode = *(DWORD*)(pMgr + 0x1d4c8);
-        int loopCount = 0;
-        while (pNode && loopCount++ < 100) {
-            if (IsBadReadPtr((void*)pNode, 0x10)) break;
-            DWORD pTask = *(DWORD*)(pNode + 0xC);
-            if (pTask && (pTask > 0x10000) && !IsBadReadPtr((void*)pTask, 0x30)) {
-                if (*(DWORD*)pTask == 0x004B9A20) {
-                    DWORD fn = *(DWORD*)(pTask + 0x1C);
-                    DWORD active = *(DWORD*)(pTask + 0x20);
-                    DWORD pc = *(DWORD*)(pTask + 0x28);
-                    LogMessage("CTaskManager task: fn=%lu pc=%lu active=%lu", fn, pc, active);
-                    if (fn == 196) foundDiff = 1;
-                }
-            }
-            pNode = *(DWORD*)(pNode + 0x8);
-        }
-    }
-
+static int IsRefrainWindowOpen(void) {
     DWORD *pTasks = (DWORD*)0x5ba0a8;
-    for (DWORD i = 0; i < 1200; i++) {
+    for (DWORD i = 0; i < 6000; i++) {
         DWORD pTask = pTasks[i];
-        if (pTask && (pTask > 0x10000) && !IsBadReadPtr((void*)pTask, 0x30)) {
+        if (pTask >= 0x00400000 && pTask < 0x7FFF0000 && ((uintptr_t)pTask & 3) == 0) {
             if (*(DWORD*)pTask == 0x004B9A20) {
                 DWORD fn = *(DWORD*)(pTask + 0x1C);
                 DWORD active = *(DWORD*)(pTask + 0x20);
-                DWORD pc = *(DWORD*)(pTask + 0x28);
-                if (fn != 0 && active > 0) {
-                    LogMessage("TaskTable slot=%lu: fn=%lu pc=%lu active=%lu", i, fn, pc, active);
-                    if (fn == 196) foundDiff = 1;
+                if (fn >= 82 && fn <= 112 && active > 0) {
+                    return 1;
                 }
             }
         }
     }
-    return foundDiff;
+    return 0;
+}
+
+static int IsDifficultyMenuOpen(void) {
+    int open = IsRefrainWindowOpen();
+    if (!open) {
+        g_RefrainWindowOpenFrames = 0;
+        g_RefrainWindowState = 0;
+        return 0;
+    }
+    return (g_RefrainWindowState == 0);
 }
 
 int __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key) {
@@ -508,8 +497,11 @@ int __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key) {
 
     if (currentScene == 1 && nextScene == 1 && !g_ShowStageMenu && !g_AutoAdvanceToDifficulty && !IsReplayOrDemo()) {
         if (IsConceptReactorTriggered()) {
-            if (IsDifficultyMenuOpen()) {
-                LogMessage("Concept Reactor triggered during Difficulty Selection (input hook) -> blocked");
+            int isDiff = IsDifficultyMenuOpen();
+            LogMessage("Concept Reactor triggered on Title: isDiff=%d (windowOpen=%d, frames=%d, state=%d)",
+                       isDiff, IsRefrainWindowOpen(), g_RefrainWindowOpenFrames, g_RefrainWindowState);
+            if (isDiff) {
+                LogMessage("Concept Reactor blocked during Difficulty Selection (input hook)");
                 return 0;
             }
             g_ShowStageMenu = 1;
@@ -534,7 +526,31 @@ int __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key) {
         return 0;
     }
 
-    return orig_IsKeyTriggered(this, key);
+    int res = orig_IsKeyTriggered(this, key);
+
+    // Track navigation inside REFRAIN window
+    if (currentScene == 1 && res) {
+        if (IsRefrainWindowOpen()) {
+            if (MatchSimulatedKey(SIMKEY_DECIDE, key) && g_RefrainWindowOpenFrames >= 20) {
+                if (g_RefrainWindowState == 0) {
+                    g_RefrainWindowState = 1;
+                    LogMessage("REFRAIN window: Confirmed Difficulty -> advanced to Post-Difficulty menu (DIVE 2 M.R.S.) [frames=%d]", g_RefrainWindowOpenFrames);
+                }
+            } else if (MatchSimulatedKey(SIMKEY_CANCEL, key)) {
+                if (g_RefrainWindowState == 1) {
+                    g_RefrainWindowState = 0;
+                    LogMessage("REFRAIN window: Cancelled from Post-Difficulty -> back to Difficulty Selection");
+                } else if (g_RefrainWindowState == 0) {
+                    LogMessage("REFRAIN window: Cancelled from Difficulty Selection -> closing window");
+                }
+            }
+        } else {
+            g_RefrainWindowOpenFrames = 0;
+            g_RefrainWindowState = 0;
+        }
+    }
+
+    return res;
 }
 
 DWORD __cdecl HandleSetLives(DWORD origLives) {
@@ -1172,6 +1188,15 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
             }
         }
     }
+    if (currentScene == 1) {
+        if (IsRefrainWindowOpen()) {
+            g_RefrainWindowOpenFrames++;
+        } else {
+            g_RefrainWindowOpenFrames = 0;
+            g_RefrainWindowState = 0;
+        }
+    }
+
     if (g_ReturnToStageMenu && currentScene == 1) {
         g_ReturnToStageMenu = 0;
         g_AutoAdvanceToDifficulty = 1;
@@ -1199,7 +1224,10 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
         } else if (g_AutoNavPhase == 1) {
             if (g_AutoNavTimer >= 35 && g_AutoNavTimer <= 36) {
                 g_SimulatedKeyAction = SIMKEY_DECIDE;
-                if (g_AutoNavTimer == 35) LogMessage("AutoNav: Phase 1 -> Confirming Difficulty (timer=%d)", g_AutoNavTimer);
+                if (g_AutoNavTimer == 35) {
+                    g_RefrainWindowState = 1;
+                    LogMessage("AutoNav: Phase 1 -> Confirming Difficulty (timer=%d)", g_AutoNavTimer);
+                }
             } else if (g_AutoNavTimer == 37) {
                 g_SimulatedKeyAction = SIMKEY_NONE;
             } else if (g_AutoNavTimer >= 40) {
@@ -1225,8 +1253,11 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
 
     if (currentScene == 1 && nextScene == 1 && !g_ShowStageMenu && !g_AutoAdvanceToDifficulty && !IsReplayOrDemo()) {
         if (IsConceptReactorTriggered()) {
-            if (IsDifficultyMenuOpen()) {
-                LogMessage("Concept Reactor triggered during Difficulty Selection (render loop) -> blocked");
+            int isDiff = IsDifficultyMenuOpen();
+            LogMessage("Concept Reactor triggered on Title (render loop): isDiff=%d (windowOpen=%d, frames=%d, state=%d)",
+                       isDiff, IsRefrainWindowOpen(), g_RefrainWindowOpenFrames, g_RefrainWindowState);
+            if (isDiff) {
+                LogMessage("Concept Reactor blocked during Difficulty Selection (render loop)");
             } else {
                 g_ShowStageMenu = 1;
                 g_ActiveColumn = 0;
