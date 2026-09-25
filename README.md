@@ -1,7 +1,7 @@
 # **Raindrop**
 RefRain - prism memories - V1.03.7用のステージセレクト等の機能追加パッチです。
 ## 使い方
-[Releases](https://github.com/Madotsukanai/Raindrop/releases)からd3d9.dllをダウンロードし、RefRain.exe (SHA-256: db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78)と同じディレクトリにコピーしてからゲームを起動して下さい。
+[Releases](https://github.com/Madotsukanai/Raindrop/releases)からd3d9.dllをダウンロードし、RefRain.exe (SHA-256: db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78)と同じディレクトリにコピーしてからゲームを起動して下さい。<br>
 「DIVE 2 M.R.S.」にカーソルを合わせた状態でコンセプトリアクターに割り当てたキーを入力するとプラクティスメニューが開きます。
 
 ## 機能
