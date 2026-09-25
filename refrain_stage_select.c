@@ -9,16 +9,26 @@ static volatile int g_ShowStageMenu = 0;
 static volatile int g_StageSelected = 0;
 static volatile int g_PracticeMode = 0;   // 1 if started via C key menu (practice mode), 0 if normal game start
 static volatile int g_ReturnToStageMenu = 0; // set when practice stage ends to return to stage menu
+static volatile int g_AutoAdvanceToDifficulty = 0; // flag to auto-advance Title scene to Difficulty Menu
+static volatile int g_AutoNavPhase = 0;           // 0: login, 1: desktop, 2: difficulty menu
+static volatile int g_AutoNavTimer = 0;           // frame counter for auto-navigation
+#define SIMKEY_NONE   0
+#define SIMKEY_DECIDE 1
+#define SIMKEY_CANCEL 2
+#define SIMKEY_DOWN   3
+#define SIMKEY_UP     4
+static volatile int g_SimulatedKeyAction = SIMKEY_NONE; // action to simulate on current frame
+static volatile DWORD g_PracticeChar = 0;         // player character: 0=Miria, 1=Tee, 2=Mews
 static volatile int g_CancelToTitle = 0; // set when player cancels back to title
 static volatile int g_MenuCursor = 0;   // 0 to 4 (Stage index)
 static volatile int g_ActiveColumn = 0; // 0=Stage, 1=Lives, 2=MEFA, 3=CR Stock, 4=CR Gauge
-static volatile int g_LifeCursor = 2;   // 0 to 5 (default: 2 in reserve)
+static volatile int g_LifeCursor = 2;   // 0 to 10 (default: 2 in reserve)
 static volatile int g_SelectedLives = 2;
-static volatile int g_MefaCursor = 2;   // 0 to 6 (default: 2 stocks = 200.0f)
-static volatile int g_CrStockCursor = 1; // 0 to 3 (default: 1 stock)
+static volatile int g_MefaCursor = 1;   // 0 to 6 (default: 1 stock = 100.0f)
+static volatile int g_CrStockCursor = 0; // 0 to 3 (default: 0 stocks)
 static volatile int g_CrGaugeCursor = 0; // 0 to 4 (default: 0%)
-static volatile DWORD g_SelectedMefaDword = 0x43480000; // 200.0f (2 stocks)
-static volatile DWORD g_SelectedCrDword = 0x42c80000;   // 100.0f (1 stock, 0%)
+static volatile DWORD g_SelectedMefaDword = 0x42c80000; // 100.0f (1 stock)
+static volatile DWORD g_SelectedCrDword = 0x00000000;   // 0.0f (0 stocks, 0%)
 static volatile int g_PendingStageInitStats = 0;
 static volatile int g_StageInitRenderFrames = 0;
 
@@ -103,9 +113,9 @@ static void EnsureFont(IDirect3DDevice9 *pDevice, DWORD screenW) {
         if (hD3DX) {
             PFN_D3DXCreateFontA pfnCreateFont = (PFN_D3DXCreateFontA)GetProcAddress(hD3DX, "D3DXCreateFontA");
             if (pfnCreateFont) {
-                int itemH = (screenW >= 1000) ? 22 : 14;
+                int itemH = (screenW >= 1000) ? 20 : 13;
                 int stageH = (screenW >= 1000) ? 20 : 13;
-                int titleH = (screenW >= 1000) ? 26 : 16;
+                int titleH = (screenW >= 1000) ? 24 : 16;
                 int footerH = (screenW >= 1000) ? 18 : 12;
 
                 pfnCreateFont(pDevice, itemH, 0, FW_BOLD, 1, FALSE, DEFAULT_CHARSET,
@@ -165,15 +175,20 @@ typedef struct {
     const char *label;
 } LifeItem;
 
-#define LIFE_ITEM_COUNT 6
+#define LIFE_ITEM_COUNT 11
 
 static const LifeItem g_LifeItems[LIFE_ITEM_COUNT] = {
     { 0, "0" },
     { 1, "1" },
-    { 2, "2 (DEF)" },
+    { 2, "2 (Default)" },
     { 3, "3" },
     { 4, "4" },
-    { 5, "5 (MAX)" },
+    { 5, "5" },
+    { 6, "6" },
+    { 7, "7" },
+    { 8, "8" },
+    { 9, "9" },
+    { 10, "10 (Maximum)" },
 };
 
 static void UpdateSelectedLives(void) {
@@ -189,12 +204,12 @@ typedef struct {
 
 static const MefaItem g_MefaItems[MEFA_ITEM_COUNT] = {
     { 0, "0" },
-    { 1, "1" },
-    { 2, "2 (DEF)" },
+    { 1, "1 (Default)" },
+    { 2, "2" },
     { 3, "3" },
     { 4, "4" },
     { 5, "5" },
-    { 6, "6 (MAX)" },
+    { 6, "6 (Maximum)" },
 };
 
 typedef struct {
@@ -205,10 +220,10 @@ typedef struct {
 #define CR_STOCK_ITEM_COUNT 4
 
 static const CrStockItem g_CrStockItems[CR_STOCK_ITEM_COUNT] = {
-    { 0, "0" },
-    { 1, "1 (DEF)" },
+    { 0, "0 (Default)" },
+    { 1, "1" },
     { 2, "2" },
-    { 3, "3 (MAX)" },
+    { 3, "3 (Maximum)" },
 };
 
 typedef struct {
@@ -219,7 +234,7 @@ typedef struct {
 #define CR_GAUGE_ITEM_COUNT 5
 
 static const CrGaugeItem g_CrGaugeItems[CR_GAUGE_ITEM_COUNT] = {
-    { 0.0f,   "0% (DEF)" },
+    { 0.0f,   "0% (Default)" },
     { 25.0f,  "25%" },
     { 50.0f,  "50%" },
     { 75.0f,  "75%" },
@@ -305,6 +320,254 @@ static inline int IsReplayOrDemo(void) {
         return 1;
     }
     return 0;
+}
+
+// Input manager hooks: suppress game input when the Stage Select menu is visible
+// so the Title screen does not react to menu navigation keys.
+// Also allows opening the menu cleanly from Title screen upon pressing 'C' key.
+typedef int (__attribute__((thiscall)) *PFN_IsKey)(void *this, int key);
+static PFN_IsKey orig_IsKeyPressed = (PFN_IsKey)0x00431760;
+static PFN_IsKey orig_IsKeyTriggered = (PFN_IsKey)0x004317a0;
+
+// Match a simulated action against virtual key codes checked by RefRain engine.
+// RefRain's CKeyboard uses Win32 Virtual Key codes (via GetKeyboardState):
+//   Decide: 'Z' (0x5A), 'z' (0x7A), VK_RETURN (0x0D), VK_SPACE (0x20)
+//   Cancel: 'X' (0x58), 'x' (0x78), VK_ESCAPE (0x1B)
+//   Down:   VK_DOWN (0x28) (HSF VM Opcode 27 / 0x7E calls IsKeyPressed(0x28))
+//   Up:     VK_UP (0x26)   (HSF VM Opcode 27 / 0x7E calls IsKeyPressed(0x26))
+static inline int MatchSimulatedKey(int action, int key) {
+    switch (action) {
+        case SIMKEY_DECIDE:
+            if (key == 'Z' || key == 'z' || key == 0x5A || key == 0x7A ||
+                key == VK_RETURN || key == 0x0D ||
+                key == VK_SPACE || key == 0x20 ||
+                key == 0x2C || key == 0x1C) {
+                return 1;
+            }
+            break;
+        case SIMKEY_CANCEL:
+            if (key == 'X' || key == 'x' || key == 0x58 || key == 0x78 ||
+                key == VK_ESCAPE || key == 0x1B ||
+                key == 0x2D || key == 0x01) {
+                return 1;
+            }
+            break;
+        case SIMKEY_DOWN:
+            if (key == VK_DOWN || key == 0x28 || key == 0xD0) {
+                return 1;
+            }
+            break;
+        case SIMKEY_UP:
+            if (key == VK_UP || key == 0x26 || key == 0xC8) {
+                return 1;
+            }
+            break;
+    }
+    return 0;
+}
+
+int __attribute__((thiscall)) Hook_IsKeyPressed(void *this, int key) {
+    if (g_ShowStageMenu) return 0;
+
+    // During Auto-Navigation to Difficulty Menu:
+    if (g_AutoAdvanceToDifficulty) {
+        if (g_SimulatedKeyAction != SIMKEY_NONE && MatchSimulatedKey(g_SimulatedKeyAction, key)) {
+            LogMessage("Hook_IsKeyPressed: SIMULATED MATCH action=%d key=0x%02X", g_SimulatedKeyAction, key);
+            return 1;
+        }
+        return 0; // block other inputs during auto-nav
+    }
+
+    return orig_IsKeyPressed(this, key);
+}
+
+// Get the configured virtual key code for Concept Reactor (default 'C' = 0x43)
+static inline int GetConceptReactorKey(void) {
+    DWORD pConfig = *(volatile DWORD*)0x5ac9b0;
+    if (pConfig && !IsBadReadPtr((void*)pConfig, 0x800)) {
+        DWORD crIdx = *(DWORD*)(pConfig + 0x434);
+        if (crIdx < 32) {
+            DWORD keyCode = *(DWORD*)(pConfig + 0x728 + crIdx * 4);
+            if (keyCode > 0 && keyCode < 256) {
+                return (int)keyCode;
+            }
+        }
+    }
+    return 'C'; // default: 'C' (0x43)
+}
+
+// Get the configured joystick button index for Concept Reactor (0-based)
+static inline int GetConceptReactorJoyButton(int crKey) {
+    void *pInputMgr = *(void**)0x5ac9b4;
+    if (pInputMgr && !IsBadReadPtr(pInputMgr, 16)) {
+        void *pJ = *(void**)((DWORD)pInputMgr + 0xc);
+        if (pJ && !IsBadReadPtr(pJ, 0x400)) {
+            DWORD vtbl = *(DWORD*)pJ;
+            if (vtbl == 0x4b83f8 && crKey >= 0 && crKey < 256) { // CJoystickDInput
+                int btn = *(int*)((DWORD)pJ + 0x34 + crKey * 4);
+                if (btn >= 0 && btn < 32) return btn;
+            } else if (vtbl == 0x4b807c && crKey >= 0 && crKey < 256) { // CJoystickWinMM
+                int btn = *(int*)((DWORD)pJ + 0x1f4 + crKey * 4);
+                if (btn >= 0 && btn < 32) return btn;
+            }
+        }
+    }
+    return 2; // Default button index: Button 3 (0-indexed: 2 -> bit 2 = 0x4)
+}
+
+// Check if Concept Reactor was triggered on either keyboard or controller
+static int IsConceptReactorTriggered(void) {
+    int crKey = GetConceptReactorKey();
+
+    // 1. Check via game engine's CInputManager::IsKeyTriggered (handles both Keyboard and Joystick)
+    void *pInputMgr = *(void**)0x5ac9b4;
+    if (pInputMgr && !IsBadReadPtr(pInputMgr, 16)) {
+        if (orig_IsKeyTriggered(pInputMgr, crKey)) {
+            return 1;
+        }
+    }
+
+    // 2. Direct keyboard fallback: GetAsyncKeyState with edge detection
+    static int s_prevKey = 0;
+    int keyState = (GetAsyncKeyState(crKey) & 0x8000) != 0;
+    int keyTrig = keyState && !s_prevKey;
+    s_prevKey = keyState;
+    if (keyTrig) {
+        return 1;
+    }
+
+    // 3. Direct controller fallback: joyGetPosEx with edge detection
+    JOYINFOEX joy;
+    joy.dwSize = sizeof(joy);
+    joy.dwFlags = JOY_RETURNBUTTONS;
+    if (joyGetPosEx(0, &joy) == JOYERR_NOERROR) {
+        static DWORD s_prevJoyButtons = 0;
+        DWORD trigButtons = joy.dwButtons & ~s_prevJoyButtons;
+        s_prevJoyButtons = joy.dwButtons;
+
+        int btnIdx = GetConceptReactorJoyButton(crKey);
+        if (btnIdx >= 0 && btnIdx < 32) {
+            if (trigButtons & (1 << btnIdx)) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+// Check if Concept Reactor is currently held down on either keyboard or controller
+static int IsConceptReactorHeld(void) {
+    int crKey = GetConceptReactorKey();
+
+    void *pInputMgr = *(void**)0x5ac9b4;
+    if (pInputMgr && !IsBadReadPtr(pInputMgr, 16)) {
+        if (orig_IsKeyPressed(pInputMgr, crKey)) {
+            return 1;
+        }
+    }
+
+    if ((GetAsyncKeyState(crKey) & 0x8000) != 0) {
+        return 1;
+    }
+
+    JOYINFOEX joy;
+    joy.dwSize = sizeof(joy);
+    joy.dwFlags = JOY_RETURNBUTTONS;
+    if (joyGetPosEx(0, &joy) == JOYERR_NOERROR) {
+        int btnIdx = GetConceptReactorJoyButton(crKey);
+        if (btnIdx >= 0 && btnIdx < 32) {
+            if (joy.dwButtons & (1 << btnIdx)) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+// Check if the game is currently on the Difficulty Selection menu (Title.rsr Function 196)
+static int IsDifficultyMenuOpen(void) {
+    int foundDiff = 0;
+
+    // Check 1: Active task list across CTaskManager priority groups (0x5b99c8 .. 0x5ba0a4)
+    DWORD *pStart = (DWORD*)0x5b99c8;
+    DWORD *pEnd = (DWORD*)0x5ba0a4;
+    for (DWORD *pGrp = pStart; pGrp < pEnd; pGrp++) {
+        DWORD pMgr = *pGrp;
+        if (!pMgr || (pMgr < 0x10000) || IsBadReadPtr((void*)(pMgr + 0x1d4c8), 4)) continue;
+        DWORD pNode = *(DWORD*)(pMgr + 0x1d4c8);
+        int loopCount = 0;
+        while (pNode && loopCount++ < 100) {
+            if (IsBadReadPtr((void*)pNode, 0x10)) break;
+            DWORD pTask = *(DWORD*)(pNode + 0xC);
+            if (pTask && (pTask > 0x10000) && !IsBadReadPtr((void*)pTask, 0x30)) {
+                if (*(DWORD*)pTask == 0x004B9A20) { // CScriptTask
+                    DWORD fn = *(DWORD*)(pTask + 0x1C);
+                    DWORD active = *(DWORD*)(pTask + 0x20);
+                    DWORD pc = *(DWORD*)(pTask + 0x28);
+                    LogMessage("CTaskManager task: fn=%lu pc=%lu active=%lu", fn, pc, active);
+                    if (fn == 196) foundDiff = 1;
+                }
+            }
+            pNode = *(DWORD*)(pNode + 0x8);
+        }
+    }
+
+    // Check 2: Task table 0x5ba0a8 (all 1200 task slots)
+    DWORD *pTasks = (DWORD*)0x5ba0a8;
+    for (DWORD i = 0; i < 1200; i++) {
+        DWORD pTask = pTasks[i];
+        if (pTask && (pTask > 0x10000) && !IsBadReadPtr((void*)pTask, 0x30)) {
+            if (*(DWORD*)pTask == 0x004B9A20) {
+                DWORD fn = *(DWORD*)(pTask + 0x1C);
+                DWORD active = *(DWORD*)(pTask + 0x20);
+                DWORD pc = *(DWORD*)(pTask + 0x28);
+                if (fn != 0 && active > 0) {
+                    LogMessage("TaskTable slot=%lu: fn=%lu pc=%lu active=%lu", i, fn, pc, active);
+                    if (fn == 196) foundDiff = 1;
+                }
+            }
+        }
+    }
+    return foundDiff;
+}
+
+int __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key) {
+    DWORD currentScene = *(volatile DWORD*)0x5c073c;
+    DWORD nextScene = *(volatile DWORD*)0x5c0740;
+
+    // Check if player triggers Concept Reactor (keyboard or controller) on Title screen to open practice menu
+    if (currentScene == 1 && nextScene == 1 && !g_ShowStageMenu && !g_AutoAdvanceToDifficulty && !IsReplayOrDemo()) {
+        if (IsConceptReactorTriggered()) {
+            if (IsDifficultyMenuOpen()) {
+                LogMessage("Concept Reactor triggered during Difficulty Selection (input hook) -> blocked");
+                return 0;
+            }
+            g_ShowStageMenu = 1;
+            g_ActiveColumn = 0;
+            g_StageSelected = 0;
+            g_PracticeMode = 1;
+            DWORD curChar = *(volatile DWORD*)0x5b9774;
+            if (curChar <= 2) g_PracticeChar = curChar;
+            PlayGameSE(1040);
+            LogMessage("Concept Reactor triggered on Title screen (input hook) -> opening Stage Menu directly (practice mode, char=%lu)", g_PracticeChar);
+            return 0;
+        }
+    }
+
+    if (g_ShowStageMenu) return 0;
+
+    // During Auto-Navigation to Difficulty Menu after practice stage clear:
+    if (g_AutoAdvanceToDifficulty && currentScene == 1) {
+        if (g_SimulatedKeyAction != SIMKEY_NONE && MatchSimulatedKey(g_SimulatedKeyAction, key)) {
+            LogMessage("Hook_IsKeyTriggered: SIMULATED MATCH action=%d key=0x%02X", g_SimulatedKeyAction, key);
+            return 1;
+        }
+        return 0; // block other inputs during auto-nav
+    }
+
+    return orig_IsKeyTriggered(this, key);
 }
 
 // Hook for HSF Native SetLives (0x00462535) - Native 77 (Player lives at 0x5b8e08)
@@ -435,30 +698,30 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
 
     if (isHD) {
         totalW = 1200.0f;
-        stageBoxH = 200.0f;
-        paramBoxH = 280.0f;
-        footerH = 64.0f;
-        rowGap = 10.0f;
-        headerH = 34.0f;
-        stageLineSpacing = 28.0f;
-        paramLineSpacing = 32.0f;
+        stageBoxH = 175.0f;
+        paramBoxH = 325.0f;
+        footerH = 56.0f;
+        rowGap = 8.0f;
+        headerH = 30.0f;
+        stageLineSpacing = 27.0f;
+        paramLineSpacing = 25.0f;
         colGap = 16.0f;
         colW = (totalW - (3.0f * colGap)) / 4.0f; // (1200 - 48) / 4 = 288.0f
-        stageHighlightH = 24.0f;
-        paramHighlightH = 24.0f;
+        stageHighlightH = 23.0f;
+        paramHighlightH = 22.0f;
     } else {
         totalW = 616.0f;
-        stageBoxH = 136.0f;
-        paramBoxH = 176.0f;
-        footerH = 46.0f;
-        rowGap = 6.0f;
-        headerH = 24.0f;
-        stageLineSpacing = 20.0f;
-        paramLineSpacing = 20.0f;
+        stageBoxH = 115.0f;
+        paramBoxH = 195.0f;
+        footerH = 38.0f;
+        rowGap = 5.0f;
+        headerH = 20.0f;
+        stageLineSpacing = 17.0f;
+        paramLineSpacing = 15.0f;
         colGap = 8.0f;
         colW = (totalW - (3.0f * colGap)) / 4.0f; // (616 - 24) / 4 = 148.0f
-        stageHighlightH = 18.0f;
-        paramHighlightH = 18.0f;
+        stageHighlightH = 15.0f;
+        paramHighlightH = 14.0f;
     }
 
     float totalH = stageBoxH + rowGap + paramBoxH + rowGap + footerH;
@@ -503,7 +766,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     DrawShadowText(g_pTitleFont, "STAGE SELECT", (int)startX + (isHD ? 14 : 10), (int)stageBoxY + (isHD ? 8 : 5), titleCol0);
 
     // Items for Column 0 (Stage)
-    int stageStartY = (int)stageBoxY + (isHD ? 44 : 30);
+    int stageStartY = (int)stageBoxY + (isHD ? 36 : 24);
     for (int i = 0; i < MENU_ITEM_COUNT; i++) {
         int itemY = stageStartY + (int)(i * stageLineSpacing);
         char buf[128];
@@ -524,7 +787,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     }
 
     // Bottom Row: 4 parameter columns
-    int paramStartY = (int)paramBoxY + (isHD ? 44 : 30);
+    int paramStartY = (int)paramBoxY + (isHD ? 36 : 24);
 
     // Column 1: LIVES
     DrawSolidRect(pDevice, xLives - 2.0f, paramBoxY - 2.0f, colW + 4.0f, paramBoxH + 4.0f, borderCol1);
@@ -810,10 +1073,14 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             UpdateSelectedCr();
             int stage = g_MenuItems[g_MenuCursor].stage;
 
+            DWORD curChar = *(volatile DWORD*)0x5b9774;
+            if (curChar <= 2) g_PracticeChar = curChar;
+
             g_ShowStageMenu = 0;
             g_StageSelected = 1;
             g_PracticeMode = 1;
             g_ReturnToStageMenu = 0;
+            g_AutoAdvanceToDifficulty = 0;
             g_ActiveColumn = 0;
             g_PendingStageInitStats = 1;
             g_StageInitRenderFrames = 0;
@@ -821,8 +1088,8 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             ResetStageScore();
             *(volatile DWORD*)0x5c0740 = 2 + stage;
             PlayGameSE(1040); // Decide SE
-            LogMessage("All confirmed -> Starting Stage %d (Lives=%d, MEFA stocks=%d, dw=0x%08X, CR Stock=%d, CR Gauge=%s, CR Total=0x%08X)",
-                       stage, g_SelectedLives, g_MefaItems[g_MefaCursor].value, g_SelectedMefaDword,
+            LogMessage("All confirmed -> Starting Stage %d (char=%lu, Lives=%d, MEFA stocks=%d, dw=0x%08X, CR Stock=%d, CR Gauge=%s, CR Total=0x%08X)",
+                       stage, g_PracticeChar, g_SelectedLives, g_MefaItems[g_MefaCursor].value, g_SelectedMefaDword,
                        g_CrStockItems[g_CrStockCursor].stock,
                        g_CrGaugeItems[g_CrGaugeCursor].label, g_SelectedCrDword);
         }
@@ -864,11 +1131,22 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             g_StageSelected = 0;
             g_PracticeMode = 0;
             g_ReturnToStageMenu = 0;
-            g_CancelToTitle = 1;
+            g_AutoAdvanceToDifficulty = 0;
+            g_AutoNavPhase = 0;
+            g_AutoNavTimer = 0;
+            g_SimulatedKeyAction = SIMKEY_NONE;
             g_ActiveColumn = 0;
-            *(volatile DWORD*)0x5c0740 = 1; // Return to Title
             PlayGameSE(1048); // Cancel SE
-            LogMessage("Stage Menu Cancel -> Return to Title");
+            DWORD prevScene = *(volatile DWORD*)0x5c073c;
+            if (prevScene != 1) {
+                g_CancelToTitle = 1;
+                *(volatile DWORD*)0x5c0740 = 1; // Return to Title
+                LogMessage("Stage Menu Cancel -> Redirecting to Title (prevScene=%lu)", prevScene);
+            } else {
+                g_CancelToTitle = 0;
+                *(volatile DWORD*)0x5c0740 = 1;
+                LogMessage("Stage Menu Cancel -> Closed menu on Title screen");
+            }
         }
     } else if (do_left) {
         if (g_ActiveColumn == 4) {
@@ -936,14 +1214,97 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
     }
 
     DWORD currentScene = *(volatile DWORD*)0x5c073c;
+    DWORD nextScene = *(volatile DWORD*)0x5c0740;
+
+    static int scriptDumped = 0;
+    if (!scriptDumped && currentScene == 1) {
+        char *pScript = *(char**)0x5c0760;
+        if (pScript && (DWORD)pScript > 0x10000 && !IsBadReadPtr(pScript, 0x100)) {
+            DWORD size = *(DWORD*)(pScript + 8);
+            if (size > 0 && size < 0x200000 && !IsBadReadPtr(pScript, size)) {
+                FILE *fout = fopen("full_title_script.bin", "wb");
+                if (fout) {
+                    fwrite(pScript, 1, size, fout);
+                    fclose(fout);
+                    LogMessage("Dumped full Title.rsr script: size=%lu bytes", size);
+                    scriptDumped = 1;
+                }
+            }
+        }
+    }
     if (g_ReturnToStageMenu && currentScene == 1) {
         g_ReturnToStageMenu = 0;
-        g_ShowStageMenu = 1;
-        g_ActiveColumn = 0;
-        g_StageSelected = 0;
-        g_PracticeMode = 1;
-        LogMessage("Practice stage finished -> Title reached (scene=%lu), showing Stage Menu for stage %d",
-                   currentScene, g_MenuItems[g_MenuCursor].stage);
+        g_AutoAdvanceToDifficulty = 1;
+        g_AutoNavPhase = 0;
+        g_AutoNavTimer = 0;
+        g_SimulatedKeyAction = SIMKEY_NONE;
+        LogMessage("EndScene: Title reached (scene=%lu), auto-advancing to menu after Difficulty for char %lu",
+                   currentScene, g_PracticeChar);
+    }
+
+    if (currentScene == 1 && g_AutoAdvanceToDifficulty) {
+        g_AutoNavTimer++;
+
+        if (g_AutoNavPhase == 0) {
+            // Phase 0: Waiting for Desktop to appear and clicking "REFRAIN" icon
+            // Returning from gameplay (stage clear or pause menu) always lands directly on the Desktop,
+            // with the top icon "REFRAIN" selected by default.
+            if (g_AutoNavTimer >= 50 && g_AutoNavTimer <= 51) {
+                g_SimulatedKeyAction = SIMKEY_DECIDE; // Click default selected REFRAIN icon
+                if (g_AutoNavTimer == 50) LogMessage("AutoNav: Phase 0 -> Clicking REFRAIN icon on Desktop (timer=%d)", g_AutoNavTimer);
+            } else if (g_AutoNavTimer == 52) {
+                g_SimulatedKeyAction = SIMKEY_NONE;
+            } else if (g_AutoNavTimer >= 55) {
+                g_AutoNavPhase = 1;
+                g_AutoNavTimer = 0;
+                LogMessage("AutoNav: Advancing to Phase 1 (Waiting for Difficulty Menu window)");
+            }
+        } else if (g_AutoNavPhase == 1) {
+            // Phase 1: Waiting for REFRAIN window (Difficulty Menu) to open (~35 frames),
+            // then pressing DECIDE to confirm difficulty and proceed to the next menu ("DIVE 2 M.R.S.")
+            if (g_AutoNavTimer >= 35 && g_AutoNavTimer <= 36) {
+                g_SimulatedKeyAction = SIMKEY_DECIDE; // Confirm Difficulty
+                if (g_AutoNavTimer == 35) LogMessage("AutoNav: Phase 1 -> Confirming Difficulty (timer=%d)", g_AutoNavTimer);
+            } else if (g_AutoNavTimer == 37) {
+                g_SimulatedKeyAction = SIMKEY_NONE;
+            } else if (g_AutoNavTimer >= 40) {
+                g_AutoNavPhase = 2;
+                g_AutoNavTimer = 0;
+                LogMessage("AutoNav: Advancing to Phase 2 (Waiting for menu after Difficulty Selection)");
+            }
+        } else if (g_AutoNavPhase == 2) {
+            // Phase 2: Waiting for the menu after Difficulty Selection ("DIVE 2 M.R.S.") to appear (~35 frames)
+            if (g_AutoNavTimer >= 35) {
+                g_AutoAdvanceToDifficulty = 0;
+                g_AutoNavPhase = 0;
+                g_AutoNavTimer = 0;
+                g_SimulatedKeyAction = SIMKEY_NONE;
+                g_ShowStageMenu = 1;
+                g_ActiveColumn = 0;
+                g_StageSelected = 0;
+                g_PracticeMode = 1;
+                LogMessage("AutoNav: Menu after Difficulty ready! Stage Menu opened on top of sub-menu for stage %d.",
+                           g_MenuItems[g_MenuCursor].stage);
+            }
+        }
+    }
+
+    // Also check Concept Reactor key/button on Title screen in render loop if not already opened
+    if (currentScene == 1 && nextScene == 1 && !g_ShowStageMenu && !g_AutoAdvanceToDifficulty && !IsReplayOrDemo()) {
+        if (IsConceptReactorTriggered()) {
+            if (IsDifficultyMenuOpen()) {
+                LogMessage("Concept Reactor triggered during Difficulty Selection (render loop) -> blocked");
+            } else {
+                g_ShowStageMenu = 1;
+                g_ActiveColumn = 0;
+                g_StageSelected = 0;
+                g_PracticeMode = 1;
+                DWORD curChar = *(volatile DWORD*)0x5b9774;
+                if (curChar <= 2) g_PracticeChar = curChar;
+                PlayGameSE(1040);
+                LogMessage("Concept Reactor triggered on Title screen (render loop) -> opening Stage Menu directly (practice mode, char=%lu)", g_PracticeChar);
+            }
+        }
     }
 
     if (g_ShowStageMenu) {
@@ -975,7 +1336,7 @@ void __cdecl HandleSceneCheck(DWORD *pEdx) {
 
     if (nextScene == 1) {
         g_StageSelected = 0;
-        if (!g_ReturnToStageMenu) {
+        if (!g_ReturnToStageMenu && !g_AutoAdvanceToDifficulty) {
             g_PracticeMode = 0; // reset practice mode when returning to Title without practice return
         }
         g_LastResetTargetScene = 0;
@@ -1054,27 +1415,29 @@ DWORD __cdecl HandleTrans(void) {
         return prevScene;
     }
 
-    // Practice Mode: when a stage finishes (clear, game over, quit to title, etc.), redirect transition to Title
-    // and flag g_ReturnToStageMenu so the Stage Menu re-opens upon arrival.
+    // Practice Mode: handle transitions out of gameplay (stage clear or pause menu return to title)
     // In RefRain, in-game gameplay scene is 2 (CGameScene). Transitions out of scene 2 signify stage end.
     if ((prevScene == 2 || (prevScene >= 3 && prevScene <= 10)) &&
         prevScene != nextScene &&
         g_PracticeMode && g_PendingReset == 0) {
-        LogMessage("Practice stage end (prev=%lu next=%lu) -> redirecting to Title", prevScene, nextScene);
-        g_ReturnToStageMenu = 1;
+
+        DWORD curChar = *(volatile DWORD*)0x5b9774;
+        if (curChar <= 2) g_PracticeChar = curChar;
+        LogMessage("Practice stage end (prev=%lu next=%lu) -> redirecting to Title for difficulty menu auto-nav (char=%lu)",
+                   prevScene, nextScene, g_PracticeChar);
+        g_ReturnToStageMenu = 0;
+        g_AutoAdvanceToDifficulty = 1;
+        g_AutoNavPhase = 0;
+        g_AutoNavTimer = 0;
+        g_SimulatedKeyAction = SIMKEY_NONE;
         g_StageSelected = 0;
         *(volatile DWORD*)0x5c0740 = 1; // redirect scene transition to Title
         return prevScene;
     }
 
-    // Practice Mode: once arrived at Title after stage end, open the Stage Menu
+    // Practice Mode: once arrived at Title after stage end
     if (prevScene == 1 && g_ReturnToStageMenu) {
         g_ReturnToStageMenu = 0;
-        g_ShowStageMenu = 1;
-        g_ActiveColumn = 0;
-        g_StageSelected = 0;
-        g_PracticeMode = 1;
-        LogMessage("Arrived at Title after practice stage -> opening Stage Menu for stage %d", g_MenuItems[g_MenuCursor].stage);
         return prevScene;
     }
 
@@ -1086,20 +1449,20 @@ DWORD __cdecl HandleTrans(void) {
             return nextScene;
         }
 
-        // Only show stage select menu if 'C' was held when starting the game
-        int isC = (GetAsyncKeyState('C') & 0x8000) != 0;
+        // Only show stage select menu if Concept Reactor key/button was held when starting the game
+        int isC = IsConceptReactorHeld();
         if (isC) {
             g_ShowStageMenu = 1;
             g_ActiveColumn = 0;
             g_PracticeMode = 1;
-            LogMessage("Trans intercepted with C key: prev=%lu next=%lu -> showing stage select menu (practice mode)", prevScene, nextScene);
+            LogMessage("Trans intercepted with Concept Reactor: prev=%lu next=%lu -> showing stage select menu (practice mode)", prevScene, nextScene);
             // Return nextScene so eax == [0x5c0740] -> equality check passes -> skip transition
             return nextScene;
         } else {
-            // Normal game start without C key: pass through directly to original game start
+            // Normal game start without Concept Reactor: pass through directly to original game start
             g_StageSelected = 1;
             g_PracticeMode = 0; // Not practice mode: hotkeys disabled!
-            LogMessage("Game started normally (without C key): prev=%lu next=%lu -> starting stage directly (hotkeys disabled)", prevScene, nextScene);
+            LogMessage("Game started normally (without Concept Reactor): prev=%lu next=%lu -> starting stage directly (hotkeys disabled)", prevScene, nextScene);
             return prevScene;
         }
     }
@@ -1159,7 +1522,7 @@ int __cdecl HandleLoadStart(void) {
         return 0; // allow stage load for replay/demo without menu
     }
 
-    if (g_ReturnToStageMenu) {
+    if (g_ReturnToStageMenu || g_AutoAdvanceToDifficulty) {
         return 0; // allow transition to Title
     }
 
@@ -1167,17 +1530,17 @@ int __cdecl HandleLoadStart(void) {
         if (g_ShowStageMenu) {
             return 1; // suppressed while menu is open
         }
-        int isC = (GetAsyncKeyState('C') & 0x8000) != 0;
+        int isC = IsConceptReactorHeld();
         if (isC) {
             g_ShowStageMenu = 1;
             g_ActiveColumn = 0;
             g_PracticeMode = 1;
-            LogMessage("LoadStart intercepted with C key -> showing stage select menu (practice mode)");
+            LogMessage("LoadStart intercepted with Concept Reactor -> showing stage select menu (practice mode)");
             return 1; // suppressed
         } else {
             g_StageSelected = 1;
             g_PracticeMode = 0;
-            LogMessage("LoadStart passed through normally (without C key, hotkeys disabled)");
+            LogMessage("LoadStart passed through normally (without Concept Reactor, hotkeys disabled)");
             return 0; // allow
         }
     }
@@ -1499,9 +1862,21 @@ static void InstallHooks(void) {
         LogMessage("[Error] SetLives signature at 0x%08X did not match!", setLivesAddr);
     }
 
-    // Leave the script entry point alone: the stage-select logic only needs the scene
-    // transition and load-start hooks. Hooking the script dispatcher is more invasive and
-    // can destabilize stage loads when a menu selection triggers a new stage script.
+    // 8. InputMgr vtable hook for IsKeyPressed (0x4b80c4) and IsKeyTriggered (0x4b80c8)
+    void *inputVtableAddr = (void*)0x004b80c4;
+    DWORD origIsKey[2] = { 0x00431760, 0x004317a0 };
+    if (memcmp(inputVtableAddr, origIsKey, 8) == 0) {
+        if (VirtualProtect(inputVtableAddr, 8, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            *(DWORD*)0x004b80c4 = (DWORD)Hook_IsKeyPressed;
+            *(DWORD*)0x004b80c8 = (DWORD)Hook_IsKeyTriggered;
+            VirtualProtect(inputVtableAddr, 8, oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), inputVtableAddr, 8);
+            LogMessage("InputMgr vtable hooked successfully at 0x%08X", inputVtableAddr);
+        }
+    } else {
+        LogMessage("[Error] InputMgr vtable signature at 0x%08X did not match! (found 0x%08X, 0x%08X)",
+                   inputVtableAddr, *(DWORD*)0x004b80c4, *(DWORD*)0x004b80c8);
+    }
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) {
