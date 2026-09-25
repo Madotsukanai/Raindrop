@@ -4,42 +4,41 @@
 #include <mmsystem.h>
 #include <stdio.h>
 
-// Global states
 static volatile int g_ShowStageMenu = 0;
 static volatile int g_StageSelected = 0;
-static volatile int g_PracticeMode = 0;   // 1 if started via C key menu (practice mode), 0 if normal game start
-static volatile int g_ReturnToStageMenu = 0; // set when practice stage ends to return to stage menu
-static volatile int g_AutoAdvanceToDifficulty = 0; // flag to auto-advance Title scene to Difficulty Menu
-static volatile int g_AutoNavPhase = 0;           // 0: login, 1: desktop, 2: difficulty menu
-static volatile int g_AutoNavTimer = 0;           // frame counter for auto-navigation
+static volatile int g_PracticeMode = 0;
+static volatile int g_ReturnToStageMenu = 0;
+static volatile int g_AutoAdvanceToDifficulty = 0;
+static volatile int g_AutoNavPhase = 0;
+static volatile int g_AutoNavTimer = 0;
 #define SIMKEY_NONE   0
 #define SIMKEY_DECIDE 1
 #define SIMKEY_CANCEL 2
 #define SIMKEY_DOWN   3
 #define SIMKEY_UP     4
-static volatile int g_SimulatedKeyAction = SIMKEY_NONE; // action to simulate on current frame
-static volatile DWORD g_PracticeChar = 0;         // player character: 0=Miria, 1=Tee, 2=Mews
-static volatile int g_CancelToTitle = 0; // set when player cancels back to title
-static volatile int g_MenuCursor = 0;   // 0 to 4 (Stage index)
-static volatile int g_ActiveColumn = 0; // 0=Stage, 1=Lives, 2=MEFA, 3=CR Stock, 4=CR Gauge
-static volatile int g_LifeCursor = 2;   // 0 to 10 (default: 2 in reserve)
+static volatile int g_SimulatedKeyAction = SIMKEY_NONE;
+static volatile DWORD g_PracticeChar = 0;
+static volatile int g_CancelToTitle = 0;
+static volatile int g_MenuCursor = 0;
+static volatile int g_ActiveColumn = 0;
+static volatile int g_LifeCursor = 2;
 static volatile int g_SelectedLives = 2;
-static volatile int g_MefaCursor = 1;   // 0 to 6 (default: 1 stock = 100.0f)
-static volatile int g_CrStockCursor = 0; // 0 to 3 (default: 0 stocks)
-static volatile int g_CrGaugeCursor = 0; // 0 to 4 (default: 0%)
-static volatile DWORD g_SelectedMefaDword = 0x42c80000; // 100.0f (1 stock)
-static volatile DWORD g_SelectedCrDword = 0x00000000;   // 0.0f (0 stocks, 0%)
+static volatile int g_MefaCursor = 1;
+static volatile int g_CrStockCursor = 0;
+static volatile int g_CrGaugeCursor = 0;
+static volatile DWORD g_SelectedMefaDword = 0x42c80000;
+static volatile DWORD g_SelectedCrDword = 0x00000000;
 static volatile int g_PendingStageInitStats = 0;
 static volatile int g_StageInitRenderFrames = 0;
 
 static void ResetStageScore(void);
-static DWORD g_LastResetTargetScene = 0; // kept for logging only
-static volatile long g_PendingReset = 0;  // set whenever a new stage warp is requested (use InterlockedExchange)
+static DWORD g_LastResetTargetScene = 0;
+static volatile long g_PendingReset = 0;
 
 static const DWORD g_ReturnAddr = 0x00440ffe;
 static const DWORD g_EndSceneRetAddr = 0x00467273;
-static const DWORD g_LoadStartRetAddr  = 0x004410a3; // continue: call 0x43f960
-static const DWORD g_LoadStartSkipAddr = 0x004410ba; // skip: past the whole loading block
+static const DWORD g_LoadStartRetAddr  = 0x004410a3;
+static const DWORD g_LoadStartSkipAddr = 0x004410ba;
 
 static HINSTANCE g_hOurDll = NULL;
 
@@ -82,7 +81,6 @@ static void LogMessage(const char *format, ...) {
     }
 }
 
-// 2D Vertex for background box rendering
 struct Vertex2D {
     float x, y, z, rhw;
     DWORD color;
@@ -154,9 +152,8 @@ static int IsKeyTriggered(int vk) {
     return triggered;
 }
 
-// Menu Items structure
 typedef struct {
-    int stage;      // 1 to 5
+    int stage;
     const char *label;
 } MenuItem;
 
@@ -257,7 +254,6 @@ static void UpdateSelectedCr(void) {
     g_SelectedCrDword = u.dw;
 }
 
-// ---- Sound Effect (SE) Functions for Menu ----
 static void PlaySoundDirect(DWORD pSoundObj) {
     if (!pSoundObj || pSoundObj < 0x10000 || pSoundObj > 0x7fff0000) return;
 
@@ -273,24 +269,20 @@ static void PlaySoundDirect(DWORD pSoundObj) {
     DWORD *vtbl = *(DWORD**)pDSBuf;
     if (!vtbl || (DWORD)vtbl < 0x10000 || (DWORD)vtbl > 0x7fff0000) return;
 
-    // IDirectSoundBuffer::SetCurrentPosition(0) - rewind to start
     typedef HRESULT (__stdcall *PFN_SetCurrentPosition)(DWORD pBuf, DWORD pos);
     PFN_SetCurrentPosition pfnSetPos = (PFN_SetCurrentPosition)vtbl[0x34 / 4];
     if (pfnSetPos) pfnSetPos(pDSBuf, 0);
 
-    // IDirectSoundBuffer::Play(0, 0, 0) - play once, no looping
     typedef HRESULT (__stdcall *PFN_Play)(DWORD pBuf, DWORD res1, DWORD res2, DWORD flags);
     PFN_Play pfnPlay = (PFN_Play)vtbl[0x30 / 4];
     if (pfnPlay) pfnPlay(pDSBuf, 0, 0, 0);
 
-    // Advance round-robin index
     DWORD totalSlots = *(DWORD*)(pSoundObj + 0x12c);
     if (totalSlots > 0 && totalSlots <= 16) {
         *(DWORD*)(pSoundObj + 0x134) = (bufIdx + 1) % totalSlots;
     }
 }
 
-// Call game's GetSoundObject (0x43bf40) and play via PlaySoundDirect
 static void PlayGameSE(int seIndex) {
     DWORD pSoundObj = 0;
 
@@ -309,32 +301,20 @@ static void PlayGameSE(int seIndex) {
     }
 }
 
-// Check if the game is currently loading or playing a replay, demo, or tutorial
 static inline int IsReplayOrDemo(void) {
     DWORD replaySlot = *(volatile DWORD*)0x4d237c;
     DWORD gameMode   = *(volatile DWORD*)0x4d2378;
 
-    // Mode 2 = Replay, Mode 3 = Tutorial / Demo
-    // replaySlot != 0xFFFFFFFF (-1) indicates a replay/demo file is loaded
     if (replaySlot != 0xFFFFFFFF || gameMode == 2 || gameMode == 3) {
         return 1;
     }
     return 0;
 }
 
-// Input manager hooks: suppress game input when the Stage Select menu is visible
-// so the Title screen does not react to menu navigation keys.
-// Also allows opening the menu cleanly from Title screen upon pressing 'C' key.
 typedef int (__attribute__((thiscall)) *PFN_IsKey)(void *this, int key);
 static PFN_IsKey orig_IsKeyPressed = (PFN_IsKey)0x00431760;
 static PFN_IsKey orig_IsKeyTriggered = (PFN_IsKey)0x004317a0;
 
-// Match a simulated action against virtual key codes checked by RefRain engine.
-// RefRain's CKeyboard uses Win32 Virtual Key codes (via GetKeyboardState):
-//   Decide: 'Z' (0x5A), 'z' (0x7A), VK_RETURN (0x0D), VK_SPACE (0x20)
-//   Cancel: 'X' (0x58), 'x' (0x78), VK_ESCAPE (0x1B)
-//   Down:   VK_DOWN (0x28) (HSF VM Opcode 27 / 0x7E calls IsKeyPressed(0x28))
-//   Up:     VK_UP (0x26)   (HSF VM Opcode 27 / 0x7E calls IsKeyPressed(0x26))
 static inline int MatchSimulatedKey(int action, int key) {
     switch (action) {
         case SIMKEY_DECIDE:
@@ -369,19 +349,17 @@ static inline int MatchSimulatedKey(int action, int key) {
 int __attribute__((thiscall)) Hook_IsKeyPressed(void *this, int key) {
     if (g_ShowStageMenu) return 0;
 
-    // During Auto-Navigation to Difficulty Menu:
     if (g_AutoAdvanceToDifficulty) {
         if (g_SimulatedKeyAction != SIMKEY_NONE && MatchSimulatedKey(g_SimulatedKeyAction, key)) {
             LogMessage("Hook_IsKeyPressed: SIMULATED MATCH action=%d key=0x%02X", g_SimulatedKeyAction, key);
             return 1;
         }
-        return 0; // block other inputs during auto-nav
+        return 0;
     }
 
     return orig_IsKeyPressed(this, key);
 }
 
-// Get the configured virtual key code for Concept Reactor (default 'C' = 0x43)
 static inline int GetConceptReactorKey(void) {
     DWORD pConfig = *(volatile DWORD*)0x5ac9b0;
     if (pConfig && !IsBadReadPtr((void*)pConfig, 0x800)) {
@@ -393,33 +371,30 @@ static inline int GetConceptReactorKey(void) {
             }
         }
     }
-    return 'C'; // default: 'C' (0x43)
+    return 'C';
 }
 
-// Get the configured joystick button index for Concept Reactor (0-based)
 static inline int GetConceptReactorJoyButton(int crKey) {
     void *pInputMgr = *(void**)0x5ac9b4;
     if (pInputMgr && !IsBadReadPtr(pInputMgr, 16)) {
         void *pJ = *(void**)((DWORD)pInputMgr + 0xc);
         if (pJ && !IsBadReadPtr(pJ, 0x400)) {
             DWORD vtbl = *(DWORD*)pJ;
-            if (vtbl == 0x4b83f8 && crKey >= 0 && crKey < 256) { // CJoystickDInput
+            if (vtbl == 0x4b83f8 && crKey >= 0 && crKey < 256) {
                 int btn = *(int*)((DWORD)pJ + 0x34 + crKey * 4);
                 if (btn >= 0 && btn < 32) return btn;
-            } else if (vtbl == 0x4b807c && crKey >= 0 && crKey < 256) { // CJoystickWinMM
+            } else if (vtbl == 0x4b807c && crKey >= 0 && crKey < 256) {
                 int btn = *(int*)((DWORD)pJ + 0x1f4 + crKey * 4);
                 if (btn >= 0 && btn < 32) return btn;
             }
         }
     }
-    return 2; // Default button index: Button 3 (0-indexed: 2 -> bit 2 = 0x4)
+    return 2;
 }
 
-// Check if Concept Reactor was triggered on either keyboard or controller
 static int IsConceptReactorTriggered(void) {
     int crKey = GetConceptReactorKey();
 
-    // 1. Check via game engine's CInputManager::IsKeyTriggered (handles both Keyboard and Joystick)
     void *pInputMgr = *(void**)0x5ac9b4;
     if (pInputMgr && !IsBadReadPtr(pInputMgr, 16)) {
         if (orig_IsKeyTriggered(pInputMgr, crKey)) {
@@ -427,7 +402,6 @@ static int IsConceptReactorTriggered(void) {
         }
     }
 
-    // 2. Direct keyboard fallback: GetAsyncKeyState with edge detection
     static int s_prevKey = 0;
     int keyState = (GetAsyncKeyState(crKey) & 0x8000) != 0;
     int keyTrig = keyState && !s_prevKey;
@@ -436,7 +410,6 @@ static int IsConceptReactorTriggered(void) {
         return 1;
     }
 
-    // 3. Direct controller fallback: joyGetPosEx with edge detection
     JOYINFOEX joy;
     joy.dwSize = sizeof(joy);
     joy.dwFlags = JOY_RETURNBUTTONS;
@@ -456,7 +429,6 @@ static int IsConceptReactorTriggered(void) {
     return 0;
 }
 
-// Check if Concept Reactor is currently held down on either keyboard or controller
 static int IsConceptReactorHeld(void) {
     int crKey = GetConceptReactorKey();
 
@@ -486,11 +458,9 @@ static int IsConceptReactorHeld(void) {
     return 0;
 }
 
-// Check if the game is currently on the Difficulty Selection menu (Title.rsr Function 196)
 static int IsDifficultyMenuOpen(void) {
     int foundDiff = 0;
 
-    // Check 1: Active task list across CTaskManager priority groups (0x5b99c8 .. 0x5ba0a4)
     DWORD *pStart = (DWORD*)0x5b99c8;
     DWORD *pEnd = (DWORD*)0x5ba0a4;
     for (DWORD *pGrp = pStart; pGrp < pEnd; pGrp++) {
@@ -502,7 +472,7 @@ static int IsDifficultyMenuOpen(void) {
             if (IsBadReadPtr((void*)pNode, 0x10)) break;
             DWORD pTask = *(DWORD*)(pNode + 0xC);
             if (pTask && (pTask > 0x10000) && !IsBadReadPtr((void*)pTask, 0x30)) {
-                if (*(DWORD*)pTask == 0x004B9A20) { // CScriptTask
+                if (*(DWORD*)pTask == 0x004B9A20) {
                     DWORD fn = *(DWORD*)(pTask + 0x1C);
                     DWORD active = *(DWORD*)(pTask + 0x20);
                     DWORD pc = *(DWORD*)(pTask + 0x28);
@@ -514,7 +484,6 @@ static int IsDifficultyMenuOpen(void) {
         }
     }
 
-    // Check 2: Task table 0x5ba0a8 (all 1200 task slots)
     DWORD *pTasks = (DWORD*)0x5ba0a8;
     for (DWORD i = 0; i < 1200; i++) {
         DWORD pTask = pTasks[i];
@@ -537,7 +506,6 @@ int __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key) {
     DWORD currentScene = *(volatile DWORD*)0x5c073c;
     DWORD nextScene = *(volatile DWORD*)0x5c0740;
 
-    // Check if player triggers Concept Reactor (keyboard or controller) on Title screen to open practice menu
     if (currentScene == 1 && nextScene == 1 && !g_ShowStageMenu && !g_AutoAdvanceToDifficulty && !IsReplayOrDemo()) {
         if (IsConceptReactorTriggered()) {
             if (IsDifficultyMenuOpen()) {
@@ -558,19 +526,17 @@ int __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key) {
 
     if (g_ShowStageMenu) return 0;
 
-    // During Auto-Navigation to Difficulty Menu after practice stage clear:
     if (g_AutoAdvanceToDifficulty && currentScene == 1) {
         if (g_SimulatedKeyAction != SIMKEY_NONE && MatchSimulatedKey(g_SimulatedKeyAction, key)) {
             LogMessage("Hook_IsKeyTriggered: SIMULATED MATCH action=%d key=0x%02X", g_SimulatedKeyAction, key);
             return 1;
         }
-        return 0; // block other inputs during auto-nav
+        return 0;
     }
 
     return orig_IsKeyTriggered(this, key);
 }
 
-// Hook for HSF Native SetLives (0x00462535) - Native 77 (Player lives at 0x5b8e08)
 DWORD __cdecl HandleSetLives(DWORD origLives) {
     if (g_PendingStageInitStats && !IsReplayOrDemo()) {
         LogMessage("SetLives (Native 77): intercepted script call (%lu) -> overriding to %d",
@@ -596,7 +562,6 @@ void __attribute__((naked)) Hook_SetLives(void) {
     );
 }
 
-// Hook for HSF Native SetMefa (0x00462430) - Native 54 (M.E.F.A.2 float at 0x5b9770)
 DWORD __cdecl HandleSetMefa(DWORD origDword) {
     if (g_PendingStageInitStats && !IsReplayOrDemo()) {
         union { DWORD dw; float f; } uOrig, uSel;
@@ -625,7 +590,6 @@ void __attribute__((naked)) Hook_SetMefa(void) {
     );
 }
 
-// Hook for HSF Native SetCR (0x00462443) - Native 55 (Concept Reactor float at 0x5b976c)
 DWORD __cdecl HandleSetCR(DWORD origDword) {
     if (g_PendingStageInitStats && !IsReplayOrDemo()) {
         union { DWORD dw; float f; } uOrig, uSel;
@@ -666,7 +630,6 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     EnsureFont(pDevice, vp.Width);
     if (!g_pFont || !g_pTitleFont) return;
 
-    // Save render states
     DWORD fvf, alphaBlend, srcBlend, destBlend, zEnable, lighting, cullMode;
     pDevice->lpVtbl->GetFVF(pDevice, &fvf);
     pDevice->lpVtbl->GetRenderState(pDevice, D3DRS_ALPHABLENDENABLE, &alphaBlend);
@@ -684,10 +647,6 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_CULLMODE, D3DCULL_NONE);
     pDevice->lpVtbl->SetTexture(pDevice, 0, NULL);
 
-    // Layout configuration: 2-Row Layout
-    // Row 1 (Top): STAGE SELECT (Full width)
-    // Row 2 (Bottom): 4 parameter columns (LIVES, M.E.F.A.2, CR STOCK, CR GAUGE)
-    // Footer: Navigation guide
     int isHD = (vp.Width >= 1000);
 
     float totalW, startX;
@@ -706,7 +665,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         stageLineSpacing = 27.0f;
         paramLineSpacing = 25.0f;
         colGap = 16.0f;
-        colW = (totalW - (3.0f * colGap)) / 4.0f; // (1200 - 48) / 4 = 288.0f
+        colW = (totalW - (3.0f * colGap)) / 4.0f;
         stageHighlightH = 23.0f;
         paramHighlightH = 22.0f;
     } else {
@@ -719,7 +678,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         stageLineSpacing = 17.0f;
         paramLineSpacing = 15.0f;
         colGap = 8.0f;
-        colW = (totalW - (3.0f * colGap)) / 4.0f; // (616 - 24) / 4 = 148.0f
+        colW = (totalW - (3.0f * colGap)) / 4.0f;
         stageHighlightH = 15.0f;
         paramHighlightH = 14.0f;
     }
@@ -740,7 +699,6 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     float xCrStock = xMefa + colW + colGap;
     float xCrGauge = xCrStock + colW + colGap;
 
-    // Active/Inactive visual styles
     DWORD borderCol0 = (g_ActiveColumn == 0) ? 0xFF00BFFF : 0xFF335577;
     DWORD borderCol1 = (g_ActiveColumn == 1) ? 0xFF00BFFF : 0xFF335577;
     DWORD borderCol2 = (g_ActiveColumn == 2) ? 0xFF00BFFF : 0xFF335577;
@@ -759,13 +717,11 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     DWORD titleCol3  = (g_ActiveColumn == 3) ? 0xFFFFCC00 : 0xFF88AABB;
     DWORD titleCol4  = (g_ActiveColumn == 4) ? 0xFFFFCC00 : 0xFF88AABB;
 
-    // Top Panel: STAGE SELECT (Full width)
     DrawSolidRect(pDevice, startX - 2.0f, stageBoxY - 2.0f, totalW + 4.0f, stageBoxH + 4.0f, borderCol0);
     DrawSolidRect(pDevice, startX, stageBoxY, totalW, stageBoxH, 0xEE0D111A);
     DrawSolidRect(pDevice, startX + 4.0f, stageBoxY + 4.0f, totalW - 8.0f, headerH, headerBg0);
     DrawShadowText(g_pTitleFont, "STAGE SELECT", (int)startX + (isHD ? 14 : 10), (int)stageBoxY + (isHD ? 8 : 5), titleCol0);
 
-    // Items for Column 0 (Stage)
     int stageStartY = (int)stageBoxY + (isHD ? 36 : 24);
     for (int i = 0; i < MENU_ITEM_COUNT; i++) {
         int itemY = stageStartY + (int)(i * stageLineSpacing);
@@ -786,10 +742,8 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         }
     }
 
-    // Bottom Row: 4 parameter columns
     int paramStartY = (int)paramBoxY + (isHD ? 36 : 24);
 
-    // Column 1: LIVES
     DrawSolidRect(pDevice, xLives - 2.0f, paramBoxY - 2.0f, colW + 4.0f, paramBoxH + 4.0f, borderCol1);
     DrawSolidRect(pDevice, xLives, paramBoxY, colW, paramBoxH, 0xEE0D111A);
     DrawSolidRect(pDevice, xLives + 4.0f, paramBoxY + 4.0f, colW - 8.0f, headerH, headerBg1);
@@ -818,7 +772,6 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         }
     }
 
-    // Column 2: M.E.F.A.2
     DrawSolidRect(pDevice, xMefa - 2.0f, paramBoxY - 2.0f, colW + 4.0f, paramBoxH + 4.0f, borderCol2);
     DrawSolidRect(pDevice, xMefa, paramBoxY, colW, paramBoxH, 0xEE0D111A);
     DrawSolidRect(pDevice, xMefa + 4.0f, paramBoxY + 4.0f, colW - 8.0f, headerH, headerBg2);
@@ -847,7 +800,6 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         }
     }
 
-    // Column 3: CR STOCK
     DrawSolidRect(pDevice, xCrStock - 2.0f, paramBoxY - 2.0f, colW + 4.0f, paramBoxH + 4.0f, borderCol3);
     DrawSolidRect(pDevice, xCrStock, paramBoxY, colW, paramBoxH, 0xEE0D111A);
     DrawSolidRect(pDevice, xCrStock + 4.0f, paramBoxY + 4.0f, colW - 8.0f, headerH, headerBg3);
@@ -876,7 +828,6 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         }
     }
 
-    // Column 4: CR GAUGE
     DrawSolidRect(pDevice, xCrGauge - 2.0f, paramBoxY - 2.0f, colW + 4.0f, paramBoxH + 4.0f, borderCol4);
     DrawSolidRect(pDevice, xCrGauge, paramBoxY, colW, paramBoxH, 0xEE0D111A);
     DrawSolidRect(pDevice, xCrGauge + 4.0f, paramBoxY + 4.0f, colW - 8.0f, headerH, headerBg4);
@@ -901,7 +852,6 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         }
     }
 
-    // Footer panel
     DrawSolidRect(pDevice, startX - 2.0f, footerY - 2.0f, totalW + 4.0f, footerH + 4.0f, 0xFF335577);
     DrawSolidRect(pDevice, startX, footerY, totalW, footerH, 0xEE0D111A);
 
@@ -928,7 +878,6 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     DrawShadowText(pFootFont, help1, (int)startX + (isHD ? 16 : 10), (int)footerY + (isHD ? 8 : 5), 0xFF88DDFF);
     DrawShadowText(pFootFont, help2, (int)startX + (isHD ? 16 : 10), (int)footerY + (isHD ? 32 : 23), 0xFF6699BB);
 
-    // Joypad input polling
     int trig_up = 0, trig_down = 0, trig_left = 0, trig_right = 0;
     int trig_btn1 = 0, trig_btn2 = 0;
 
@@ -974,7 +923,6 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     int do_decide = IsKeyTriggered('Z') || IsKeyTriggered(VK_RETURN) || IsKeyTriggered(VK_SPACE) || trig_btn1;
     int do_cancel = IsKeyTriggered('X') || IsKeyTriggered(VK_ESCAPE) || trig_btn2;
 
-    // Vertical navigation in active column
     if (do_up) {
         if (g_ActiveColumn == 0) {
             g_MenuCursor = (g_MenuCursor + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
@@ -1010,7 +958,6 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         }
     }
 
-    // Number keys quick jump
     if (g_ActiveColumn == 0) {
         for (int i = 0; i < MENU_ITEM_COUNT; i++) {
             if (IsKeyTriggered('1' + i)) g_MenuCursor = i;
@@ -1045,27 +992,26 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         }
     }
 
-    // Decide or Right navigation
     if (do_decide) {
         if (g_ActiveColumn == 0) {
             g_ActiveColumn = 1;
-            PlayGameSE(1040); // Decide SE
+            PlayGameSE(1040);
             LogMessage("Stage confirmed: %d -> moving to Lives", g_MenuItems[g_MenuCursor].stage);
         } else if (g_ActiveColumn == 1) {
             UpdateSelectedLives();
             g_ActiveColumn = 2;
-            PlayGameSE(1040); // Decide SE
+            PlayGameSE(1040);
             LogMessage("Lives confirmed: %d -> moving to MEFA", g_SelectedLives);
         } else if (g_ActiveColumn == 2) {
             UpdateSelectedMefa();
             g_ActiveColumn = 3;
-            PlayGameSE(1040); // Decide SE
+            PlayGameSE(1040);
             LogMessage("MEFA confirmed: %d stocks (0x%08X) -> moving to CR Stock",
                        g_MefaItems[g_MefaCursor].value, g_SelectedMefaDword);
         } else if (g_ActiveColumn == 3) {
             UpdateSelectedCr();
             g_ActiveColumn = 4;
-            PlayGameSE(1040); // Decide SE
+            PlayGameSE(1040);
             LogMessage("CR Stock confirmed: %d -> moving to CR Gauge", g_CrStockItems[g_CrStockCursor].stock);
         } else if (g_ActiveColumn == 4) {
             UpdateSelectedLives();
@@ -1087,7 +1033,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             InterlockedExchange(&g_PendingReset, 1);
             ResetStageScore();
             *(volatile DWORD*)0x5c0740 = 2 + stage;
-            PlayGameSE(1040); // Decide SE
+            PlayGameSE(1040);
             LogMessage("All confirmed -> Starting Stage %d (char=%lu, Lives=%d, MEFA stocks=%d, dw=0x%08X, CR Stock=%d, CR Gauge=%s, CR Total=0x%08X)",
                        stage, g_PracticeChar, g_SelectedLives, g_MefaItems[g_MefaCursor].value, g_SelectedMefaDword,
                        g_CrStockItems[g_CrStockCursor].stock,
@@ -1112,20 +1058,19 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         }
     }
 
-    // Cancel or Left navigation
     if (do_cancel) {
         if (g_ActiveColumn == 4) {
             g_ActiveColumn = 3;
-            PlayGameSE(1048); // Cancel SE
+            PlayGameSE(1048);
         } else if (g_ActiveColumn == 3) {
             g_ActiveColumn = 2;
-            PlayGameSE(1048); // Cancel SE
+            PlayGameSE(1048);
         } else if (g_ActiveColumn == 2) {
             g_ActiveColumn = 1;
-            PlayGameSE(1048); // Cancel SE
+            PlayGameSE(1048);
         } else if (g_ActiveColumn == 1) {
             g_ActiveColumn = 0;
-            PlayGameSE(1048); // Cancel SE
+            PlayGameSE(1048);
         } else if (g_ActiveColumn == 0) {
             g_ShowStageMenu = 0;
             g_StageSelected = 0;
@@ -1136,11 +1081,11 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             g_AutoNavTimer = 0;
             g_SimulatedKeyAction = SIMKEY_NONE;
             g_ActiveColumn = 0;
-            PlayGameSE(1048); // Cancel SE
+            PlayGameSE(1048);
             DWORD prevScene = *(volatile DWORD*)0x5c073c;
             if (prevScene != 1) {
                 g_CancelToTitle = 1;
-                *(volatile DWORD*)0x5c0740 = 1; // Return to Title
+                *(volatile DWORD*)0x5c0740 = 1;
                 LogMessage("Stage Menu Cancel -> Redirecting to Title (prevScene=%lu)", prevScene);
             } else {
                 g_CancelToTitle = 0;
@@ -1164,7 +1109,6 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         }
     }
 
-    // Restore render states
     pDevice->lpVtbl->SetFVF(pDevice, fvf);
     pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_ALPHABLENDENABLE, alphaBlend);
     pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_SRCBLEND, srcBlend);
@@ -1180,18 +1124,16 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
         uMefa.dw = g_SelectedMefaDword;
         uCr.dw = g_SelectedCrDword;
 
-        // Enforce the values in globals while stage is initializing
-        *(volatile DWORD*)0x5b8e08 = (DWORD)g_SelectedLives; // Lives (0..5)
-        *(volatile DWORD*)0x5b9770 = g_SelectedMefaDword;     // M.E.F.A.2 (float, 0..600)
-        *(volatile DWORD*)0x5b976c = g_SelectedCrDword;       // Concept Reactor (float, 0..300)
+        *(volatile DWORD*)0x5b8e08 = (DWORD)g_SelectedLives;
+        *(volatile DWORD*)0x5b9770 = g_SelectedMefaDword;
+        *(volatile DWORD*)0x5b976c = g_SelectedCrDword;
 
-        // Also enforce in GameState if allocated
         char *pGameState = *(char**)0x5ac9b0;
         if (pGameState && (DWORD)pGameState > 0x10000 && !IsBadReadPtr(pGameState, 0x200)) {
             for (int s = 1; s <= 6; s++) {
-                *(DWORD*)(pGameState + s * 4 + 0x115) = (DWORD)g_SelectedLives; // stageLives
-                *(DWORD*)(pGameState + s * 4 + 0x12d) = g_SelectedMefaDword;    // stageMefa
-                *(DWORD*)(pGameState + s * 4 + 0x145) = g_SelectedCrDword;      // stageCr
+                *(DWORD*)(pGameState + s * 4 + 0x115) = (DWORD)g_SelectedLives;
+                *(DWORD*)(pGameState + s * 4 + 0x12d) = g_SelectedMefaDword;
+                *(DWORD*)(pGameState + s * 4 + 0x145) = g_SelectedCrDword;
             }
         }
 
@@ -1201,8 +1143,6 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
 
         g_StageInitRenderFrames++;
 
-        // Once in game scene (scene 2..7, 10), player object exists, and at least 30 frames elapsed
-        // Or if 120 render frames have elapsed in the game scene (safety fallback)
         if ((currentScene >= 2 && currentScene <= 7) || currentScene == 10) {
             if ((pPlayer != 0 && frameCount >= 30) || g_StageInitRenderFrames >= 120) {
                 g_PendingStageInitStats = 0;
@@ -1246,11 +1186,8 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
         g_AutoNavTimer++;
 
         if (g_AutoNavPhase == 0) {
-            // Phase 0: Waiting for Desktop to appear and clicking "REFRAIN" icon
-            // Returning from gameplay (stage clear or pause menu) always lands directly on the Desktop,
-            // with the top icon "REFRAIN" selected by default.
             if (g_AutoNavTimer >= 50 && g_AutoNavTimer <= 51) {
-                g_SimulatedKeyAction = SIMKEY_DECIDE; // Click default selected REFRAIN icon
+                g_SimulatedKeyAction = SIMKEY_DECIDE;
                 if (g_AutoNavTimer == 50) LogMessage("AutoNav: Phase 0 -> Clicking REFRAIN icon on Desktop (timer=%d)", g_AutoNavTimer);
             } else if (g_AutoNavTimer == 52) {
                 g_SimulatedKeyAction = SIMKEY_NONE;
@@ -1260,10 +1197,8 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
                 LogMessage("AutoNav: Advancing to Phase 1 (Waiting for Difficulty Menu window)");
             }
         } else if (g_AutoNavPhase == 1) {
-            // Phase 1: Waiting for REFRAIN window (Difficulty Menu) to open (~35 frames),
-            // then pressing DECIDE to confirm difficulty and proceed to the next menu ("DIVE 2 M.R.S.")
             if (g_AutoNavTimer >= 35 && g_AutoNavTimer <= 36) {
-                g_SimulatedKeyAction = SIMKEY_DECIDE; // Confirm Difficulty
+                g_SimulatedKeyAction = SIMKEY_DECIDE;
                 if (g_AutoNavTimer == 35) LogMessage("AutoNav: Phase 1 -> Confirming Difficulty (timer=%d)", g_AutoNavTimer);
             } else if (g_AutoNavTimer == 37) {
                 g_SimulatedKeyAction = SIMKEY_NONE;
@@ -1273,7 +1208,6 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
                 LogMessage("AutoNav: Advancing to Phase 2 (Waiting for menu after Difficulty Selection)");
             }
         } else if (g_AutoNavPhase == 2) {
-            // Phase 2: Waiting for the menu after Difficulty Selection ("DIVE 2 M.R.S.") to appear (~35 frames)
             if (g_AutoNavTimer >= 35) {
                 g_AutoAdvanceToDifficulty = 0;
                 g_AutoNavPhase = 0;
@@ -1289,7 +1223,6 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
         }
     }
 
-    // Also check Concept Reactor key/button on Title screen in render loop if not already opened
     if (currentScene == 1 && nextScene == 1 && !g_ShowStageMenu && !g_AutoAdvanceToDifficulty && !IsReplayOrDemo()) {
         if (IsConceptReactorTriggered()) {
             if (IsDifficultyMenuOpen()) {
@@ -1315,12 +1248,11 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
 void __attribute__((naked)) Hook_EndScene(void) {
     __asm__ __volatile__(
         "pushal\n\t"
-        "movl 32(%%esp), %%eax\n\t" // pDevice was pushed at 0x0046726c
+        "movl 32(%%esp), %%eax\n\t"
         "pushl %%eax\n\t"
         "call _OnRenderHook\n\t"
         "addl $4, %%esp\n\t"
         "popal\n\t"
-        // Original EndScene call
         "movl (%%esp), %%ecx\n\t"
         "movl (%%ecx), %%eax\n\t"
         "call *0xa8(%%eax)\n\t"
@@ -1330,14 +1262,13 @@ void __attribute__((naked)) Hook_EndScene(void) {
     );
 }
 
-// Called from Hook_SceneCheck (0x440ff8): reads [0x5c0740] every frame.
 void __cdecl HandleSceneCheck(DWORD *pEdx) {
     DWORD nextScene = *pEdx;
 
     if (nextScene == 1) {
         g_StageSelected = 0;
         if (!g_ReturnToStageMenu && !g_AutoAdvanceToDifficulty) {
-            g_PracticeMode = 0; // reset practice mode when returning to Title without practice return
+            g_PracticeMode = 0;
         }
         g_LastResetTargetScene = 0;
         g_PendingStageInitStats = 0;
@@ -1346,15 +1277,10 @@ void __cdecl HandleSceneCheck(DWORD *pEdx) {
     }
 }
 
-// Called from Hook_Trans: fires at the top of the scene-transition function (0x440dc0)
-// before any loading or scene change happens.
-// Returns the value to put in eax (= [0x5c073c]).
-
-// Retrieve GameState pointer for the currently running replay
 static char *GetReplayGameState(void) {
     char *pInputMgr = *(char**)0x5ac9b4;
     if (pInputMgr && (DWORD)pInputMgr > 0x10000 && !IsBadReadPtr(pInputMgr, 0x20)) {
-        if (*(DWORD*)(pInputMgr + 4) == 4) { // CReplayInput type
+        if (*(DWORD*)(pInputMgr + 4) == 4) {
             char *pReplayGS = *(char**)(pInputMgr + 8);
             if (pReplayGS && (DWORD)pReplayGS > 0x10000 && !IsBadReadPtr(pReplayGS, 0x200)) {
                 return pReplayGS;
@@ -1368,7 +1294,6 @@ static char *GetReplayGameState(void) {
     return NULL;
 }
 
-// Check if the loaded replay contains recording data for the given stage (1 to 5)
 static int ReplayHasStage(int stage) {
     if (stage < 1 || stage > 5) return 0;
 
@@ -1378,45 +1303,35 @@ static int ReplayHasStage(int stage) {
         return 0;
     }
 
-    // [pGameState + stage + 0x52] is the stage visited / recorded flag (1 = recorded)
     BYTE visited = *(BYTE*)(pReplayGS + stage + 0x52);
     DWORD startFrame = *(DWORD*)(pReplayGS + stage * 4 + 0x15d);
 
     LogMessage("ReplayHasStage(%d): visited=%u, startFrame=%lu", stage, visited, startFrame);
 
     if (stage == 1) {
-        // Stage 1 is always present in any valid replay
         return 1;
     }
     return (visited != 0 && startFrame > 0);
 }
 
-// If we want to suppress the transition, return [0x5c0740] so the equality check passes
-// and the function skips all transition logic.
 DWORD __cdecl HandleTrans(void) {
     DWORD prevScene = *(volatile DWORD*)0x5c073c;
     DWORD nextScene = *(volatile DWORD*)0x5c0740;
 
-    // Allow cancel-to-title transition through unconditionally.
-    // Return a value != nextScene so the cmp eax,[0x5c0740] check fails
-    // and the transition logic actually runs.
     if (g_CancelToTitle) {
         g_CancelToTitle = 0;
         g_PracticeMode = 0;
         g_ReturnToStageMenu = 0;
         LogMessage("Trans: cancel to title allowed (prev=%lu next=%lu)", prevScene, nextScene);
-        return nextScene - 1; // guaranteed != nextScene, triggers the transition
+        return nextScene - 1;
     }
 
-    // Do NOT show stage select menu when playing back a replay or watching a demo/tutorial!
     if (IsReplayOrDemo()) {
         LogMessage("Trans: Replay/Demo playback detected (replaySlot=%ld, mode=%lu) -> passing through without menu",
                    (long)*(volatile DWORD*)0x4d237c, *(volatile DWORD*)0x4d2378);
         return prevScene;
     }
 
-    // Practice Mode: handle transitions out of gameplay (stage clear or pause menu return to title)
-    // In RefRain, in-game gameplay scene is 2 (CGameScene). Transitions out of scene 2 signify stage end.
     if ((prevScene == 2 || (prevScene >= 3 && prevScene <= 10)) &&
         prevScene != nextScene &&
         g_PracticeMode && g_PendingReset == 0) {
@@ -1431,70 +1346,55 @@ DWORD __cdecl HandleTrans(void) {
         g_AutoNavTimer = 0;
         g_SimulatedKeyAction = SIMKEY_NONE;
         g_StageSelected = 0;
-        *(volatile DWORD*)0x5c0740 = 1; // redirect scene transition to Title
+        *(volatile DWORD*)0x5c0740 = 1;
         return prevScene;
     }
 
-    // Practice Mode: once arrived at Title after stage end
     if (prevScene == 1 && g_ReturnToStageMenu) {
         g_ReturnToStageMenu = 0;
         return prevScene;
     }
 
-    // When the game is about to enter a stage scene (Stages 1-5 = scenes 3-7) and no stage has been selected yet
-    // Note: Scene 8 is Stage 6 (Tutorial), which is excluded from the stage select menu
     if (nextScene >= 3 && nextScene <= 7 && !g_StageSelected) {
         if (g_ShowStageMenu) {
-            // Stage select menu is already open; keep suppressing transition
             return nextScene;
         }
 
-        // Only show stage select menu if Concept Reactor key/button was held when starting the game
         int isC = IsConceptReactorHeld();
         if (isC) {
             g_ShowStageMenu = 1;
             g_ActiveColumn = 0;
             g_PracticeMode = 1;
             LogMessage("Trans intercepted with Concept Reactor: prev=%lu next=%lu -> showing stage select menu (practice mode)", prevScene, nextScene);
-            // Return nextScene so eax == [0x5c0740] -> equality check passes -> skip transition
             return nextScene;
         } else {
-            // Normal game start without Concept Reactor: pass through directly to original game start
             g_StageSelected = 1;
-            g_PracticeMode = 0; // Not practice mode: hotkeys disabled!
+            g_PracticeMode = 0;
             LogMessage("Game started normally (without Concept Reactor): prev=%lu next=%lu -> starting stage directly (hotkeys disabled)", prevScene, nextScene);
             return prevScene;
         }
     }
 
-    // Run this on the game's transition thread, immediately before the
-    // original transition code.  The previous implementation did this from
-    // HotkeyThread, racing the score/FPS update code and losing the reset.
     if (nextScene >= 3 && nextScene <= 7 && g_StageSelected && InterlockedExchange(&g_PendingReset, 0)) {
         ResetStageScore();
-        g_LastResetTargetScene = nextScene; // kept for logging only
+        g_LastResetTargetScene = nextScene;
     }
 
-    // Allow the transition
     return prevScene;
 }
 
-// Hook at 0x00440deb (5 bytes: A1 3C 07 5C 00  =  mov eax,[0x5c073c])
-// If we want to suppress, we return [0x5c0740] as eax so cmp eax,[0x5c0740] is equal
-// and the je at 0x440df6 skips all transition logic.
 void __attribute__((naked)) Hook_Trans(void) {
     __asm__ __volatile__(
-        "pushal\n\t"               // pushes 8 regs (32 bytes); ret addr is at esp+32
+        "pushal\n\t"
         "call _HandleTrans\n\t"
         "movl %%eax, 28(%%esp)\n\t"
-        "popal\n\t"                // restores all regs including eax = HandleTrans result
-        "ret\n\t"                  // return to caller (0x440df0), eax is set
+        "popal\n\t"
+        "ret\n\t"
         :
         :
     );
 }
 
-// Hook at 0x00440ff8 (6 bytes: 8B 15 40 07 5C 00 -> mov edx, [0x5c0740])
 void __attribute__((naked)) Hook_SceneCheck(void) {
     __asm__ __volatile__(
         "movl 0x5c0740, %%edx\n\t"
@@ -1514,21 +1414,18 @@ void __attribute__((naked)) Hook_SceneCheck(void) {
     );
 }
 
-// Called from Hook_LoadStart: fires when the game is about to start loading a stage.
-// If we haven't selected a stage yet, show the menu and suppress the load.
-// Returns 1 if suppressed, 0 if allowed through.
 int __cdecl HandleLoadStart(void) {
     if (IsReplayOrDemo()) {
-        return 0; // allow stage load for replay/demo without menu
+        return 0;
     }
 
     if (g_ReturnToStageMenu || g_AutoAdvanceToDifficulty) {
-        return 0; // allow transition to Title
+        return 0;
     }
 
     if (!g_StageSelected) {
         if (g_ShowStageMenu) {
-            return 1; // suppressed while menu is open
+            return 1;
         }
         int isC = IsConceptReactorHeld();
         if (isC) {
@@ -1536,26 +1433,20 @@ int __cdecl HandleLoadStart(void) {
             g_ActiveColumn = 0;
             g_PracticeMode = 1;
             LogMessage("LoadStart intercepted with Concept Reactor -> showing stage select menu (practice mode)");
-            return 1; // suppressed
+            return 1;
         } else {
             g_StageSelected = 1;
             g_PracticeMode = 0;
             LogMessage("LoadStart passed through normally (without Concept Reactor, hotkeys disabled)");
-            return 0; // allow
+            return 0;
         }
     }
-    // Fallback: if transition hook was bypassed, reset score here too
     if (InterlockedExchange(&g_PendingReset, 0)) {
         ResetStageScore();
     }
-    return 0; // allow
+    return 0;
 }
 
-// Hook at 0x00441097 (7 bytes: 32 C9 C7 05 DC C4 5A 00)
-//   xor cl, cl
-//   movl $1, [0x5ac4dc]   <- start of loading sequence
-// If HandleLoadStart returns non-zero, skip the entire loading block.
-// Otherwise run the original bytes and fall through.
 void __attribute__((naked)) Hook_LoadStart(void) {
     __asm__ __volatile__(
         "pushal\n\t"
@@ -1563,7 +1454,6 @@ void __attribute__((naked)) Hook_LoadStart(void) {
         "testl %%eax, %%eax\n\t"
         "popal\n\t"
         "jnz 1f\n\t"
-        // not suppressed: run original bytes then continue
         "xorl %%ecx, %%ecx\n\t"
         "movl $1, 0x5ac4dc\n\t"
         "jmp *%0\n\t"
@@ -1616,49 +1506,45 @@ static void ResetStageScore(void) {
     uMefa.dw = g_SelectedMefaDword;
     uCr.dw = g_SelectedCrDword;
 
-    // 1. Reset frame / FPS counters (mirrors 0x00441332)
     *(volatile DWORD*)0x5abb78 = 0;
     *(volatile DWORD*)0x5abb74 = 0;
     *(volatile DWORD*)0x5abb70 = 0x3c;
 
-    // 2. Reset score & player status globals (mirrors Title scene start at 0x00441718)
-    *(volatile DWORD*)0x5b8e20 = 0;                 // Score Low (32-bit)
-    *(volatile DWORD*)0x5b8e24 = 0;                 // Score High (32-bit)
-    *(volatile DWORD*)0x5b8e08 = (DWORD)g_SelectedLives; // Lives (0..5 in reserve)
-    *(volatile DWORD*)0x5b8e1c = 0;                 // Score multiplier / rate
-    *(volatile DWORD*)0x5b8e14 = 0;                 // Prisms
-    *(volatile DWORD*)0x5b8e10 = 0;                 // Miss / continue count
+    *(volatile DWORD*)0x5b8e20 = 0;
+    *(volatile DWORD*)0x5b8e24 = 0;
+    *(volatile DWORD*)0x5b8e08 = (DWORD)g_SelectedLives;
+    *(volatile DWORD*)0x5b8e1c = 0;
+    *(volatile DWORD*)0x5b8e14 = 0;
+    *(volatile DWORD*)0x5b8e10 = 0;
     *(volatile DWORD*)0x5b8e18 = 0;
-    *(volatile DWORD*)0x5b9770 = g_SelectedMefaDword;// M.E.F.A.2 (float, 0..600)
-    *(volatile DWORD*)0x5b976c = g_SelectedCrDword;  // Concept Reactor (float, 0..300)
-    *(volatile BYTE*)0x5b975d = 0;                  // Force PointTask to re-initialize
+    *(volatile DWORD*)0x5b9770 = g_SelectedMefaDword;
+    *(volatile DWORD*)0x5b976c = g_SelectedCrDword;
+    *(volatile BYTE*)0x5b975d = 0;
 
-    // 3. Clear GameState stage records (0x5ac9b0) so 0x431de0 won't restore old scores
     char *pGameState = *(char**)0x5ac9b0;
     if (pGameState && (DWORD)pGameState > 0x10000) {
         for (int s = 1; s <= 6; s++) {
-            *(BYTE*)(pGameState + s + 0x52) = 0;                      // Stage visited flag = 0
-            *(DWORD*)(pGameState + s * 8 + 0x69) = 0;                 // Saved Score Low = 0
-            *(DWORD*)(pGameState + s * 8 + 0x6d) = 0;                 // Saved Score High = 0
-            *(DWORD*)(pGameState + s * 4 + 0x9d) = 0;                 // Saved multiplier = 0
-            *(DWORD*)(pGameState + s * 4 + 0xcd) = 0;                 // Saved prisms = 0
-            *(DWORD*)(pGameState + s * 4 + 0x115) = (DWORD)g_SelectedLives; // Saved lives
-            *(DWORD*)(pGameState + s * 4 + 0x12d) = g_SelectedMefaDword; // Saved stageMefa
-            *(DWORD*)(pGameState + s * 4 + 0x145) = g_SelectedCrDword;   // Saved stageCr
+            *(BYTE*)(pGameState + s + 0x52) = 0;
+            *(DWORD*)(pGameState + s * 8 + 0x69) = 0;
+            *(DWORD*)(pGameState + s * 8 + 0x6d) = 0;
+            *(DWORD*)(pGameState + s * 4 + 0x9d) = 0;
+            *(DWORD*)(pGameState + s * 4 + 0xcd) = 0;
+            *(DWORD*)(pGameState + s * 4 + 0x115) = (DWORD)g_SelectedLives;
+            *(DWORD*)(pGameState + s * 4 + 0x12d) = g_SelectedMefaDword;
+            *(DWORD*)(pGameState + s * 4 + 0x145) = g_SelectedCrDword;
             *(DWORD*)(pGameState + s * 4 + 0x15d) = 0;
             *(DWORD*)(pGameState + s * 4 + 0x17c) = 0;
             *(DWORD*)(pGameState + s * 4 + 0xb5) = 0;
             *(DWORD*)(pGameState + s * 4 + 0xe5) = 0;
             *(DWORD*)(pGameState + s * 4 + 0xfd) = 0;
         }
-        *(DWORD*)(pGameState + 0x7a8) = 0; // Total play time = 0
+        *(DWORD*)(pGameState + 0x7a8) = 0;
     }
 
     LogMessage("ResetStageScore: Score and player stats reset (Lives=%d, MEFA=%f (dw=0x%08X), CR=%f (dw=0x%08X), GameState=0x%p)",
                g_SelectedLives, uMefa.f, uMefa.dw, uCr.f, uCr.dw, pGameState);
 }
 
-// In-game F1-F5 hotkeys thread (for practice stage warp anytime)
 static DWORD WINAPI HotkeyThread(LPVOID param) {
     (void)param;
     int key_state[5] = {0};
@@ -1666,36 +1552,28 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
     while (1) {
         Sleep(50);
 
-        // Hotkeys are disabled during normal game start (only active in Practice Mode or Replay playback)
         if (!g_PracticeMode && !IsReplayOrDemo()) {
             memset(key_state, 0, sizeof(key_state));
             continue;
         }
 
-        DWORD currentScene = *(volatile DWORD*)0x5c073c; // 0x5c073c = current scene
+        DWORD currentScene = *(volatile DWORD*)0x5c073c;
 
-        // F1-F5 for Stages 1-5 (Stage 6 is Tutorial, excluded)
         for (int i = 0; i < 5; i++) {
             int is_down = (GetAsyncKeyState(VK_F1 + i) & 0x8000) != 0;
             if (is_down && !key_state[i]) {
                 int stage = i + 1;
-                // Allow warp during menu (scene 2) and gameplay (scene 10 or 3-7).
-                // Block while our custom stage menu is showing.
                 if (!g_ShowStageMenu && ((currentScene >= 2 && currentScene <= 7) || currentScene == 10)) {
                     if (IsReplayOrDemo()) {
-                        // Replay mode: check if the replay contains this stage
                         if (!ReplayHasStage(stage)) {
                             LogMessage("Hotkey F%d -> Replay does NOT contain Stage %d; skipping warp", stage, stage);
                         } else {
                             LogMessage("Hotkey F%d -> Replay seeking to Stage %d", stage, stage);
                             g_StageSelected = 1;
-                            // Do NOT call ResetStageScore() or set g_PendingReset in replay mode!
-                            // CReplayInput::SeekToStage will restore the replay's recorded score and inputs.
                             *(volatile DWORD*)0x5c0740 = 2 + stage;
-                            PlayGameSE(1040); // Decide SE
+                            PlayGameSE(1040);
                         }
                     } else if (g_PracticeMode) {
-                        // Practice mode: warp and reset score/stats
                         LogMessage("Hotkey F%d -> Warping to Stage %d (currentScene=%lu)", stage, stage, currentScene);
                         g_MenuCursor = stage - 1;
                         g_StageSelected = 1;
@@ -1704,7 +1582,7 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
                         InterlockedExchange(&g_PendingReset, 1);
                         ResetStageScore();
                         *(volatile DWORD*)0x5c0740 = 2 + stage;
-                        PlayGameSE(1040); // Decide SE
+                        PlayGameSE(1040);
                     }
                 }
             }
@@ -1717,14 +1595,12 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
 static void InstallHooks(void) {
     DWORD oldProtect;
 
-    // 1. Trans Hook at 0x00440deb (5 bytes: A1 3C 07 5C 00)
-    //    Fires at the top of the scene-transition function, before any loading starts.
     void *transAddr = (void*)0x00440deb;
     unsigned char expectedTrans[5] = { 0xA1, 0x3C, 0x07, 0x5C, 0x00 };
     if (memcmp(transAddr, expectedTrans, 5) == 0) {
         if (VirtualProtect(transAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[5];
-            patch[0] = 0xE8; // CALL rel32
+            patch[0] = 0xE8;
             DWORD relOffset = (DWORD)Hook_Trans - ((DWORD)transAddr + 5);
             memcpy(&patch[1], &relOffset, 4);
             memcpy(transAddr, patch, 5);
@@ -1736,17 +1612,16 @@ static void InstallHooks(void) {
         LogMessage("[Error] Trans signature at 0x%08X did not match!", transAddr);
     }
 
-    // 2. LoadStart Hook at 0x00441097 (7 bytes: 32 C9 C7 05 DC C4 5A 00)
     void *loadStartAddr = (void*)0x00441097;
     unsigned char expectedLoadStart[7] = { 0x32, 0xC9, 0xC7, 0x05, 0xDC, 0xC4, 0x5A };
     if (memcmp(loadStartAddr, expectedLoadStart, 7) == 0) {
         if (VirtualProtect(loadStartAddr, 7, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[7];
-            patch[0] = 0xE9; // JMP rel32
+            patch[0] = 0xE9;
             DWORD relOffset = (DWORD)Hook_LoadStart - ((DWORD)loadStartAddr + 5);
             memcpy(&patch[1], &relOffset, 4);
-            patch[5] = 0x90; // NOP
-            patch[6] = 0x90; // NOP
+            patch[5] = 0x90;
+            patch[6] = 0x90;
             memcpy(loadStartAddr, patch, 7);
             VirtualProtect(loadStartAddr, 7, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), loadStartAddr, 7);
@@ -1756,16 +1631,15 @@ static void InstallHooks(void) {
         LogMessage("[Error] LoadStart signature at 0x%08X did not match!", loadStartAddr);
     }
 
-    // 3. Scene Check Hook at 0x00440ff8 (6 bytes: 8B 15 40 07 5C 00)
     void *sceneAddr = (void*)0x00440ff8;
     unsigned char expectedScene[6] = { 0x8B, 0x15, 0x40, 0x07, 0x5C, 0x00 };
     if (memcmp(sceneAddr, expectedScene, 6) == 0) {
         if (VirtualProtect(sceneAddr, 6, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[6];
-            patch[0] = 0xE9; // JMP rel32
+            patch[0] = 0xE9;
             DWORD relOffset = (DWORD)Hook_SceneCheck - ((DWORD)sceneAddr + 5);
             memcpy(&patch[1], &relOffset, 4);
-            patch[5] = 0x90; // NOP
+            patch[5] = 0x90;
             memcpy(sceneAddr, patch, 6);
             VirtualProtect(sceneAddr, 6, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), sceneAddr, 6);
@@ -1775,16 +1649,15 @@ static void InstallHooks(void) {
         LogMessage("[Error] Memory signature at 0x%08X did not match!", sceneAddr);
     }
 
-    // 4. EndScene Hook at 0x0046726d (6 bytes: FF 90 A8 00 00 00)
     void *endSceneAddr = (void*)0x0046726d;
     unsigned char expectedEndScene[6] = { 0xFF, 0x90, 0xA8, 0x00, 0x00, 0x00 };
     if (memcmp(endSceneAddr, expectedEndScene, 6) == 0) {
         if (VirtualProtect(endSceneAddr, 6, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[6];
-            patch[0] = 0xE9; // JMP rel32
+            patch[0] = 0xE9;
             DWORD relOffset = (DWORD)Hook_EndScene - ((DWORD)endSceneAddr + 5);
             memcpy(&patch[1], &relOffset, 4);
-            patch[5] = 0x90; // NOP
+            patch[5] = 0x90;
             memcpy(endSceneAddr, patch, 6);
             VirtualProtect(endSceneAddr, 6, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), endSceneAddr, 6);
@@ -1794,7 +1667,6 @@ static void InstallHooks(void) {
         LogMessage("[Error] EndScene signature at 0x%08X did not match!", endSceneAddr);
     }
 
-    // 5. SetMefa Hook at 0x00462430 (13 bytes: F3 0F 10 45 08 F3 0F 11 05 70 97 5B 00) - Native 54
     void *setMefaAddr = (void*)0x00462430;
     unsigned char expectedSetMefa[13] = {
         0xF3, 0x0F, 0x10, 0x45, 0x08,
@@ -1803,10 +1675,10 @@ static void InstallHooks(void) {
     if (memcmp(setMefaAddr, expectedSetMefa, 13) == 0) {
         if (VirtualProtect(setMefaAddr, 13, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[13];
-            patch[0] = 0xE9; // JMP rel32
+            patch[0] = 0xE9;
             DWORD relOffset = (DWORD)Hook_SetMefa - ((DWORD)setMefaAddr + 5);
             memcpy(&patch[1], &relOffset, 4);
-            memset(&patch[5], 0x90, 8); // 8 NOPs
+            memset(&patch[5], 0x90, 8);
             memcpy(setMefaAddr, patch, 13);
             VirtualProtect(setMefaAddr, 13, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), setMefaAddr, 13);
@@ -1816,7 +1688,6 @@ static void InstallHooks(void) {
         LogMessage("[Error] SetMefa signature at 0x%08X did not match!", setMefaAddr);
     }
 
-    // 6. SetCR Hook at 0x00462443 (13 bytes: F3 0F 10 45 08 F3 0F 11 05 6C 97 5B 00) - Native 55
     void *setCrAddr = (void*)0x00462443;
     unsigned char expectedSetCr[13] = {
         0xF3, 0x0F, 0x10, 0x45, 0x08,
@@ -1825,10 +1696,10 @@ static void InstallHooks(void) {
     if (memcmp(setCrAddr, expectedSetCr, 13) == 0) {
         if (VirtualProtect(setCrAddr, 13, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[13];
-            patch[0] = 0xE9; // JMP rel32
+            patch[0] = 0xE9;
             DWORD relOffset = (DWORD)Hook_SetCR - ((DWORD)setCrAddr + 5);
             memcpy(&patch[1], &relOffset, 4);
-            memset(&patch[5], 0x90, 8); // 8 NOPs
+            memset(&patch[5], 0x90, 8);
             memcpy(setCrAddr, patch, 13);
             VirtualProtect(setCrAddr, 13, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), setCrAddr, 13);
@@ -1838,7 +1709,6 @@ static void InstallHooks(void) {
         LogMessage("[Error] SetCR signature at 0x%08X did not match!", setCrAddr);
     }
 
-    // 7. SetLives Hook at 0x00462535 (8 bytes: 8B 45 08 A3 08 8E 5B 00) - Native 77
     void *setLivesAddr = (void*)0x00462535;
     unsigned char expectedSetLives[8] = {
         0x8B, 0x45, 0x08,
@@ -1847,12 +1717,12 @@ static void InstallHooks(void) {
     if (memcmp(setLivesAddr, expectedSetLives, 8) == 0) {
         if (VirtualProtect(setLivesAddr, 8, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[8];
-            patch[0] = 0xE9; // JMP rel32
+            patch[0] = 0xE9;
             DWORD relOffset = (DWORD)Hook_SetLives - ((DWORD)setLivesAddr + 5);
             memcpy(&patch[1], &relOffset, 4);
-            patch[5] = 0x90; // NOP
-            patch[6] = 0x90; // NOP
-            patch[7] = 0x90; // NOP
+            patch[5] = 0x90;
+            patch[6] = 0x90;
+            patch[7] = 0x90;
             memcpy(setLivesAddr, patch, 8);
             VirtualProtect(setLivesAddr, 8, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), setLivesAddr, 8);
@@ -1862,7 +1732,6 @@ static void InstallHooks(void) {
         LogMessage("[Error] SetLives signature at 0x%08X did not match!", setLivesAddr);
     }
 
-    // 8. InputMgr vtable hook for IsKeyPressed (0x4b80c4) and IsKeyTriggered (0x4b80c8)
     void *inputVtableAddr = (void*)0x004b80c4;
     DWORD origIsKey[2] = { 0x00431760, 0x004317a0 };
     if (memcmp(inputVtableAddr, origIsKey, 8) == 0) {

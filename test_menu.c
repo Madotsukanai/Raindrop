@@ -1,10 +1,9 @@
 #include <windows.h>
 #include <stdio.h>
 
-// Menu item definition
 typedef struct {
-    int stage;      // 1 to 6
-    int isBoss;     // 0 = Normal, 1 = Boss
+    int stage;
+    int isBoss;
     const char *label;
 } MenuItem;
 
