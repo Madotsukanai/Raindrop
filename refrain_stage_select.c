@@ -40,6 +40,7 @@ static const DWORD g_ReturnAddr = 0x00440ffe;
 static const DWORD g_EndSceneRetAddr = 0x00467273;
 static const DWORD g_LoadStartRetAddr  = 0x004410a3;
 static const DWORD g_LoadStartSkipAddr = 0x004410ba;
+static const DWORD g_CreateDeviceRetAddr = 0x00425035;
 
 // Ultra Low Latency synchronization
 static IDirect3DQuery9 *g_pEventQuery = NULL;
@@ -1801,6 +1802,18 @@ void __attribute__((naked)) Hook_EndScene(void) {
     );
 }
 
+// Ultra Low Latency: Set PresentationInterval=IMMEDIATE right before CreateDevice
+// Hooked at 0x425030: original instruction is mov eax, [0x4df33c] (5 bytes)
+void __attribute__((naked)) Hook_PreCreateDevice(void) {
+    __asm__ __volatile__(
+        "movl $0x80000000, 0x4df334\n\t"  // PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE
+        "movl 0x4df33c, %%eax\n\t"         // original instruction: mov eax, [0x4df33c]
+        "jmp *%0\n\t"
+        :
+        : "m"(g_CreateDeviceRetAddr)
+    );
+}
+
 void __cdecl HandleSceneCheck(DWORD *pEdx) {
     DWORD nextScene = *pEdx;
 
@@ -2435,27 +2448,24 @@ static void InstallHooks(void) {
     }
 
     // Ultra Low Latency Patch: Force D3DPRESENT_INTERVAL_IMMEDIATE (VSync OFF)
-    // At 0x00424fb9: mov dword ptr [0x4df324], 1 (EnableAutoDepthStencil)
-    // Replace with: mov dword ptr [0x4df334], 0x80000000 (PresentationInterval = IMMEDIATE)
-    void *d3dPresentIntAddr = (void*)0x00424fb9;
-    unsigned char expectedD3dPresentInt[10] = {
-        0xC7, 0x05, 0x24, 0xF3, 0x4D, 0x00, 0x01, 0x00, 0x00, 0x00
-    };
-    if (memcmp(d3dPresentIntAddr, expectedD3dPresentInt, 10) == 0) {
-        if (VirtualProtect(d3dPresentIntAddr, 10, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            // mov dword ptr [0x4df334], 0x80000000
-            // Also explicitly ensure EnableAutoDepthStencil (0x4df324) = 1 in memory
-            *(DWORD*)0x4df324 = 1;
-            unsigned char patch[10] = {
-                0xC7, 0x05, 0x34, 0xF3, 0x4D, 0x00, 0x00, 0x00, 0x00, 0x80
-            };
-            memcpy(d3dPresentIntAddr, patch, 10);
-            VirtualProtect(d3dPresentIntAddr, 10, oldProtect, &oldProtect);
-            FlushInstructionCache(GetCurrentProcess(), d3dPresentIntAddr, 10);
-            LogMessage("Ultra Low Latency: PresentationInterval patched to D3DPRESENT_INTERVAL_IMMEDIATE at 0x%08X", d3dPresentIntAddr);
+    // Hook at 0x00425030: mov eax, [0x4df33c] (5 bytes, right before first CreateDevice call)
+    // Our hook writes PresentationInterval = IMMEDIATE to the D3DPRESENT_PARAMETERS struct,
+    // then executes the original instruction and returns.
+    // This preserves EnableAutoDepthStencil at 0x4df324 (which the old patch was destroying).
+    void *preCreateDeviceAddr = (void*)0x00425030;
+    unsigned char expectedPreCreate[5] = { 0xA1, 0x3C, 0xF3, 0x4D, 0x00 };
+    if (memcmp(preCreateDeviceAddr, expectedPreCreate, 5) == 0) {
+        if (VirtualProtect(preCreateDeviceAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            DWORD hookOffset = (DWORD)&Hook_PreCreateDevice - (DWORD)preCreateDeviceAddr - 5;
+            unsigned char jmp[5] = { 0xE9, 0, 0, 0, 0 };
+            memcpy(&jmp[1], &hookOffset, 4);
+            memcpy(preCreateDeviceAddr, jmp, 5);
+            VirtualProtect(preCreateDeviceAddr, 5, oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), preCreateDeviceAddr, 5);
+            LogMessage("Ultra Low Latency: PreCreateDevice hook installed at 0x%08X (PresentationInterval = IMMEDIATE)", preCreateDeviceAddr);
         }
     } else {
-        LogMessage("[Warning] D3DPresentInterval signature at 0x%08X did not match!", d3dPresentIntAddr);
+        LogMessage("[Warning] PreCreateDevice signature at 0x%08X did not match!", preCreateDeviceAddr);
     }
 }
 
