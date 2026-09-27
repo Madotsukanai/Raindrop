@@ -6,7 +6,7 @@ CFLAGS = -O2 -Wall -static-libgcc -lwinmm
 # real system d3d9.dll after installing this mod's hooks.
 all: d3d9.dll
 
-d3d9.dll: refrain_stage_select.c
+d3d9.dll: RefRain.c
 	$(CC) -shared -o $@ $< $(CFLAGS) -s -Wl,--kill-at
 
 clean:
