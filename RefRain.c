@@ -44,7 +44,7 @@ static const DWORD g_CreateDeviceRetAddr = 0x00425035;
 
 // Ultra Low Latency synchronization
 static IDirect3DQuery9 *g_pEventQuery = NULL;
-static int g_LowLatencyMode = 1; // 1 = Enabled (VSync OFF + GPU queue flush + Direct polling)
+static int g_LowLatencyMode = 1; // 1 = Enabled (GPU queue flush + Direct polling, VSync ON)
 
 static HINSTANCE g_hOurDll = NULL;
 
@@ -2447,26 +2447,8 @@ static void InstallHooks(void) {
         LogMessage("[Error] SetGameInfoInt signature at 0x0044fca0 did not match!");
     }
 
-    // Ultra Low Latency Patch: Force D3DPRESENT_INTERVAL_IMMEDIATE (VSync OFF)
-    // Hook at 0x00425030: mov eax, [0x4df33c] (5 bytes, right before first CreateDevice call)
-    // Our hook writes PresentationInterval = IMMEDIATE to the D3DPRESENT_PARAMETERS struct,
-    // then executes the original instruction and returns.
-    // This preserves EnableAutoDepthStencil at 0x4df324 (which the old patch was destroying).
-    void *preCreateDeviceAddr = (void*)0x00425030;
-    unsigned char expectedPreCreate[5] = { 0xA1, 0x3C, 0xF3, 0x4D, 0x00 };
-    if (memcmp(preCreateDeviceAddr, expectedPreCreate, 5) == 0) {
-        if (VirtualProtect(preCreateDeviceAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            DWORD hookOffset = (DWORD)&Hook_PreCreateDevice - (DWORD)preCreateDeviceAddr - 5;
-            unsigned char jmp[5] = { 0xE9, 0, 0, 0, 0 };
-            memcpy(&jmp[1], &hookOffset, 4);
-            memcpy(preCreateDeviceAddr, jmp, 5);
-            VirtualProtect(preCreateDeviceAddr, 5, oldProtect, &oldProtect);
-            FlushInstructionCache(GetCurrentProcess(), preCreateDeviceAddr, 5);
-            LogMessage("Ultra Low Latency: PreCreateDevice hook installed at 0x%08X (PresentationInterval = IMMEDIATE)", preCreateDeviceAddr);
-        }
-    } else {
-        LogMessage("[Warning] PreCreateDevice signature at 0x%08X did not match!", preCreateDeviceAddr);
-    }
+    // VSync is intentionally left enabled (PresentationInterval not overridden).
+    // GPU queue flush (FlushGPUQueue) remains active for low-latency frame pacing.
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) {
