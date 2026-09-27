@@ -164,11 +164,17 @@ typedef struct {
 
 #define MENU_ITEM_COUNT 5
 
+static inline int GetSelectableStageCount(void) {
+    DWORD diff = *(volatile DWORD*)0x5b8e28;
+    // Easy (diff==1) cannot access Stage 5 (the final boss)
+    return (diff == 1) ? 4 : MENU_ITEM_COUNT;
+}
+
 static const MenuItem g_MenuItems[MENU_ITEM_COUNT] = {
     { 1, "Central 01 - The way to UTOPIA / Natural Landscape -" },
     { 2, "Central 02 - DATA Flow / Artificial Landscape -" },
     { 3, "Central 03 - Virtual-Labo-Factory / Virtual Reality-" },
-    { 4, "Central 04 - Divergence layer of higher level data / Haze in dezert-" },
+    { 4, "Central 04 - Divergence layer of higher level data / Haze in desert-" },
     { 5, "Central 05 - The Central Nervous System / M.R.S. Central Core-" },
 };
 
@@ -1152,10 +1158,15 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     DrawShadowText(g_pTitleFont, titleBuf, (int)startX + (isHD ? 14 : 10), (int)stageBoxY + (isHD ? 8 : 5), titleCol);
 
     int stageStartY = (int)stageBoxY + (isHD ? 36 : 24);
+    int maxStages = GetSelectableStageCount();
     for (int i = 0; i < MENU_ITEM_COUNT; i++) {
         int itemY = stageStartY + (int)(i * stageLineSpacing);
         char buf[128];
-        if (i == g_MenuCursor) {
+        if (i >= maxStages) {
+            // Locked stage (Easy cannot access Stage 5)
+            snprintf(buf, sizeof(buf), "   %s", g_MenuItems[i].label);
+            DrawShadowText(g_pStageFont ? g_pStageFont : g_pFont, buf, (int)startX + (isHD ? 12 : 8), itemY, 0xFF333333);
+        } else if (i == g_MenuCursor) {
             if (g_ActiveColumn == 0) {
                 DrawSolidRect(pDevice, startX + 4.0f, (float)itemY - 1.0f, totalW - 8.0f, stageHighlightH, 0x660077CC);
                 snprintf(buf, sizeof(buf), ">> %s", g_MenuItems[i].label);
@@ -1369,7 +1380,8 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
 
     if (do_up) {
         if (g_ActiveColumn == 0) {
-            g_MenuCursor = (g_MenuCursor + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
+            int maxStages = GetSelectableStageCount();
+            g_MenuCursor = (g_MenuCursor + maxStages - 1) % maxStages;
         } else if (g_ActiveColumn == 1) {
             g_LifeCursor = (g_LifeCursor + LIFE_ITEM_COUNT - 1) % LIFE_ITEM_COUNT;
             UpdateSelectedLives();
@@ -1386,7 +1398,8 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     }
     if (do_down) {
         if (g_ActiveColumn == 0) {
-            g_MenuCursor = (g_MenuCursor + 1) % MENU_ITEM_COUNT;
+            int maxStages = GetSelectableStageCount();
+            g_MenuCursor = (g_MenuCursor + 1) % maxStages;
         } else if (g_ActiveColumn == 1) {
             g_LifeCursor = (g_LifeCursor + 1) % LIFE_ITEM_COUNT;
             UpdateSelectedLives();
@@ -1403,7 +1416,8 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     }
 
     if (g_ActiveColumn == 0) {
-        for (int i = 0; i < MENU_ITEM_COUNT; i++) {
+        int maxStages = GetSelectableStageCount();
+        for (int i = 0; i < maxStages; i++) {
             if (IsKeyTriggered('1' + i)) g_MenuCursor = i;
         }
     } else if (g_ActiveColumn == 1) {
@@ -2117,6 +2131,10 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
                             PlayGameSE(1040);
                         }
                     } else if (g_PracticeMode) {
+                        DWORD diff = *(volatile DWORD*)0x5b8e28;
+                        if (stage == 5 && diff == 1) {
+                            LogMessage("Hotkey F%d -> Stage %d blocked on Easy difficulty", stage, stage);
+                        } else {
                         LogMessage("Hotkey F%d -> Warping to Stage %d (currentScene=%lu)", stage, stage, currentScene);
                         g_PracticeStage = stage;
                         g_MenuCursor = stage - 1;
@@ -2128,6 +2146,7 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
                         BackupGlobalData();
                         *(volatile DWORD*)0x5c0740 = 2 + stage;
                         PlayGameSE(1040);
+                        }
                     }
                 }
             }
