@@ -357,8 +357,10 @@ static void PatchTitleCancel(void) {
  *
  * Option screen object = title object + 0x5730 (updated by 0x41b270 from title state 3).
  *   +0x3308 : page (0 top menu, 1 game options, 2 key config, 3 leaving)
- *   game options page: +0x3318 FPS-1, +0x331c hitrect-off, +0x3320 BGM-off, +0x3324 BGM vol,
- *                      +0x3328 SE-off,  +0x332c SE vol  (+0x3314 screen mode is left untouched)
+ *   game options page: +0x3314 Rest (initial lives; the game's g_ScreenMode/0x46c7c4, used as
+ *                      the start lives by the retry function 0x419d10), +0x3318 FPS-1,
+ *                      +0x331c hitrect-off, +0x3320 BGM-off, +0x3324 BGM vol,
+ *                      +0x3328 SE-off,  +0x332c SE vol
  *   key config page  : rows are set with 0x41bf60(this, row, pad, type, key), exactly like the
  *                      game's own "default" row.  0x4e9240 != 0 while waiting for a key.
  * The hook replaces the `call 0x41b270` at 0x423650 and calls the original afterwards.
@@ -387,6 +389,7 @@ static unsigned char __attribute__((fastcall)) OptionUpdateHook(void *opt) {
         if (rawkey(input, 0x44)) {
             PF_PlaySe playSe = (PF_PlaySe)(uintptr_t)0x412210;
             if (page == 1) {
+                OPT_F(opt, 0x3314) = 4;    /* Rest=4 */
                 OPT_F(opt, 0x3318) = 3;    /* FPS=4 (60fps) */
                 OPT_F(opt, 0x331c) = 1;    /* ShowHitRect=off */
                 OPT_F(opt, 0x3320) = 0;    /* EnableBGM=on */
@@ -552,6 +555,371 @@ static void PatchResultRetry(void) {
     VirtualProtect(p, sizeof(orig), old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
     Log("ResultRetry: patched (hook=%p)", (void*)&ResultDrawHook);
+}
+
+/*
+ * Replay menu: invisible stage choices below stage 1-3.
+ *
+ * Replay menu object = title object + 0x8ad0 (updated by 0x421ee0 from title state 6).
+ * After a replay is chosen from the list (+0x27f4 != 0) the stage select screen shows at most 3
+ * stage rows, but the number of cursor positions is taken from the replay header copy at
+ * +0x2700: BYTE +0x2711 (+1), or 1 when BYTE +0x271e (extra) is set.  A header value above 2
+ * therefore creates invisible choices; confirming one starts the replay with stage 4+
+ * ([+0x27e8]+1 is passed to 0x431fe0), which shows the ending etc.
+ * The hook replaces the `call 0x421ee0` at 0x4236b4 and clamps the menu's header copy (and the
+ * cursor) to the 3 visible stages before calling the original.  The replay file is not touched.
+ */
+static const int g_ReplayStageFix = 1;
+
+typedef void (__attribute__((fastcall)) *PF_ReplayUpdate)(void *obj);
+
+static void __attribute__((fastcall)) ReplayUpdateHook(void *obj) {
+    unsigned char *o = (unsigned char*)obj;
+    if (o[0x27f4] != 0 && o[0x271e] == 0) {          /* stage select, not extra */
+        if (o[0x2711] > 2) {
+            Log("ReplayStage: header stage byte %u -> 2", (unsigned)o[0x2711]);
+            o[0x2711] = 2;
+        }
+        if (*(int*)(o + 0x27e8) < 0 || *(int*)(o + 0x27e8) > 2) {
+            Log("ReplayStage: cursor %d -> 0", *(int*)(o + 0x27e8));
+            *(int*)(o + 0x27e8) = 0;
+        }
+    }
+    ((PF_ReplayUpdate)(uintptr_t)0x421ee0)(obj);
+}
+
+static void PatchReplayStage(void) {
+    static const unsigned char orig[11] = {
+        0x88,0x1d,0x49,0xb1,0x4d,0x00, 0xe8,0x27,0xe8,0xff,0xff
+    };
+    const DWORD addr = 0x4236ae;
+    unsigned char *p = (unsigned char*)addr;
+    DWORD old, rel;
+
+    if (!g_ReplayStageFix) return;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("ReplayStage: unexpected image base, skipped");
+        return;
+    }
+    if (memcmp(p, orig, sizeof(orig)) != 0) {
+        Log("ReplayStage: code signature mismatch, skipped");
+        return;
+    }
+    if (!VirtualProtect(p, sizeof(orig), PAGE_EXECUTE_READWRITE, &old)) {
+        Log("ReplayStage: VirtualProtect failed (err=%08X)", GetLastError());
+        return;
+    }
+    rel = (DWORD)(uintptr_t)&ReplayUpdateHook - (addr + 6 + 5);
+    memcpy(p + 7, &rel, 4);   /* call 0x421ee0 -> call ReplayUpdateHook */
+    VirtualProtect(p, sizeof(orig), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
+    Log("ReplayStage: patched (hook=%p)", (void*)&ReplayUpdateHook);
+}
+
+/*
+ * Practice start: stage 2 starts with power level 6 (6 boxes on the HUD), stage 3 with MAX.
+ *
+ * Power = DWORD 0x4dadd0 (0..7; the HUD draws power+1 boxes, 7 is MAX).  0x4dadd4 is the item
+ * counter: power p is reached when the counter >= threshold T[p] (DWORD table at 0x45ae00 + 4*p,
+ * T[0] is not used), and the HUD gauge is counter - T[p].
+ * The title starts a game through 0x423880(stage) (stdcall, `ret 4`) from title state 0xb; it zeroes
+ * power and counter and only requests the scene switch.  Practice start = BYTE 0x4dade0 != 0, set
+ * by the stage select menu.  The hook replaces the `call 0x423880` at 0x42377f, calls the original and
+ * then, for practice stage 2/3, writes the power and a matching counter.  The pause menu retry
+ * (0x419d10, stdcall, stage on the stack, called from 0x419c9e/0x419cad/0x419cb9) is hooked the same
+ * way, so retrying a practice stage 2/3 gives the same power.
+ */
+static const int g_PracticeStage2Power = 5;   /* 5 => 6 boxes on the HUD */
+static const int g_PracticeStage3Power = 7;   /* 7 => MAX */
+
+typedef void (__stdcall *PF_GameStart)(int stage);
+
+/* Writes the practice power for `stage` (call after the game's own start/retry code has zeroed it). */
+static void ApplyPracticePower(int stage, const char *what) {
+    if ((stage == 2 || stage == 3) && *(volatile unsigned char*)(uintptr_t)0x4dade0 != 0) {
+        int p = (stage == 2) ? g_PracticeStage2Power : g_PracticeStage3Power;
+        if (p < 0) return;
+        if (p > 7) p = 7;
+        *(volatile int*)(uintptr_t)0x4dadd0 = p;
+        *(volatile int*)(uintptr_t)0x4dadd4 =
+            (p > 0) ? *(volatile int*)(uintptr_t)(0x45ae00 + 4 * p) : 0;
+        Log("PracticePower: stage %d %s, power=%d counter=%d", stage, what, p,
+            *(volatile int*)(uintptr_t)0x4dadd4);
+    }
+}
+
+/* title -> game start: replaces `call 0x423880` at 0x42377f */
+static void __stdcall GameStartHook(int stage) {
+    ((PF_GameStart)(uintptr_t)0x423880)(stage);
+    ApplyPracticePower(stage, "start");
+}
+
+/* pause menu retry: replaces the three `call 0x419d10` in 0x419b30 (stdcall, stage on the stack) */
+static void __stdcall RetryHook(int stage) {
+    ((PF_GameStart)(uintptr_t)0x419d10)(stage);
+    ApplyPracticePower(stage, "retry");
+}
+
+/* Redirects the `call rel32` at callAddr (which must call `target`) to `hook`. */
+static int HookCall(DWORD callAddr, DWORD target, void *hook) {
+    unsigned char *p = (unsigned char*)callAddr;
+    DWORD old, rel, cur;
+
+    if (p[0] != 0xe8) {
+        Log("PracticePower: 0x%08X is not a call, skipped", callAddr);
+        return 0;
+    }
+    memcpy(&cur, p + 1, 4);
+    if (callAddr + 5 + cur != target) {
+        Log("PracticePower: call at 0x%08X does not target 0x%08X, skipped", callAddr, target);
+        return 0;
+    }
+    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old)) {
+        Log("PracticePower: VirtualProtect failed at 0x%08X (err=%08X)", callAddr, GetLastError());
+        return 0;
+    }
+    rel = (DWORD)(uintptr_t)hook - (callAddr + 5);
+    memcpy(p + 1, &rel, 4);
+    VirtualProtect(p, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    return 1;
+}
+
+static void PatchPracticePower(void) {
+    int n = 0;
+
+    if (g_PracticeStage2Power < 0 && g_PracticeStage3Power < 0) return;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("PracticePower: unexpected image base, skipped");
+        return;
+    }
+    n += HookCall(0x42377f, 0x423880, (void*)&GameStartHook);   /* title state 0xb */
+    n += HookCall(0x419c9e, 0x419d10, (void*)&RetryHook);       /* pause retry, practice */
+    n += HookCall(0x419cad, 0x419d10, (void*)&RetryHook);       /* pause retry, extra */
+    n += HookCall(0x419cb9, 0x419d10, (void*)&RetryHook);       /* pause retry, normal */
+    Log("PracticePower: patched %d/4 call sites", n);
+}
+
+/*
+ * Pause menu: pause BGM and sound effects while the pause menu is open.
+ *
+ * Both BGM (streamed ogg) and SE live in DirectSound secondary buffers created through the game's
+ * IDirectSound (global 0x4dada8, created by `call 0x450190` (DirectSoundCreate thunk) at 0x411f1c).
+ * That call is hooked so that the IDirectSound vtable slots CreateSoundBuffer (+0x0c) and
+ * DuplicateSoundBuffer (+0x14) can be wrapped; every non-primary buffer is recorded, and the
+ * Release slot of the buffer vtable is wrapped to drop released buffers from the record.
+ * A small thread watches BYTE 0x4dae16 (pause menu active):
+ *   0 -> 1 : Stop() every buffer that is playing right now and remember it (and DSBSTATUS_LOOPING)
+ *   1 -> 0 : Play() the remembered buffers again (the play cursor is kept by Stop/Play), unless the
+ *            pause menu is closing for retry/title (pause object *0x4dae08, state at +0x538 is 4/5),
+ *            where the scene change takes over and nothing is resumed.
+ * Sounds started while the menu is open (cursor / decide SE) are not touched.
+ */
+static const int g_PauseAudio = 1;
+
+#define AUDIO_MAX 1024
+typedef struct { IDirectSoundBuffer *buf; int paused, looping; DWORD pos; } AudioBuf;
+static AudioBuf g_audio[AUDIO_MAX];
+static int g_audioN = 0;
+static CRITICAL_SECTION g_audioCs;
+
+typedef HRESULT (STDMETHODCALLTYPE *PF_DSCreateBuf)(IDirectSound*, LPCDSBUFFERDESC, LPDIRECTSOUNDBUFFER*, LPUNKNOWN);
+typedef HRESULT (STDMETHODCALLTYPE *PF_DSDupBuf)(IDirectSound*, LPDIRECTSOUNDBUFFER, LPDIRECTSOUNDBUFFER*);
+typedef HRESULT (WINAPI *PF_DSCreate)(LPCGUID, LPDIRECTSOUND*, LPUNKNOWN);
+typedef ULONG (STDMETHODCALLTYPE *PF_BufRelease)(void*);
+
+static PF_DSCreateBuf g_origCreateBuf = NULL;
+static PF_DSDupBuf g_origDupBuf = NULL;
+static struct { void **vt; PF_BufRelease orig; } g_relTab[8];
+static int g_relN = 0;
+
+static int PatchVtblSlot(void **slot, void *hook, void **orig) {
+    DWORD old;
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) return 0;
+    *orig = *slot;
+    *slot = hook;
+    VirtualProtect(slot, sizeof(void*), old, &old);
+    return 1;
+}
+
+static void AudioRemove(void *buf) {   /* caller holds g_audioCs */
+    int i;
+    for (i = 0; i < g_audioN; i++) {
+        if ((void*)g_audio[i].buf == buf) {
+            g_audio[i] = g_audio[g_audioN - 1];
+            g_audioN--;
+            return;
+        }
+    }
+}
+
+static ULONG STDMETHODCALLTYPE BufReleaseHook(void *self) {
+    void **vt = *(void***)self;
+    PF_BufRelease orig = NULL;
+    ULONG r;
+    int i;
+    for (i = 0; i < g_relN; i++)
+        if (g_relTab[i].vt == vt) { orig = g_relTab[i].orig; break; }
+    if (!orig) return 0;
+    EnterCriticalSection(&g_audioCs);
+    r = orig(self);
+    if (r == 0) AudioRemove(self);
+    LeaveCriticalSection(&g_audioCs);
+    return r;
+}
+
+static void AudioAdd(IDirectSoundBuffer *buf) {
+    void **vt;
+    int i, known = 0;
+    if (!buf) return;
+    EnterCriticalSection(&g_audioCs);
+    for (i = 0; i < g_audioN; i++)
+        if (g_audio[i].buf == buf) { known = 1; break; }
+    if (!known && g_audioN < AUDIO_MAX) {
+        g_audio[g_audioN].buf = buf;
+        g_audio[g_audioN].paused = 0;
+        g_audio[g_audioN].looping = 0;
+        g_audioN++;
+    }
+    vt = *(void***)buf;
+    known = 0;
+    for (i = 0; i < g_relN; i++)
+        if (g_relTab[i].vt == vt) { known = 1; break; }
+    if (!known && g_relN < 8) {
+        void *orig = NULL;
+        if (PatchVtblSlot(&vt[2], (void*)&BufReleaseHook, &orig)) {
+            g_relTab[g_relN].vt = vt;
+            g_relTab[g_relN].orig = (PF_BufRelease)orig;
+            g_relN++;
+            Log("PauseAudio: buffer Release hooked (vtbl=%p)", (void*)vt);
+        }
+    }
+    LeaveCriticalSection(&g_audioCs);
+}
+
+static HRESULT STDMETHODCALLTYPE DSCreateBufHook(IDirectSound *self, LPCDSBUFFERDESC desc,
+                                                 LPDIRECTSOUNDBUFFER *pp, LPUNKNOWN unk) {
+    HRESULT hr = g_origCreateBuf(self, desc, pp, unk);
+    if (SUCCEEDED(hr) && pp && *pp && desc && !(desc->dwFlags & DSBCAPS_PRIMARYBUFFER))
+        AudioAdd(*pp);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE DSDupBufHook(IDirectSound *self, LPDIRECTSOUNDBUFFER src,
+                                              LPDIRECTSOUNDBUFFER *pp) {
+    HRESULT hr = g_origDupBuf(self, src, pp);
+    if (SUCCEEDED(hr) && pp && *pp) AudioAdd(*pp);
+    return hr;
+}
+
+static HRESULT WINAPI DSCreateHook(LPCGUID guid, LPDIRECTSOUND *pp, LPUNKNOWN unk) {
+    HRESULT hr = ((PF_DSCreate)(uintptr_t)0x450190)(guid, pp, unk);
+    if (SUCCEEDED(hr) && pp && *pp) {
+        void **vt = *(void***)*pp;
+        void *o1 = NULL, *o2 = NULL;
+        if (vt[3] != (void*)&DSCreateBufHook) {
+            if (PatchVtblSlot(&vt[3], (void*)&DSCreateBufHook, &o1)) g_origCreateBuf = (PF_DSCreateBuf)o1;
+            if (PatchVtblSlot(&vt[5], (void*)&DSDupBufHook, &o2)) g_origDupBuf = (PF_DSDupBuf)o2;
+            Log("PauseAudio: IDirectSound %p hooked (CreateSoundBuffer=%p Duplicate=%p)",
+                (void*)*pp, o1, o2);
+        }
+    }
+    return hr;
+}
+
+static void AudioPause(void) {
+    int i, n = 0;
+    EnterCriticalSection(&g_audioCs);
+    for (i = 0; i < g_audioN; i++) {
+        DWORD st = 0;
+        IDirectSoundBuffer *b = g_audio[i].buf;
+        g_audio[i].paused = 0;
+        if (SUCCEEDED(IDirectSoundBuffer_GetStatus(b, &st)) && (st & DSBSTATUS_PLAYING)) {
+            g_audio[i].paused = 1;
+            g_audio[i].looping = (st & DSBSTATUS_LOOPING) ? 1 : 0;
+            IDirectSoundBuffer_Stop(b);
+            IDirectSoundBuffer_GetCurrentPosition(b, &g_audio[i].pos, NULL);
+            if (g_audio[i].looping)
+                Log("PauseAudio: loop buffer %p stopped at play cursor %lu", (void*)b, (unsigned long)g_audio[i].pos);
+            n++;
+        }
+    }
+    LeaveCriticalSection(&g_audioCs);
+    Log("PauseAudio: paused %d of %d buffers", n, g_audioN);
+}
+
+static void AudioResume(int doPlay) {
+    int i, n = 0, fixed = 0;
+    EnterCriticalSection(&g_audioCs);
+    for (i = 0; i < g_audioN; i++) {
+        if (!g_audio[i].paused) continue;
+        g_audio[i].paused = 0;
+        if (doPlay) {
+            DWORD st = 0;
+            IDirectSoundBuffer *b = g_audio[i].buf;
+            if (SUCCEEDED(IDirectSoundBuffer_GetStatus(b, &st)) && !(st & DSBSTATUS_PLAYING)) {
+                DWORD cur = 0, after = 0;
+                if (st & DSBSTATUS_BUFFERLOST) {
+                    IDirectSoundBuffer_Restore(b);
+                } else {
+                    IDirectSoundBuffer_GetCurrentPosition(b, &cur, NULL);
+                    if (cur != g_audio[i].pos) {
+                        IDirectSoundBuffer_SetCurrentPosition(b, g_audio[i].pos);
+                        fixed++;
+                    }
+                }
+                IDirectSoundBuffer_Play(b, 0, 0, g_audio[i].looping ? DSBPLAY_LOOPING : 0);
+                if (g_audio[i].looping) {
+                    IDirectSoundBuffer_GetCurrentPosition(b, &after, NULL);
+                    Log("PauseAudio: loop buffer %p resumed: stopped=%lu before_play=%lu after_play=%lu",
+                        (void*)b, (unsigned long)g_audio[i].pos, (unsigned long)cur, (unsigned long)after);
+                }
+                n++;
+            }
+        }
+    }
+    LeaveCriticalSection(&g_audioCs);
+    Log("PauseAudio: %s %d buffers (cursor restored on %d)", doPlay ? "resumed" : "dropped (retry/title)", n, fixed);
+}
+
+static DWORD WINAPI PauseAudioThread(LPVOID unused) {
+    int prev = 0;
+    (void)unused;
+    for (;;) {
+        int cur;
+        Sleep(5);
+        cur = (*(volatile unsigned char*)(uintptr_t)0x4dae16) != 0;
+        if (cur && !prev) {
+            AudioPause();
+        } else if (!cur && prev) {
+            int doPlay = 1;
+            void *pm = *(void* volatile*)(uintptr_t)0x4dae08;
+            if (pm) {
+                int st = *(volatile int*)((char*)pm + 0x538);
+                if (st == 4 || st == 5) doPlay = 0;
+            }
+            AudioResume(doPlay);
+        }
+        prev = cur;
+    }
+    return 0;
+}
+
+static void PatchPauseAudio(void) {
+    HANDLE th;
+    if (!g_PauseAudio) return;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("PauseAudio: unexpected image base, skipped");
+        return;
+    }
+    InitializeCriticalSection(&g_audioCs);
+    if (!HookCall(0x411f1c, 0x450190, (void*)&DSCreateHook)) {
+        Log("PauseAudio: DirectSoundCreate call not hooked, skipped");
+        return;
+    }
+    th = CreateThread(NULL, 0, PauseAudioThread, NULL, 0, NULL);
+    if (th) CloseHandle(th);
+    Log("PauseAudio: patched (thread %s)", th ? "ok" : "failed");
 }
 
 /*
@@ -1119,6 +1487,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         PatchOptionDefaults();
         PatchPauseKeys();
         PatchResultRetry();
+        PatchReplayStage();
+        PatchPracticePower();
+        PatchPauseAudio();
         PatchSoundFix();
         break;
     case DLL_PROCESS_DETACH:
