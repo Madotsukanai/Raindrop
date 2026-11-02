@@ -1,3 +1,5 @@
+[English](README_en.md)
+
 # **Raindrop**
 『五月雨〜samidare〜』Ver1.054及び『RefRain - prism memories -』V1.03.7用のステージセレクト等の機能追加パッチです。
 ## 使い方
