@@ -24,7 +24,7 @@ $(BUILD)/RefRain.o: RefRain.c | $(BUILD)
 smd: $(BUILD)/ddraw.dll
 
 $(BUILD)/ddraw.dll: $(BUILD)/Smd.o
-	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32
 
 $(BUILD)/Smd.o: Smd.c | $(BUILD)
 	$(CC) -c -o $@ $< $(SMD_CFLAGS) $(SMD_DEFS)
