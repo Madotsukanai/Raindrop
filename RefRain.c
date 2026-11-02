@@ -338,14 +338,8 @@ static inline int IsReplayOrDemo(void) {
 typedef unsigned char (__attribute__((thiscall)) *PFN_IsKey)(void *this, int key);
 static PFN_IsKey orig_IsKeyPressed = (PFN_IsKey)0x00431760;
 static PFN_IsKey orig_IsKeyTriggered = (PFN_IsKey)0x004317a0;
-static int g_PauseMenuHotkeyAction = 0;
-static int g_PauseMenuHotkeyDowns = 0;
-static int g_PauseMenuHotkeyTarget = 0;
-static DWORD g_PauseMenuHotkeyNextTick = 0;
 static volatile int g_PauseMenuOpen = 0;
 static void PauseDiagKey(int key);
-static int g_PauseMenuSyntheticKey = -1;
-static DWORD g_PauseMenuSyntheticUntil = 0;
 
 static inline int MatchSimulatedKey(int action, int key) {
     switch (action) {
@@ -632,7 +626,6 @@ static BOOL WINAPI Mine_GetKeyboardState(PBYTE p) {
         static int qWasDown = 0;
         static int rWasDown = 0;
         static int escWasDown = 0;
-        DWORD now = GetTickCount();
         int qDown = (GetAsyncKeyState('Q') & 0x8000) != 0;
         int rDown = (GetAsyncKeyState('R') & 0x8000) != 0;
         int escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
@@ -640,66 +633,33 @@ static BOOL WINAPI Mine_GetKeyboardState(PBYTE p) {
         if (inStage) {
             if (escDown && !escWasDown) {
                 g_PauseMenuOpen = !g_PauseMenuOpen;
-                g_PauseMenuHotkeyAction = 0;
                 LogMessage("Pause menu state: %s (ESC)", g_PauseMenuOpen ? "open" : "closed");
             }
-            if (g_PauseMenuOpen && !g_PauseMenuHotkeyAction) {
+            if (g_PauseMenuOpen) {
                 if (qDown && !qWasDown) {
-                    g_PauseMenuHotkeyAction = 1;
-                    g_PauseMenuHotkeyDowns = 0;
-                    g_PauseMenuHotkeyTarget = 3;
-                    g_PauseMenuHotkeyNextTick = now;
-                    LogMessage("Pause hotkey Q: selecting Return to Title");
+                    g_PauseMenuOpen = 0;
+                    *(volatile DWORD*)0x5c0740 = 1;
+                    LogMessage("Pause hotkey Q: direct Return to Title (next scene=1)");
                 } else if (rDown && !rWasDown) {
-                    g_PauseMenuHotkeyAction = 1;
-                    g_PauseMenuHotkeyDowns = 0;
-                    g_PauseMenuHotkeyTarget = 2;
-                    g_PauseMenuHotkeyNextTick = now;
                     g_PauseRetryAll = 1;
-                    LogMessage("Pause hotkey R: selecting Retry All");
+                    g_PauseMenuOpen = 0;
+                    DWORD retryScene = (g_PracticeMode && g_PracticeStage >= 1 &&
+                                        g_PracticeStage <= 5)
+                                           ? 2 + (DWORD)g_PracticeStage
+                                           : 3;
+                    *(volatile DWORD*)0x5c0740 = retryScene;
+                    LogMessage("Pause hotkey R: direct Retry All (next scene=%lu)", retryScene);
                 }
             }
             qWasDown = qDown;
             rWasDown = rDown;
             escWasDown = escDown;
-
-            if (g_PauseMenuSyntheticKey >= 0 && now < g_PauseMenuSyntheticUntil)
-                p[g_PauseMenuSyntheticKey] |= 0x80;
-            else
-                g_PauseMenuSyntheticKey = -1;
-
-            if (g_PauseMenuHotkeyAction &&
-                (LONG)(now - g_PauseMenuHotkeyNextTick) >= 0) {
-                int key = -1;
-                if (g_PauseMenuHotkeyDowns < 4) {
-                    key = VK_UP;
-                } else if (g_PauseMenuHotkeyDowns < 4 + g_PauseMenuHotkeyTarget) {
-                    key = VK_DOWN;
-                } else {
-                    key = 'Z';
-                    g_PauseMenuHotkeyAction = 0;
-                    g_PauseMenuOpen = 0;
-                    LogMessage("Pause hotkey: injecting decide key");
-                }
-                g_PauseMenuHotkeyDowns++;
-                g_PauseMenuSyntheticKey = key;
-                g_PauseMenuSyntheticUntil = now + 45;
-                g_PauseMenuHotkeyNextTick = now + 180;
-                p[key] |= 0x80;
-                if (key == VK_UP)
-                    LogMessage("Pause hotkey: injecting UP (%d/4)", g_PauseMenuHotkeyDowns);
-                else if (key == VK_DOWN)
-                    LogMessage("Pause hotkey: injecting DOWN (%d/%d)",
-                               g_PauseMenuHotkeyDowns - 4, g_PauseMenuHotkeyTarget);
-            }
         } else {
             g_PauseMenuOpen = 0;
-            g_PauseMenuHotkeyAction = 0;
-            g_PauseMenuSyntheticKey = -1;
             qWasDown = rWasDown = escWasDown = 0;
         }
 
-        if (g_PauseMenuOpen && !g_PauseMenuHotkeyAction &&
+        if (g_PauseMenuOpen &&
             ((p['Z'] | p[VK_RETURN] | p[VK_SPACE]) & 0x80)) {
             g_PauseMenuOpen = 0;
             LogMessage("Pause menu state: closed (decide)");
