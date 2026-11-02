@@ -595,25 +595,78 @@ static void PatchOptionDefaults(void) {
  *            3 = closing, 1 = resumed).  States 4/5 fade out and then run the game's own
  *            title switch (FUN_004254d0(1,0)) / restart (FUN_00419d10).
  * The hook replaces the `call 0x419b30` at 0x413d26 and forces state 4/5 on Q/R.
- * (When a replay is playing the pause menu is never shown, so the keys do nothing there.)
+ * Replay playback: the game opens no pause menu while a replay is played (button 7 stops the replay).
+ * PatchReplayPause turns that branch into the normal pause open path.  While the menu is open the
+ * input object's playback flag (+0x234) is cleared so the menu reads the real keys instead of the
+ * replay data, and it is set again when the menu is closed (PauseReplayRestore, called from the stage
+ * frame / input query hooks).  The stage frame loop does not run while paused, so the replay position
+ * is kept. Title / Q stops the replay (0x432020, like the old button 7 exit). Retry / R reloads
+ * the same replay file at stage 1 through the game's replay loader.
  */
 static const int g_PauseQRKey = 1;
 
+static const int g_ReplayPause = 1;
+static int g_pauseSeen = 0;           /* a pause session is running (set on its first menu update) */
+static int g_pauseReplay = 0;         /* ... and it was opened while a replay was playing */
+static int g_pauseReplayHandled = 0;  /* ... and a title/retry transition has been requested */
+static int g_replayFileId = -1;
+static int g_replayStage = 1;
+static int g_replayFileIdCaptured = 0;
+
 typedef void (__attribute__((fastcall)) *PF_PauseUpdate)(void *menu);
+typedef void (__attribute__((thiscall)) *PF_ReplayStop)(void *input);
+typedef int (__attribute__((thiscall)) *PF_ReplayLoad)(void *input, int replayId, int stage);
+typedef void (__cdecl *PF_SceneSwitch)(int a, int b);
+
+/* Called at the start of every stage frame and input query: once the pause menu is closed again,
+ * hand the input object back to the replay. */
+static void PauseReplayRestore(void) {
+    if (*(volatile unsigned char*)(uintptr_t)0x4dae16 != 0) return;   /* menu still open */
+    if (g_pauseReplay && !g_pauseReplayHandled) {
+        void *input = *(void**)(uintptr_t)0x46bbec;
+        if (input) {
+            *((volatile unsigned char*)input + 0x234) = 1;
+            Log("ReplayPause: pause menu closed, replay playback restored");
+        }
+    }
+    g_pauseSeen = 0;
+    g_pauseReplay = 0;
+    g_pauseReplayHandled = 0;
+}
 
 static void __attribute__((fastcall)) PauseUpdateHook(void *menu) {
     void *input = *(void**)(uintptr_t)0x46bbec;
+    if (input && !g_pauseSeen) {
+        g_pauseSeen = 1;
+        if (g_ReplayPause && *((volatile unsigned char*)input + 0x234)) {
+            g_pauseReplay = 1;
+            g_pauseReplayHandled = 0;
+            *((volatile unsigned char*)input + 0x234) = 0;   /* menu uses the real keys */
+            Log("ReplayPause: pause menu opened during replay playback");
+        }
+    }
     if (input && menu && OPT_F(menu, 0x538) == 6) {
         PF_InputKey rawkey = (PF_InputKey)(uintptr_t)0x431500;
         int next = 0;
-        if (rawkey(input, 0x51)) next = 4;        /* Q: title */
-        else if (rawkey(input, 0x52)) next = 5;   /* R: retry */
+        if (rawkey(input, 0x51)) next = 4;                          /* Q: title */
+        else if (rawkey(input, 0x52)) next = 5;                    /* R: retry/restart */
         if (next) {
             ((PF_PlaySe)(uintptr_t)0x412210)((void*)(uintptr_t)0x4ea3a8, 0, 0xff);
             OPT_F(menu, 0x538) = next;
         }
     }
     ((PF_PauseUpdate)(uintptr_t)0x419b30)(menu);
+    if (g_pauseReplay && !g_pauseReplayHandled && input && menu) {
+        int st = OPT_F(menu, 0x538);
+        if (st == 4) {              /* title: stop the replay like the old button 7 exit */
+            *((volatile unsigned char*)input + 0x234) = 1;
+            ((PF_ReplayStop)(uintptr_t)0x432020)(input);
+            g_pauseReplayHandled = 1;
+            Log("ReplayPause: title chosen, replay stopped");
+        } else if (st == 5) {       /* retry: ReplayRetryHook reloads the file at stage 1 */
+            g_pauseReplayHandled = 1;
+        }
+    }
 }
 
 static void PatchPauseKeys(void) {
@@ -642,6 +695,39 @@ static void PatchPauseKeys(void) {
     VirtualProtect(p, sizeof(orig), old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
     Log("PauseKeys: patched (hook=%p)", (void*)&PauseUpdateHook);
+}
+
+/*
+ * Replay pause: in the scene update 0x413ab0, button 7 pressed while a replay plays (input object
+ * +0x234 != 0) runs 0x432020 + scene switch instead of opening the pause menu:
+ *   413ccf: mov al,[ecx+0x234] ; 413cd5: test al,al ; 413cd7: je 0x413cec (open the pause menu)
+ * The `je` is turned into `jmp`, so the replay opens the same pause menu as a normal game.
+ */
+static void PatchReplayPause(void) {
+    static const unsigned char orig[10] = {
+        0x8a,0x81,0x34,0x02,0x00,0x00, 0x84,0xc0, 0x74,0x13
+    };
+    const DWORD addr = 0x413ccf;
+    unsigned char *p = (unsigned char*)addr;
+    DWORD old;
+
+    if (!g_ReplayPause) return;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("ReplayPause: unexpected image base, skipped");
+        return;
+    }
+    if (memcmp(p, orig, sizeof(orig)) != 0) {
+        Log("ReplayPause: code signature mismatch, skipped");
+        return;
+    }
+    if (!VirtualProtect(p + 8, 1, PAGE_EXECUTE_READWRITE, &old)) {
+        Log("ReplayPause: VirtualProtect failed (err=%08X)", GetLastError());
+        return;
+    }
+    p[8] = 0xeb;   /* je -> jmp */
+    VirtualProtect(p + 8, 1, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
+    Log("ReplayPause: patched (pause menu opens during replay playback)");
 }
 
 /*
@@ -762,6 +848,115 @@ static void PatchReplayStage(void) {
     VirtualProtect(p, sizeof(orig), old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
     Log("ReplayStage: patched (hook=%p)", (void*)&ReplayUpdateHook);
+}
+
+/*
+ * Replay desync fix (Proton / Wine): x87 control word.
+ *
+ * The game computes object positions in x87 floating point, and its replays only reproduce when every
+ * run uses the same precision.  Rain.exe asks DirectDraw for DDSCL_EXCLUSIVE|FULLSCREEN|ALLOWREBOOT
+ * without DDSCL_FPUPRESERVE, so on Windows Direct3D 7 switches the FPU to single precision (24 bit
+ * mantissa, all exceptions masked, round to nearest = control word 0x007F) when the device is created.
+ * Under Proton the control word of the game thread can be different (53 bit 0x027F, or changed by a
+ * driver / audio library), which makes the simulation, and so the replay, drift.
+ * The control word is forced to g_ReplayFpuCw at the start of every stage frame (event dispatch hook)
+ * and at every input query; the first change and the value at every stage start are logged so a
+ * mismatch with the Windows value can be seen in Smd_ddraw.log.
+ */
+static const int g_ReplayFpuFix = 1;
+static const unsigned short g_ReplayFpuCw = 0x007F;
+static int g_fpuLogLeft = 40;
+
+static unsigned short FpuGetCw(void) {
+    unsigned short cw = 0;
+    __asm__ __volatile__("fnstcw %0" : "=m"(cw));
+    return cw;
+}
+
+static void FpuSetCw(unsigned short cw) {
+    __asm__ __volatile__("fldcw %0" : : "m"(cw));
+}
+
+static void FpuEnforce(const char *where, int frame) {
+    unsigned short cur, want = g_ReplayFpuCw;
+    if (!g_ReplayFpuFix) return;
+    cur = FpuGetCw();
+    if (frame == 0)
+        Log("FpuFix: %s frame 0: x87 control word %04X (target %04X)", where, (unsigned)cur, (unsigned)want);
+    if (cur != want) {
+        FpuSetCw(want);
+        if (g_fpuLogLeft > 0) {
+            g_fpuLogLeft--;
+            Log("FpuFix: %s: x87 control word %04X -> %04X", where, (unsigned)cur, (unsigned)want);
+        }
+    }
+}
+
+/* Trace the actual input-query path used by gameplay while replay data is active. */
+typedef unsigned char (__attribute__((thiscall)) *PF_ReplayInputQuery)(void *self, int id,
+                                                                       int delay);
+static PF_ReplayInputQuery g_replayInputQueryOrig = NULL;
+static unsigned g_replayInputQueryLogRemaining = 0;
+
+static unsigned char __attribute__((fastcall)) ReplayInputQueryHook(void *self, void *edx,
+                                                                     int id, int delay) {
+    unsigned char result;
+    int playback = self && *(volatile unsigned char*)((char*)self + 0x234);
+    unsigned buttons = playback ? *(volatile unsigned*)((char*)self + 4) : 0;
+    unsigned index = playback ? *(volatile unsigned*)((char*)self + 0x11a8) : 0;
+
+    (void)edx;
+    FpuEnforce("input", -1);
+    PauseReplayRestore();
+    result = g_replayInputQueryOrig(self, id, delay);
+    if (playback && g_replayInputQueryLogRemaining) {
+        Log("ReplayInput: frame=%d cursor=%u mask=%04X query=%d delay=%d result=%u",
+            *(volatile int*)(uintptr_t)0x4dadf8, index, buttons & 0xffff, id, delay,
+            (unsigned)result);
+        --g_replayInputQueryLogRemaining;
+    }
+    return result;
+}
+
+static void PatchReplayInputTrace(void) {
+    static const unsigned char orig[5] = { 0x55,0x56,0x57,0x8b,0xf9 };
+    const DWORD addr = 0x431480;
+    unsigned char *p = (unsigned char*)(uintptr_t)addr;
+    unsigned char *tramp;
+    DWORD old, rel;
+
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("ReplayInput: unexpected image base, skipped");
+        return;
+    }
+    if (memcmp(p, orig, sizeof(orig)) != 0) {
+        Log("ReplayInput: code signature mismatch, skipped");
+        return;
+    }
+    tramp = (unsigned char*)VirtualAlloc(NULL, 10, MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_EXECUTE_READWRITE);
+    if (!tramp) {
+        Log("ReplayInput: trampoline allocation failed (err=%08X)", GetLastError());
+        return;
+    }
+    memcpy(tramp, orig, sizeof(orig));
+    tramp[5] = 0xe9;
+    rel = (DWORD)(addr + 5 - ((DWORD)(uintptr_t)tramp + 10));
+    memcpy(tramp + 6, &rel, 4);
+    g_replayInputQueryOrig = (PF_ReplayInputQuery)(uintptr_t)tramp;
+    if (!VirtualProtect(p, sizeof(orig), PAGE_EXECUTE_READWRITE, &old)) {
+        g_replayInputQueryOrig = NULL;
+        VirtualFree(tramp, 0, MEM_RELEASE);
+        Log("ReplayInput: VirtualProtect failed (err=%08X)", GetLastError());
+        return;
+    }
+    p[0] = 0xe9;
+    rel = (DWORD)(uintptr_t)&ReplayInputQueryHook - (addr + 5);
+    memcpy(p + 1, &rel, 4);
+    VirtualProtect(p, sizeof(orig), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
+    g_replayInputQueryLogRemaining = 500;
+    Log("ReplayInput: query trace hook installed");
 }
 
 /*
@@ -913,6 +1108,19 @@ static void __stdcall GameStartHook(int stage) {
 
 /* pause menu retry: replaces the three `call 0x419d10` in 0x419b30 (stdcall, stage on the stack) */
 static void __stdcall RetryHook(int stage) {
+    if (g_pauseReplay) {
+        void *input = *(void**)(uintptr_t)0x46bbec;
+        if (input && g_replayFileIdCaptured) {
+            int ok = ((PF_ReplayLoad)(uintptr_t)0x431fe0)(input, g_replayFileId, g_replayStage);
+            Log("ReplayPause: retry reloaded replay id=%d from stage %d (ok=%d)",
+                g_replayFileId, g_replayStage, ok);
+        } else {
+            Log("ReplayPause: retry could not reload replay (input=%p file_id=%d)",
+                input, g_replayFileIdCaptured);
+            ((PF_SceneSwitch)(uintptr_t)0x4254d0)(1, 0);
+        }
+        return;
+    }
     ((PF_GameStart)(uintptr_t)0x419d10)(stage);
     ExOnRetry(stage);
     ApplyPracticePower(stage, "retry");
@@ -941,6 +1149,93 @@ static int HookCall(DWORD callAddr, DWORD target, void *hook) {
     VirtualProtect(p, 5, old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, 5);
     return 1;
+}
+
+/* Sample the main per-frame subsystems so a bullet-heavy slowdown can be attributed. */
+typedef unsigned char (__cdecl *PF_FrameNoArg)(void);
+typedef struct { LONGLONG ticks, maxTicks; unsigned calls; } PerfStat;
+static PerfStat g_gamePerf[7];
+static const char *g_gamePerfName[7] = {
+    "events", "object_update", "effects", "object_checks",
+    "animation", "stage_tasks", "game_state"
+};
+
+static unsigned char PerfCall(int slot, DWORD target) {
+    LARGE_INTEGER a, b;
+    unsigned char result;
+    QueryPerformanceCounter(&a);
+    result = ((PF_FrameNoArg)(uintptr_t)target)();
+    QueryPerformanceCounter(&b);
+    if (slot >= 0 && slot < 7) {
+        LONGLONG dt = b.QuadPart - a.QuadPart;
+        g_gamePerf[slot].ticks += dt;
+        if (dt > g_gamePerf[slot].maxTicks) g_gamePerf[slot].maxTicks = dt;
+        g_gamePerf[slot].calls++;
+    }
+    return result;
+}
+
+static void PerfFlush(int frame) {
+    int i;
+    if (frame < 0 || frame % 300 != 299) return;
+    for (i = 0; i < 7; i++) {
+        PerfStat *s = &g_gamePerf[i];
+        if (s->calls) {
+            Log("GamePerf: frames %d-%d %s calls=%u avg=%.3f max=%.3f ms",
+                frame - 299, frame, g_gamePerfName[i], s->calls,
+                (double)s->ticks * 1000.0 / (double)g_qpcFreq.QuadPart / s->calls,
+                (double)s->maxTicks * 1000.0 / (double)g_qpcFreq.QuadPart);
+        }
+        memset(s, 0, sizeof(*s));
+    }
+}
+
+static unsigned char __cdecl PerfObjectUpdate(void) { return PerfCall(1, 0x42daa0); }
+static unsigned char __cdecl PerfEffects(void)      { return PerfCall(2, 0x42db70); }
+static unsigned char __cdecl PerfObjectChecks(void) { return PerfCall(3, 0x42db30); }
+static unsigned char __cdecl PerfAnimation(void)    { return PerfCall(4, 0x416540); }
+static unsigned char __cdecl PerfStageTasks(void)   { return PerfCall(5, 0x414710); }
+static unsigned char __cdecl PerfGameState(void) {
+    int frame = *(volatile int*)(uintptr_t)0x4dadf8;
+    unsigned char result = PerfCall(6, 0x434740);
+    PerfFlush(frame);
+    return result;
+}
+
+static void PatchGamePerf(void) {
+    int n = 0;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("GamePerf: unexpected image base, skipped");
+        return;
+    }
+    n += HookCall(0x413c66, 0x42daa0, (void*)&PerfObjectUpdate);
+    n += HookCall(0x413c70, 0x42db70, (void*)&PerfEffects);
+    n += HookCall(0x413c7a, 0x42db30, (void*)&PerfObjectChecks);
+    n += HookCall(0x413c84, 0x416540, (void*)&PerfAnimation);
+    n += HookCall(0x413c89, 0x414710, (void*)&PerfStageTasks);
+    n += HookCall(0x413c8e, 0x434740, (void*)&PerfGameState);
+    Log("GamePerf: patched %d/6 frame subsystems", n);
+}
+
+/* Remember the replay-list index passed by the game's replay selection screen. */
+static int __attribute__((fastcall)) ReplayLoadCaptureHook(void *input, void *edx,
+                                                            int replayId, int stage) {
+    (void)edx;
+    g_replayFileId = replayId;
+    g_replayStage = (stage == 4) ? 4 : 1;
+    g_replayFileIdCaptured = 1;
+    Log("ReplayLoad: selected id=%d stage=%d", replayId, stage);
+    return ((PF_ReplayLoad)(uintptr_t)0x431fe0)(input, replayId, stage);
+}
+
+static void PatchReplayLoadCapture(void) {
+    int n;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("ReplayLoad: unexpected image base, skipped");
+        return;
+    }
+    n = HookCall(0x4224a1, 0x431fe0, (void*)&ReplayLoadCaptureHook);
+    Log("ReplayLoad: selection hook %s", n ? "installed" : "failed");
 }
 
 static void PatchPracticePower(void) {
@@ -1316,6 +1611,9 @@ typedef struct { int n; int time; ExBgEv ev[32]; } ExBgGroup;
 static ExBgGroup g_exBgGroup;
 
 typedef void (__cdecl *PF_LayerSetU)(int layer, unsigned v);
+typedef void (__cdecl *PF_LayerSetU3)(int layer, unsigned argsP, unsigned tex);
+typedef unsigned (__cdecl *PF_TexById)(unsigned id);
+typedef void *PF_Void;
 
 static int ExValInt(unsigned tag, unsigned payload, int *ok) {
     if (tag == 0) { float f; memcpy(&f, &payload, 4); return (int)f; }
@@ -1527,6 +1825,30 @@ static float ExBitsToFloat(unsigned bits) {
     return f;
 }
 
+/* Texture id helpers.  The stage script's background textures live in a runtime table created by
+   0x4097b0(type, w, h, name, name2, flag): pointer array at 0x46c884, entry count at 0x46c888,
+   total loads ever at 0x46c890.  Tiles queue texture OBJECT pointers, so the id is found by a
+   reverse lookup; the counts show whether the table was fully populated at the time. */
+static unsigned ExTextureTableN(void) {
+    return *(volatile unsigned*)(uintptr_t)0x46c888;
+}
+
+static unsigned ExTextureLoadedN(void) {
+    return *(volatile unsigned*)(uintptr_t)0x46c890;
+}
+
+static int ExTexId(unsigned p) {
+    unsigned n = ExTextureTableN() / 4, i;
+    unsigned volatile **tbl;
+
+    if (!p) return -2;                      /* null texture pointer */
+    tbl = (unsigned volatile **)*(void *volatile *)(uintptr_t)0x46c884;
+    if (!tbl || IsBadReadPtr(tbl, ExTextureTableN())) return -3;
+    for (i = 0; i < n; i++)
+        if ((unsigned)(uintptr_t)tbl[i] == p) return (int)i;
+    return -1;                              /* not in the table (freed since) */
+}
+
 static char ExPtrLabel(unsigned *seen, int *nseen, unsigned p) {
     int i;
     if (!p) return '-';
@@ -1574,12 +1896,15 @@ static void ExLogLayerState(const char *tag, int frame) {
         }
         if (qn > (int)sizeof(qs) - 1) qn = (int)sizeof(qs) - 1;
         qs[qn] = 0;
-        Log("ExBg[%s] frame=%d layer %d: offset=%.3f slots=%c%c%c tex=%08X,%08X,%08X queue(%d)=%s qtex=%08X,%08X,%08X,%08X speed=%.4f accel=%.4f cycle=%u",
-            tag, frame, layer, ExBitsToFloat(obj[3]), s0, s1, s2, obj[4], obj[5], obj[6], cnt, qs,
+        Log("ExBg[%s] frame=%d layer %d: offset=%.3f slots=%c%c%c tid=%02X,%02X,%02X tex=%08X,%08X,%08X queue(%d)=%s qid=%02X,%02X,%02X,%02X qtex=%08X,%08X,%08X,%08X speed=%.4f accel=%.4f cycle=%u tbl=n%d/l%d",
+            tag, frame, layer, ExBitsToFloat(obj[3]), s0, s1, s2,
+            ExTexId(obj[4]), ExTexId(obj[5]), ExTexId(obj[6]), obj[4], obj[5], obj[6], cnt, qs,
+            ExTexId(qtex[0]), ExTexId(qtex[1]), ExTexId(qtex[2]), ExTexId(qtex[3]),
             qtex[0], qtex[1], qtex[2], qtex[3],
             ExBitsToFloat(*(volatile unsigned*)(uintptr_t)(0x4e9a80 + layer * 4)),
             ExBitsToFloat(*(volatile unsigned*)(uintptr_t)(0x4e9a74 + layer * 4)),
-            *(volatile unsigned*)(uintptr_t)(0x4e9a68 + layer * 4));
+            *(volatile unsigned*)(uintptr_t)(0x4e9a68 + layer * 4),
+            ExTextureTableN(), ExTextureLoadedN());
     }
 }
 
@@ -1764,6 +2089,8 @@ static void ExSimulateSettled(int from, int target, int gt) {
 
 static unsigned char __cdecl EventDispatchHook(int frame) {
     static int f9prev = 0;
+    FpuEnforce("stage", frame);
+    PauseReplayRestore();
     if (g_exSimulatingStageFrame)
         return ((PF_EventDispatch)(uintptr_t)0x430020)(frame);
     int f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
@@ -1842,6 +2169,23 @@ static unsigned char __cdecl EventDispatchHook(int frame) {
 
 typedef void (__cdecl *PF_EventInsert)(int time, void *node);
 
+/* Background texture push (event type 2 dispatch, 0x4300b4 -> 0x427d40(tex, args+8, layer):
+   as 0x427d40 reads its tex id at [esp+8], the stack holds (layer, args+8) at the call, so the
+   dispatch actually passes (layer, args+8, tex).  The log shows the resolved texture object and
+   (via its table index) why it may be a wrong image. */
+static void __cdecl BgPushHook(int layer, unsigned *argsP, unsigned tex) {
+    if (*(volatile int*)(uintptr_t)0x4dade4 == 4) {
+        union { unsigned b; float f; } v;
+        unsigned texObj;
+        v.b = tex;
+        texObj = ((PF_TexById)(uintptr_t)0x409960)((unsigned)v.f);
+        Log("ExArea: bg push frame=%d layer=%.1f args=%08X tex=%d texObj=%08X id=%d (tbl=n%d/l%d)",
+            *(volatile int*)(uintptr_t)0x4dadf8, (double)v.f, (unsigned)(uintptr_t)argsP,
+            (unsigned)v.f, texObj, ExTexId(texObj), ExTextureTableN(), ExTextureLoadedN());
+    }
+    ((PF_LayerSetU3)(uintptr_t)0x427d40)(layer, (unsigned)(uintptr_t)argsP, tex);
+}
+
 /* Event creators (0x42fe60..0x430020) insert every stage event through 0x42fe30(time, node). */
 static void __cdecl EventInsertHook(int time, unsigned *node) {
     if (node && *(volatile int*)(uintptr_t)0x4dade4 == 4) {
@@ -1874,6 +2218,21 @@ static int PatchEventInsertLog(void) {
     return n;
 }
 
+/* The FPU fix runs from EventDispatchHook; install it on its own when the Extra area select (which
+ * normally installs the same hook) is turned off. */
+static void PatchReplayFpu(void) {
+    if (!g_ReplayFpuFix) return;
+    Log("FpuFix: x87 control word at attach %04X, forcing %04X from the stage frame/input hooks",
+        (unsigned)FpuGetCw(), (unsigned)g_ReplayFpuCw);
+    if (g_ExAreaSelect) return;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("FpuFix: unexpected image base, stage hook skipped");
+        return;
+    }
+    if (HookCall(0x413c45, 0x430020, (void*)&EventDispatchHook))
+        Log("FpuFix: stage frame hook installed");
+}
+
 static void PatchExAreaSelect(void) {
     int n = 0;
 
@@ -1887,6 +2246,8 @@ static void PatchExAreaSelect(void) {
     n += HookCall(0x413c45, 0x430020, (void*)&EventDispatchHook);
     Log("ExArea: patched %d/3 call sites", n);
     Log("ExArea: event insert log: %d call site(s) hooked", PatchEventInsertLog());
+    if (HookCall(0x4300b4, 0x427d40, (void*)&BgPushHook))
+        Log("ExArea: background push log hooked");
 }
 
 /*
@@ -2683,10 +3044,14 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         PatchTitleCancel();
         PatchOptionDefaults();
         PatchPauseKeys();
+        PatchReplayPause();
+        PatchReplayLoadCapture();
         PatchResultRetry();
         PatchReplayStage();
+        PatchReplayInputTrace();
         PatchPracticePower();
         PatchExAreaSelect();
+        PatchReplayFpu();
         PatchPauseAudio();
         PatchSoundFix();
         break;
