@@ -4,10 +4,6 @@
 #include <mmsystem.h>
 #include <stdio.h>
 
-
-
-
-
 static volatile int g_ShowStageMenu = 0;
 static volatile int g_StageSelected = 0;
 static volatile int g_PracticeMode = 0;
@@ -87,10 +83,6 @@ static void LogMessage(const char *format, ...) {
         fclose(fp);
     }
 }
-
-
-
-
 
 struct Vertex2D {
     float x, y, z, rhw;
@@ -275,10 +267,6 @@ static void UpdateSelectedCr(void) {
     u.f = total;
     g_SelectedCrDword = u.dw;
 }
-
-
-
-
 
 static void PlaySoundDirect(DWORD pSoundObj) {
     if (!pSoundObj || pSoundObj < 0x10000 || pSoundObj > 0x7fff0000) return;
@@ -601,9 +589,6 @@ static void InstallWrapperDetour(DWORD target, DWORD detourFn, DWORD trampolineO
     }
 }
 
-
-
-
 static volatile LONGLONG g_LatQpcFreq = 0;
 static volatile LONGLONG g_LatLastRenderQpc = 0;
 static volatile LONGLONG g_LatLastKeyPollQpc = 0;
@@ -804,10 +789,6 @@ unsigned char __attribute__((thiscall)) Hook_IsKeyPressed(void *this, int key) {
 
     return orig_IsKeyPressed(this, key);
 }
-
-
-
-
 
 static inline int GetConceptReactorKey(void) {
     DWORD pConfig = *(volatile DWORD*)0x5ac9b0;
@@ -1150,10 +1131,6 @@ DWORD __cdecl HandleSetLives(DWORD origLives) {
     }
     return origLives;
 }
-
-
-
-
 
 void __attribute__((naked)) Hook_SetLives(void) {
     __asm__ __volatile__(
@@ -2253,10 +2230,6 @@ void __cdecl HandleSceneCheck(DWORD *pEdx) {
     }
 }
 
-
-
-
-
 static char *GetReplayGameState(void) {
     char *pInputMgr = *(char**)0x5ac9b4;
     if (pInputMgr && (DWORD)pInputMgr > 0x10000 && !IsBadReadPtr(pInputMgr, 0x20)) {
@@ -2520,10 +2493,6 @@ __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion) {
     }
     return NULL;
 }
-
-
-
-
 
 static void ResetStageScore(void) {
     UpdateSelectedLives();

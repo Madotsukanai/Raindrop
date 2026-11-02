@@ -3,6 +3,15 @@
 ## 使い方
 ### 五月雨
 [Releases](https://github.com/Madotsukanai/Raindrop/releases/latest)からddraw.dllをダウンロードし、Rain.exe (SHA-256: ae35b0ad17094bd21f86bc464504ceeafc50941e5207d75a3065e44049138211)と同じディレクトリにコピーしてからゲームを起動して下さい。<br>
+
+グラフィックスAPIは、Rain.exeと同じディレクトリに置く`raindrop.ini`で選択できます。
+
+```ini
+[Graphics]
+API=DirectDraw
+```
+
+`API=DirectDraw`はシステムのDirectDrawを使用します（未対応の場合はD3D9へフォールバックします）。`API=D3D9`にすると内蔵D3D9実装を起動時から使用します。ファイルや設定を省略した場合は`DirectDraw`です。<br>
 ### RefRain
 [Releases](https://github.com/Madotsukanai/Raindrop/releases/latest)からd3d9.dllをダウンロードし、RefRain.exe (SHA-256: db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78)と同じディレクトリにコピーしてからゲームを起動して下さい。<br>
 「DIVE 2 M.R.S.」にカーソルを合わせた状態でコンセプトリアクターに割り当てたキーを入力するとプラクティスメニューが開きます。
