@@ -27,6 +27,12 @@ static const int g_LowLatency = SMD_LOWLATENCY;
 static const int g_UseDwmFlush = SMD_DWMFLUSH;
 static const int g_StatsIntervalMs = 5000;
 static const int g_WaitTimeoutMs = 50;
+static const int g_ForceColorDepth32 = 1;
+static const int g_AutoWindowFallback = 1;
+static const int g_ForceWindowMode = 0;
+static int g_fallbackInstance = 0;
+static int g_fullscreenRequested = 0;
+static int g_displayModeFailures = 0;
 
 static void ExeDirFile(const char *name, char *out) {
     GetModuleFileNameA(NULL, out, MAX_PATH);
@@ -53,6 +59,148 @@ static void Log(const char *fmt, ...) {
     va_end(ap);
     fputc('\n', g_log);
     fflush(g_log);
+}
+
+static void LogWindowsVersion(void) {
+    typedef LONG (WINAPI *PF_RtlGetVersion)(OSVERSIONINFOW*);
+    HMODULE nt = GetModuleHandleA("ntdll.dll");
+    PF_RtlGetVersion fn = nt ? (PF_RtlGetVersion)(void*)GetProcAddress(nt, "RtlGetVersion") : NULL;
+    OSVERSIONINFOW vi;
+    memset(&vi, 0, sizeof(vi));
+    vi.dwOSVersionInfoSize = sizeof(vi);
+    if (fn && fn(&vi) == 0)
+        Log("Windows %lu.%lu build %lu", (unsigned long)vi.dwMajorVersion, (unsigned long)vi.dwMinorVersion,
+            (unsigned long)vi.dwBuildNumber);
+}
+
+static void InitFallbackInstance(void) {
+    char buf[32];
+    DWORD n = GetEnvironmentVariableA("SMD_WND_FALLBACK", buf, sizeof(buf));
+    DWORD ppid;
+    if (n == 0 || n >= sizeof(buf)) return;
+    g_fallbackInstance = 1;
+    ppid = (DWORD)strtoul(buf, NULL, 10);
+    SetEnvironmentVariableA("SMD_WND_FALLBACK", NULL);
+    if (ppid && ppid != GetCurrentProcessId()) {
+        HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, ppid);
+        if (h) {
+            WaitForSingleObject(h, 5000);
+            CloseHandle(h);
+        }
+    }
+    Log("WindowFallback: this is the window mode fallback instance (parent pid=%lu)", (unsigned long)ppid);
+}
+
+static void TriggerWindowFallback(const char *why) {
+    char exe[MAX_PATH], dir[MAX_PATH], pidbuf[32];
+    char *cmd, *slash;
+    const char *cl;
+    size_t n;
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+
+    if (!g_AutoWindowFallback || g_fallbackInstance) return;
+    Log("WindowFallback: %s -> relaunching in window mode", why);
+    GetModuleFileNameA(NULL, exe, MAX_PATH);
+    strcpy(dir, exe);
+    slash = strrchr(dir, '\\');
+    if (slash) *slash = 0;
+    cl = GetCommandLineA();
+    n = strlen(cl);
+    cmd = (char*)malloc(n + 1);
+    if (!cmd) return;
+    memcpy(cmd, cl, n + 1);
+    sprintf(pidbuf, "%lu", (unsigned long)GetCurrentProcessId());
+    SetEnvironmentVariableA("SMD_WND_FALLBACK", pidbuf);
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+    if (CreateProcessA(exe, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) {
+        DWORD newPid = pi.dwProcessId;
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        free(cmd);
+        Log("WindowFallback: new process started (pid=%lu), exiting", (unsigned long)newPid);
+        if (g_log) fflush(g_log);
+        ExitProcess(0);
+    }
+    Log("WindowFallback: CreateProcess failed (err=%08X)", (unsigned)GetLastError());
+    SetEnvironmentVariableA("SMD_WND_FALLBACK", NULL);
+    free(cmd);
+}
+
+static HRESULT TrySetDisplayMode(IDirectDraw7 *orig, DWORD wd, DWORD ht, DWORD bpp, DWORD refresh, DWORD flags) {
+    DWORD tries[3] = { 0, 0, 60 };
+    DEVMODEA dm;
+    HRESULT hr = DDERR_GENERIC;
+    int i;
+
+    memset(&dm, 0, sizeof(dm));
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+        tries[1] = dm.dmDisplayFrequency;
+    for (i = 0; i < 3; i++) {
+        if (i == 1 && tries[1] == 0) continue;
+        if (tries[i] == refresh && flags == 0) continue;
+        hr = IDirectDraw7_SetDisplayMode(orig, wd, ht, bpp, tries[i], 0);
+        Log("DD7.SetDisplayMode retry refresh=%lu -> hr=%08X", (unsigned long)tries[i], (unsigned)hr);
+        if (hr >= 0) return hr;
+    }
+    return hr;
+}
+
+static void PatchColorDepth32(void) {
+    static const unsigned char orig[11] = {
+        0x83,0xf8,0x10, 0xa3,0x30,0xc8,0x46,0x00, 0x5e, 0x74,0x1c
+    };
+    const DWORD addr = 0x405951;
+    unsigned char *p = (unsigned char*)addr;
+    DWORD old;
+
+    if (!g_ForceColorDepth32) return;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("ColorDepth32: unexpected image base, skipped");
+        return;
+    }
+    if (memcmp(p, orig, sizeof(orig)) != 0) {
+        Log("ColorDepth32: code signature mismatch, skipped");
+        return;
+    }
+    if (!VirtualProtect(p, 3, PAGE_EXECUTE_READWRITE, &old)) {
+        Log("ColorDepth32: VirtualProtect failed (err=%08X)", (unsigned)GetLastError());
+        return;
+    }
+    p[0] = 0x6a; p[1] = 0x20; p[2] = 0x58;
+    VirtualProtect(p, 3, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 3);
+    Log("ColorDepth32: patched (ColorDepth in config.txt is ignored, always 32)");
+}
+
+static void PatchForceWindowMode(void) {
+    static const unsigned char orig[10] = {
+        0xe8,0x74,0x04,0x00,0x00, 0x25,0xff,0x00,0x00,0x00
+    };
+    const DWORD addr = 0x4055c7;
+    unsigned char *p = (unsigned char*)addr;
+    DWORD old;
+
+    if (!g_ForceWindowMode && !g_fallbackInstance) return;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("ForceWindow: unexpected image base, skipped");
+        return;
+    }
+    if (memcmp(p, orig, sizeof(orig)) != 0) {
+        Log("ForceWindow: code signature mismatch, skipped");
+        return;
+    }
+    if (!VirtualProtect(p + 5, 5, PAGE_EXECUTE_READWRITE, &old)) {
+        Log("ForceWindow: VirtualProtect failed (err=%08X)", (unsigned)GetLastError());
+        return;
+    }
+    p[5] = 0xb8; p[6] = 0x01; p[7] = 0x00; p[8] = 0x00; p[9] = 0x00;
+    VirtualProtect(p + 5, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 10);
+    Log("ForceWindow: patched (WndMode is forced on)");
 }
 
 typedef HRESULT (STDMETHODCALLTYPE *PF_Blt)(IDirectDrawSurface7*, LPRECT, LPDIRECTDRAWSURFACE7, LPRECT, DWORD, LPDDBLTFX);
@@ -648,15 +796,125 @@ static void ApplyPracticePower(int stage, const char *what) {
     }
 }
 
+/*
+ * Practice: Extra stage area select (state shared with the hooks further below).
+ *
+ * g_exStartReq : set by the Practice menu when the Extra row is decided
+ * g_exRun      : the running Extra stage was started from the Practice menu
+ * g_exPending  : at the first stage frame (frame counter 0x4dadf8 == 0) the event queue is
+ *                logged and, for a practice run, fast-forwarded to the selected area
+ */
+#define EX_MAX_AREAS 16
+#define EX_AREA_N 4
+#define EX_BGM_IDS 16
+#define EX_MAIN_WAIT_IP 810192
+static const int g_ExAreaSelect = 1;
+/* Background of a practice Extra area start:
+ * 0: old behaviour, the selected area's own background group is seeded from a clean state.
+ * 1: the exact stage state of a normal run at the area's BGM frame, including the complete scene
+ *    update sequence for every simulated frame.
+ * 2: like 1, then the layers are run on (with the game's own layer update, other stage events held
+ *    back) until the tiles of the area's background group fill the layers. Areas 2 and 4 use this
+ *    to complete their background transition while holding other stage events. */
+static const int g_ExBgMode = 1;
+/* F8 during a practice Extra run cycles the background groups (diagnosis only). */
+static const int g_ExBgDebugKeys = 0;
+static const int g_exAreaBgm[EX_AREA_N] = { 2, 3, 4, 5 };
+static const int g_exAreaDefaultFrame[EX_AREA_N] = { 362, 6612, 8962, 14192 };
+static int g_exBgmTime[EX_BGM_IDS];
+static int g_exAreaN = EX_AREA_N;
+static int g_exArea = 0;
+static int g_exStartReq = 0;
+static int g_exRun = 0;
+static int g_exPending = 0;
+static int g_exSkipWait = 0;
+static int g_exShorten = 0;
+/* Guard while replaying the game's own per-frame stage routine from the area jump. */
+static int g_exSimulatingStageFrame = 0;
+
+typedef unsigned char (__cdecl *PF_Op)(void *thread, void *args);
+static PF_Op g_origOp2 = NULL;
+
+static int g_exOpLog = 0;
+
+static unsigned char __cdecl Op2Hook(void *thr, void *args) {
+    unsigned char r = g_origOp2(thr, args);
+    if (g_exOpLog > 0 && *(int*)((char*)thr + 0x14) >= EX_MAIN_WAIT_IP) {
+        g_exOpLog--;
+        Log("ExArea: op2 thread=%p ip=%d wait=%d frame=%d", thr, *(int*)((char*)thr + 0x14),
+            *(int*)((char*)thr + 0x10), *(volatile int*)(uintptr_t)0x4dadf8);
+    }
+    if (g_exShorten) {
+        int *w = (int*)((char*)thr + 0x10);
+        if (*(int*)((char*)thr + 0x14) == EX_MAIN_WAIT_IP && *w == 300) {
+            *(float*)((char*)thr + 0x50) = 362.0f;
+            *(int*)((char*)thr + 0x14) = 810248 - 12;
+            *w = 0;
+            g_exShorten = 0;
+            Log("ExArea: main timeline intro bypassed (ip -> 810248, thr+0x50 = 362)");
+        }
+    }
+    return r;
+}
+
+static void ExArm(void) {
+    void **tbl;
+    DWORD old;
+
+    memset(g_exBgmTime, 0, sizeof(g_exBgmTime));
+    g_exSkipWait = 0;
+    g_exShorten = 0;
+    g_exOpLog = g_exRun ? 40 : 0;
+    if (!g_exRun || g_exArea < 0 || g_exArea >= EX_AREA_N) return;
+    tbl = *(void***)(uintptr_t)0x4ea1fc;
+    if (!tbl) {
+        Log("ExArea: opcode table missing, area skip disabled");
+        return;
+    }
+    if (!g_origOp2) {
+        if (tbl[2] != (void*)(uintptr_t)0x42ec20) {
+            Log("ExArea: opcode 2 handler is %p, area skip disabled", tbl[2]);
+            return;
+        }
+        if (!VirtualProtect(&tbl[2], sizeof(void*), PAGE_READWRITE, &old)) {
+            Log("ExArea: VirtualProtect failed (err=%08X), area skip disabled", GetLastError());
+            return;
+        }
+        g_origOp2 = (PF_Op)tbl[2];
+        tbl[2] = (void*)Op2Hook;
+        VirtualProtect(&tbl[2], sizeof(void*), old, &old);
+    }
+    g_exShorten = 1;
+    g_exSkipWait = 1;
+}
+
+static void ExOnGameStart(int stage) {
+    g_exRun = (stage == 4) && g_exStartReq;
+    g_exStartReq = 0;
+    if (stage == 4) {
+        g_exPending = 1;
+        ExArm();
+    }
+}
+
+static void ExOnRetry(int stage) {
+    if (stage == 4) {
+        g_exPending = 1;
+        ExArm();
+    }
+}
+
 /* title -> game start: replaces `call 0x423880` at 0x42377f */
 static void __stdcall GameStartHook(int stage) {
     ((PF_GameStart)(uintptr_t)0x423880)(stage);
+    ExOnGameStart(stage);
     ApplyPracticePower(stage, "start");
 }
 
 /* pause menu retry: replaces the three `call 0x419d10` in 0x419b30 (stdcall, stage on the stack) */
 static void __stdcall RetryHook(int stage) {
     ((PF_GameStart)(uintptr_t)0x419d10)(stage);
+    ExOnRetry(stage);
     ApplyPracticePower(stage, "retry");
 }
 
@@ -698,6 +956,937 @@ static void PatchPracticePower(void) {
     n += HookCall(0x419cad, 0x419d10, (void*)&RetryHook);       /* pause retry, extra */
     n += HookCall(0x419cb9, 0x419d10, (void*)&RetryHook);       /* pause retry, normal */
     Log("PracticePower: patched %d/4 call sites", n);
+}
+
+/*
+ * Practice menu: Extra stage row with left/right area select.
+ *
+ * Practice menu object = title object + 0x22e90 (thiscall, ecx = object):
+ *   init 0x420b40, update 0x420c90 (called from 0x423791), draw 0x420de0 (called from 0x42407f)
+ *   +0x08 cursor, +0x0c fade-in (0..0x80), +0x10 font texture, +0x18 header row,
+ *   +0x100 + 0xe8*i stage rows (3 rows, y = 0x78 + 0x20*i), row colour at row+0xd8
+ * Original update/draw work for at most 3 stage rows (count = DWORD 0x46bc2c, 1..3).  When all three
+ * stages are available and Extra is unlocked (DWORD 0x46bc00), the update is replaced by a copy of
+ * the original with a 4th cursor position (the Extra row, y = 0xd8). The draw count is raised to 5
+ * so the panel grows by two rows; custom rows show "Extra" at y = 0xd8 and the area selector at
+ * y = 0xf8.
+ * Deciding the Extra row starts stage 4 like the title's Extra entry (lives = config Rest 0x46c7c4,
+ * practice flag off) and remembers the selected area (g_exArea).
+ *
+ * Event queue: the stage script is a time ordered event queue (sorted singly linked list at 0x4ea1d8,
+ * node = { next, time, type, args* }); 0x430020(frame) runs every node whose time <= frame once per
+ * frame and frees it.  type 0 = enemy spawn, type 1 = player spawn, 2..6 = effects/background/music.
+ *
+ * Area start: Script4.dat schedules BGM changes as event type 6. The BGM ID is args[3]; IDs 2, 3,
+ * 4 and 5 mark areas 1..4. Runtime traces confirm the DAT schedule at frames 362, 6612, 8962 and
+ * 14192 respectively. For a
+ * practice run the opening timeline wait is bypassed directly to IP 810248 (with timeline counter = 362),
+ * scheduling the full stage events at frame 0. Once the target area's BGM event is known, enemy
+ * spawns (type 0) and earlier BGMs (type 6) earlier than it are removed (player spawn type 1 and
+ * background events are preserved), and the frame counter 0x4dadf8 is set to its time, so the
+ * remaining earlier events (player spawn, background, music, ...) are run at once by the
+ * following dispatch.  No settings file is used.  Every Extra start logs the BGM event times.
+ */
+typedef unsigned char (__attribute__((thiscall)) *PF_InputHold)(void *self, int id, int delay);
+typedef unsigned char (__attribute__((fastcall)) *PF_PracticeFn)(void *obj);
+typedef void (__attribute__((thiscall)) *PF_RowCtor)(void *row);
+typedef void (__attribute__((thiscall)) *PF_RowSetup)(void *row, void *tex, int x, int y, int a, int b,
+                                                     int w, int h, int c);
+typedef void (__cdecl *PF_RowText)(void *row, int a, int b, int c, int d, int e, const char *fmt, ...);
+typedef void (__cdecl *PF_RowDraw)(void *row, int flag);
+typedef unsigned char (__cdecl *PF_EventDispatch)(int frame);
+typedef void (__cdecl *PF_Free)(void *p);
+
+static char g_exRowBuf[EX_MAX_AREAS][0xe8] __attribute__((aligned(16)));
+static char g_exLabelRow[0xe8] __attribute__((aligned(16)));
+static int g_exRowInit[EX_MAX_AREAS];
+static void *g_exRowTex[EX_MAX_AREAS];   /* texture the row was set up with (changes when the menu is re-created) */
+static int g_exLabelInit;
+static void *g_exLabelTex;
+static int g_exLastFade = 0;
+
+static void ExRowsReset(void) {
+    memset(g_exRowInit, 0, sizeof(g_exRowInit));
+    memset(g_exRowTex, 0, sizeof(g_exRowTex));
+    g_exLabelInit = 0;
+    g_exLabelTex = NULL;
+}
+
+static int ExRowAvailable(void) {
+    return g_ExAreaSelect &&
+           *(volatile int*)(uintptr_t)0x46bc2c == 3 &&
+           *(volatile int*)(uintptr_t)0x46bc00 != 0;
+}
+
+static void ExRowEnsure(void *obj, int area) {
+    char *row = g_exRowBuf[area];
+    void *tex = *(void**)((char*)obj + 0x10);
+    if (g_exRowInit[area] && g_exRowTex[area] == tex) return;
+    g_exRowInit[area] = 1;
+    g_exRowTex[area] = tex;
+    memset(row, 0, 0xe8);
+    ((PF_RowCtor)(uintptr_t)0x41fdf0)(row);
+    ((PF_RowSetup)(uintptr_t)0x41ff10)(row, *(void**)((char*)obj + 0x10), 0x120, 0xf8, 0, 0, 0x100, 0x100, 0);
+    ((PF_RowText)(uintptr_t)0x41ff80)(row, 0x10, 0xc, 8, 9, 0xb, "Area %d/%d", area + 1, g_exAreaN);
+    *(int*)(row + 0xac) = 0x3f4ccccd;
+    *(int*)(row + 0xb0) = 0x3f4ccccd;
+    *(int*)(row + 0xd8) = 0x505050;
+}
+
+static void ExLabelEnsure(void *obj) {
+    void *tex = *(void**)((char*)obj + 0x10);
+    if (g_exLabelInit && g_exLabelTex == tex) return;
+    g_exLabelInit = 1;
+    g_exLabelTex = tex;
+    memset(g_exLabelRow, 0, sizeof(g_exLabelRow));
+    ((PF_RowCtor)(uintptr_t)0x41fdf0)(g_exLabelRow);
+    ((PF_RowSetup)(uintptr_t)0x41ff10)(g_exLabelRow, tex, 0x6c, 0xd8, 0, 0, 0x100, 0x100, 0);
+    ((PF_RowText)(uintptr_t)0x41ff80)(g_exLabelRow, 0x10, 0xc, 8, 9, 0xb,
+                                     "Extra      %3d     %3d", 0,
+                                     *(volatile int*)(uintptr_t)0x46c7c4);
+    *(int*)(g_exLabelRow + 0xac) = 0x3f4ccccd;
+    *(int*)(g_exLabelRow + 0xb0) = 0x3f4ccccd;
+    *(int*)(g_exLabelRow + 0xd8) = 0x505050;
+}
+
+static unsigned char __attribute__((fastcall)) PracticeUpdateHook(void *obj) {
+    char *o = (char*)obj;
+    int *cur = (int*)(o + 8), *fade = (int*)(o + 0xc);
+    void *input = *(void**)(uintptr_t)0x46bbec;
+    char *scene = *(char**)(uintptr_t)0x4e93c8;
+    PF_InputKey edge = (PF_InputKey)(uintptr_t)0x431540;
+    PF_InputKey rawkey = (PF_InputKey)(uintptr_t)0x431500;
+    PF_InputHold hold = (PF_InputHold)(uintptr_t)0x431480;
+    PF_PlaySe playSe = (PF_PlaySe)(uintptr_t)0x412210;
+    const int rows = 4;
+    int i, v;
+
+    if (!ExRowAvailable())
+        return ((PF_PracticeFn)(uintptr_t)0x420c90)(obj);
+    if (*cur < 0 || *cur >= rows) *cur = 0;
+
+    if (edge(input, 4) || rawkey(input, 0xd)) {                 /* decide */
+        *(int*)(scene + 0xc) = 0;
+        if (*cur < 3) {
+            *(int*)(scene + 0x10) = *cur + 1;
+            *(volatile unsigned char*)(uintptr_t)0x4dade0 = 1;
+            *(volatile int*)(uintptr_t)0x4dadd8 = *(int*)(uintptr_t)(0x46bc14 + 4 * *cur) - 1;
+            g_exStartReq = 0;
+        } else {
+            *(int*)(scene + 0x10) = 4;
+            *(volatile unsigned char*)(uintptr_t)0x4dade0 = 0;
+            *(volatile int*)(uintptr_t)0x4dadd8 = *(volatile int*)(uintptr_t)0x46c7c4;
+            g_exStartReq = 1;
+            Log("ExArea: Extra practice start, area %d/%d", g_exArea + 1, g_exAreaN);
+        }
+        *(int*)(scene + 8) = 0xb;
+    }
+    if (hold(input, 5, 0) || hold(input, 7, 0))                 /* cancel */
+        *(int*)(scene + 8) = 2;
+    if (hold(input, 0, 0xf)) {                                  /* up */
+        *cur = (rows + *cur - 1) % rows;
+        playSe((void*)(uintptr_t)0x4ea3b8, 0, 0xff);
+    }
+    if (hold(input, 1, 0xf)) {                                  /* down */
+        *cur = (*cur + 1) % rows;
+        playSe((void*)(uintptr_t)0x4ea3b8, 0, 0xff);
+    }
+    if (*cur == 3) {                                            /* left / right: area */
+        if (hold(input, 2, 0xf)) {
+            g_exArea = (g_exArea + g_exAreaN - 1) % g_exAreaN;
+            playSe((void*)(uintptr_t)0x4ea3b8, 0, 0xff);
+        }
+        if (hold(input, 3, 0xf)) {
+            g_exArea = (g_exArea + 1) % g_exAreaN;
+            playSe((void*)(uintptr_t)0x4ea3b8, 0, 0xff);
+        }
+    }
+    for (i = 0; i < 3; i++) *(int*)(o + 0x1d8 + 0xe8 * i) = 0x505050;
+    if (*cur < 3) *(int*)(o + 0x1d8 + 0xe8 * *cur) = 0xffffff;
+    v = *fade + 4;
+    *fade = v > 0x80 ? 0x80 : v;
+    return 1;
+}
+
+static unsigned char __attribute__((fastcall)) PracticeDrawHook(void *obj) {
+    volatile int *count = (volatile int*)(uintptr_t)0x46bc2c;
+    unsigned char r;
+    int saved = *count;
+    int fade = *(int*)((char*)obj + 0xc);
+
+    /* the menu's fade-in restarts at 0 every time it is opened: our row was built from the old
+       menu's texture, so drop it and build it again from the current one */
+    if (fade < g_exLastFade) ExRowsReset();
+    g_exLastFade = fade;
+    if (!ExRowAvailable())
+        return ((PF_PracticeFn)(uintptr_t)0x420de0)(obj);
+    *count = 5;                                  /* background panel: Extra label plus Area row */
+    r = ((PF_PracticeFn)(uintptr_t)0x420de0)(obj);
+    *count = saved;
+    if (*(int*)((char*)obj + 0xc) * 6 > 0xff) {
+        char *row;
+        ExLabelEnsure(obj);
+        ExRowEnsure(obj, g_exArea);
+        row = g_exRowBuf[g_exArea];
+        *(int*)(g_exLabelRow + 0xd8) = (*(int*)((char*)obj + 8) == 3) ? 0xffffff : 0x505050;
+        *(int*)(row + 0xd8) = (*(int*)((char*)obj + 8) == 3) ? 0xffffff : 0x505050;
+        ((PF_RowDraw)(uintptr_t)0x420270)(g_exLabelRow, 0);
+        ((PF_RowDraw)(uintptr_t)0x420270)(row, 0);
+    }
+    return r;
+}
+
+/* Extra stage event queue (sorted list at 0x4ea1d8): log it, or fast-forward it. */
+static void ExLogQueue(void) {
+    unsigned *n = *(unsigned**)(uintptr_t)0x4ea1d8;
+    int cnt[8] = { 0 }, tmin[8], tmax[8], i;
+
+    for (i = 0; i < 8; i++) { tmin[i] = 0x7fffffff; tmax[i] = -1; }
+    Log("ExArea: --- Extra event queue (time type args) ---");
+    for (; n; n = (unsigned*)n[0]) {
+        int t = (int)n[1], ty = (int)n[2];
+        unsigned *a = (unsigned*)n[3];
+        if (ty < 0 || ty > 7) ty = 7;
+        cnt[ty]++;
+        if (t < tmin[ty]) tmin[ty] = t;
+        if (t > tmax[ty]) tmax[ty] = t;
+        if (ty != 0)
+            Log("ExArea: ev t=%d type=%d args=%08X %08X %08X %08X %08X %08X", t, ty,
+                a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, a ? a[4] : 0, a ? a[5] : 0);
+    }
+    for (i = 0; i < 8; i++)
+        if (cnt[i])
+            Log("ExArea: type %d: %d event(s), time %d .. %d%s", i, cnt[i], tmin[i], tmax[i],
+                i == 0 ? " (spawns not listed)" : "");
+}
+
+static void ExSkipTo(int target, int area) {
+    unsigned **headp = (unsigned**)(uintptr_t)0x4ea1d8;
+    unsigned *prev = NULL, *n = *headp;
+    const int dropOldBg = 0;   /* dropping old pushes was wrong: the layer update (0x427e60) consumes them */
+    int dropped = 0, bgDropped = 0;
+    unsigned layerKey[8];
+    int layerLast[8], nLayers = 0, li;
+
+    /* Background texture pushes (type 2: args[3] = layer, args[5] = texture id) are appended to a
+       per-layer FIFO, and the front of the FIFO is what is drawn.  Running every earlier push at
+       the jump puts the Area 1 textures in front of the target area's ones, so the background of
+       Area 1 stays on screen.  Find the latest push time per layer before the target here, and
+       drop the older pushes of that layer below (pushes made at the same time -- one background
+       made of several textures -- are all kept). */
+    for (n = *headp; n; n = (unsigned*)n[0]) {
+        unsigned *a = (unsigned*)n[3];
+        if (!dropOldBg || (int)n[2] != 2 || (int)n[1] >= target || !a) continue;
+        for (li = 0; li < nLayers; li++)
+            if (layerKey[li] == a[3]) break;
+        if (li == nLayers) {
+            if (nLayers >= 8) continue;
+            layerKey[nLayers] = a[3];
+            layerLast[nLayers] = (int)n[1];
+            nLayers++;
+        } else if ((int)n[1] > layerLast[li]) {
+            layerLast[li] = (int)n[1];
+        }
+    }
+    n = *headp;
+
+    while (n) {
+        unsigned *next = (unsigned*)n[0];
+        int t = (int)n[1];
+        int ty = (int)n[2];
+        int drop = 0;
+
+        /* All areas: drop enemy spawns (0) and earlier BGM starts (6) before the target.
+           Everything else -- player spawn (1) and all background events (2: pushTex,
+           3: scroll speed, 4: scroll pos, 5: blend mode) -- is kept.  The kept background
+           events run at the jump via the normal dispatch, so the resulting texture FIFO and
+           scroll state are exactly what the natural Extra playthrough has at that frame
+           (the game pushes every area background onto layer 1). */
+        if (t < target && (ty == 0 || ty == 6)) drop = 1;
+        /* older background pushes of a layer (superseded by a later push before the target) */
+        if (!drop && ty == 2 && t < target && n[3]) {
+            unsigned *a = (unsigned*)n[3];
+            for (li = 0; li < nLayers; li++) {
+                if (layerKey[li] == a[3]) {
+                    if (t < layerLast[li]) {
+                        drop = 1;
+                        bgDropped++;
+                        Log("ExArea: dropped old background push t=%d layer=%08X tex=%08X", t, a[3], a[5]);
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (drop) {
+            if (prev) prev[0] = (unsigned)(uintptr_t)next;
+            else *headp = next;
+            ((PF_Free)(uintptr_t)0x436b1d)(n);
+            dropped++;
+        } else {
+            prev = n;
+        }
+        n = next;
+    }
+    Log("ExArea: skipped to frame %d (area %d), removed %d event(s) (%d old background push(es))",
+        target, area + 1, dropped, bgDropped);
+}
+
+static void ExLogProgress(int frame) {
+    unsigned *n = *(unsigned**)(uintptr_t)0x4ea1d8;
+    int total = 0, bgm = 0;
+
+    for (; n; n = (unsigned*)n[0]) {
+        total++;
+        if (n[2] == 6) bgm++;
+    }
+    Log("ExArea: waiting for BGM event of area %d: frame=%d queue=%d bgm_events=%d",
+        g_exArea + 1, frame, total, bgm);
+}
+
+/* The insert hook may miss an event that was already queued.  Resolve the selected area's
+   BGM marker from the live queue too, so the jump does not depend only on insertion tracking. */
+static int ExFindBgmTime(int bgmId) {
+    unsigned *n = *(unsigned**)(uintptr_t)0x4ea1d8;
+    for (; n; n = (unsigned*)n[0]) {
+        if (n[2] == 6) {
+            unsigned *a = (unsigned*)n[3];
+            if (a && (int)a[3] == bgmId) return (int)n[1];
+        }
+    }
+    return 0;
+}
+
+/* Replay one complete normal stage tick (the update block at 0x413c39). The event-dispatch
+   call inside that routine is hooked, so EventDispatchHook bypasses its Practice logic while
+   this guard is set and lets the game's original dispatcher run. */
+static int ExRunStageFrame(int frame) {
+    typedef unsigned char (__cdecl *PF_Update)(void);
+    unsigned char ok;
+
+    *(volatile int*)(uintptr_t)0x4dadf8 = frame;
+    g_exSimulatingStageFrame = 1;
+    ok = ((PF_Update)(uintptr_t)0x413c39)();
+    g_exSimulatingStageFrame = 0;
+    return ok && *(volatile int*)(uintptr_t)0x4dadf8 == frame + 1;
+}
+
+/*
+ * Run the stage's frame loop up to `target` without drawing, matching the scene update 0x413ab0.
+ * The background layers
+ * (type 2..5 events + layer update 0x427e60) are state machines: type 2 appends textures to a
+ * per-layer queue, the layer update pops tiles into 3 slots as the scroll offset (+0xc, advanced by
+ * the speed array 0x4e9a80) passes the tile height, and type 5 sets how many tiles of the queue are
+ * recycled.  Running only the events at once leaves the queue/offset in the Area 1 state, so the
+ * layers are brought to the state of a natural run by simulating the frames.
+ */
+static void ExFastForward(int from, int target) {
+    int f;
+
+    /* `from` is the first frame whose event dispatch has not run yet.  The frames before it were
+       already run by the game itself (the stage script has only just been started and queued its
+       events), so the simulation must continue from there.  Starting at 0 would run the object
+       update -- and so scroll the background layers -- once more than a normal playthrough. */
+    for (f = from; f < target; f++) {
+        if (!ExRunStageFrame(f)) {
+            Log("ExArea: normal frame update stopped at %d", f);
+            break;
+        }
+    }
+    *(volatile int*)(uintptr_t)0x4dadf8 = target;
+    Log("ExArea: simulated frames %d..%d of events + object update", from, target - 1);
+}
+
+/*
+ * Area background seeding.
+ *
+ * The stage's backgrounds change at their own times (type 2 events: Area 1 at 0, Area 2 at 6462,
+ * Area 3 at 10162, Area 4 at 14392 -- not at the BGM times used as the area start), and a pushed tile
+ * only appears after the tiles in front of it have scrolled out.  For a practice run the selected
+ * area should show its own background from the start, so the area's background group (all type 2..5
+ * events at the group's time) is taken out of the event queue before the frames are simulated and
+ * applied afterwards: the layer's tile queue and its tile slots/scroll offset are cleared, the area's
+ * textures are queued and its speed/cycle values set, exactly with the game's own functions
+ * (0x427d40 push, 0x428030 speed, 0x428040 accel, 0x428050 cycle count).
+ * Event args words: [2],[3] = layer (tag, payload), [4],[5] = value or texture (tag, payload);
+ * tag 0 = float bits, tag 1 = int (the only tags used by the stage script).
+ */
+typedef struct { int type; unsigned w[6]; } ExBgEv;
+typedef struct { int n; int time; ExBgEv ev[32]; } ExBgGroup;
+static ExBgGroup g_exBgGroup;
+
+typedef void (__cdecl *PF_LayerSetU)(int layer, unsigned v);
+
+static int ExValInt(unsigned tag, unsigned payload, int *ok) {
+    if (tag == 0) { float f; memcpy(&f, &payload, 4); return (int)f; }
+    if (tag == 1) return (int)payload;
+    *ok = 0;
+    return 0;
+}
+
+static unsigned ExValFloatBits(unsigned tag, unsigned payload, int *ok) {
+    if (tag == 0) return payload;
+    if (tag == 1) { float f = (float)(int)payload; unsigned b; memcpy(&b, &f, 4); return b; }
+    *ok = 0;
+    return 0;
+}
+
+/* Takes the background group of `area` (1..) out of the event queue.  Returns 1 if one was found. */
+static int ExBgExtract(int area, ExBgGroup *g) {
+    unsigned **headp = (unsigned**)(uintptr_t)0x4ea1d8;
+    unsigned *n, *prev = NULL, *next;
+    int times[16], nt = 0, i, j, tb;
+
+    g->n = 0;
+    g->time = 0;
+    if (area < 1) return 0;
+    for (n = *headp; n; n = (unsigned*)n[0]) {
+        int t = (int)n[1];
+        if ((int)n[2] != 2) continue;
+        for (i = 0; i < nt && times[i] != t; i++) ;
+        if (i == nt && nt < 16) times[nt++] = t;
+    }
+    for (i = 0; i < nt; i++)
+        for (j = i + 1; j < nt; j++)
+            if (times[j] < times[i]) { int t = times[i]; times[i] = times[j]; times[j] = t; }
+    if (area >= nt) {
+        Log("ExArea: background group %d not found (%d group(s) in queue)", area + 1, nt);
+        return 0;
+    }
+    tb = times[area];
+    g->time = tb;
+    n = *headp;
+    while (n) {
+        int ty = (int)n[2];
+        next = (unsigned*)n[0];
+        if ((int)n[1] == tb && ty >= 2 && ty <= 5 && n[3] && g->n < 32) {
+            unsigned *a = (unsigned*)n[3];
+            g->ev[g->n].type = ty;
+            for (i = 0; i < 6; i++) g->ev[g->n].w[i] = a[i];
+            g->n++;
+            if (prev) prev[0] = (unsigned)(uintptr_t)next;
+            else *headp = next;
+            ((PF_Free)(uintptr_t)0x436b1d)(n);
+        } else {
+            prev = n;
+        }
+        n = next;
+    }
+    Log("ExArea: background group of area %d: time %d, %d event(s) taken out of the queue", area + 1, tb, g->n);
+    return g->n > 0;
+}
+
+/* Empties the tile queue of a layer (list of the game: sentinel at 0x4e9a94 + layer*12, count at +4). */
+static void ExQueueClear(int layer) {
+    unsigned *sent = *(unsigned**)(uintptr_t)(0x4e9a94 + layer * 12);
+    int *cnt = (int*)(uintptr_t)(0x4e9a98 + layer * 12);
+    int guard = 0;
+
+    if (!sent) return;
+    while (*cnt > 0 && guard++ < 1000) {
+        unsigned *node = (unsigned*)sent[0];
+        if (!node || node == sent) break;
+        ((unsigned*)node[1])[0] = node[0];
+        ((unsigned*)node[0])[1] = node[1];
+        ((PF_Free)(uintptr_t)0x434fad)(node);
+        (*cnt)--;
+    }
+}
+
+/* Clears the tile slots and the scroll offset of the layer's update object (update function 0x427e60). */
+static int ExLayerObjectReset(int layer) {
+    unsigned *node;
+    int found = 0;
+
+    for (node = *(unsigned**)(uintptr_t)0x4ea1ac; node; node = (unsigned*)node[1]) {
+        unsigned *obj = (unsigned*)node[4];
+        if (!obj || IsBadReadPtr(obj, 0x824)) continue;
+        if ((obj[0x808 / 4] == 0x427e60 || obj[0x81c / 4] == 0x427e60) && (int)obj[2] == layer) {
+            Log("ExArea: layer %d object %p: offset %08X slots %08X %08X %08X -> cleared", layer,
+                (void*)obj, obj[3], obj[4], obj[5], obj[6]);
+            obj[3] = 0;
+            obj[4] = obj[5] = obj[6] = 0;
+            found++;
+        }
+    }
+    return found;
+}
+
+static void ExBgSeed(const ExBgGroup *g) {
+    int layers[4], nl = 0, i, j, ok, L;
+
+    for (i = 0; i < g->n; i++) {
+        if (g->ev[i].type != 2) continue;
+        ok = 1;
+        L = ExValInt(g->ev[i].w[2], g->ev[i].w[3], &ok);
+        if (!ok || L < 0 || L > 3) continue;
+        for (j = 0; j < nl && layers[j] != L; j++) ;
+        if (j == nl) layers[nl++] = L;
+    }
+    for (i = 0; i < nl; i++) {
+        int objs;
+        ExQueueClear(layers[i]);
+        objs = ExLayerObjectReset(layers[i]);
+        if (!objs) Log("ExArea: layer %d: update object not found, tile slots left as they are", layers[i]);
+    }
+    for (i = 0; i < g->n; i++) {
+        const ExBgEv *e = &g->ev[i];
+        ok = 1;
+        L = ExValInt(e->w[2], e->w[3], &ok);
+        if (!ok || L < 0 || L > 3) continue;
+        if (e->type == 2) {
+            int tex = ExValInt(e->w[4], e->w[5], &ok);
+            if (ok) {
+                ((PF_LayerSetU)(uintptr_t)0x427d40)(L, (unsigned)tex);
+                Log("ExArea: layer %d: queued texture %02X", L, tex);
+            }
+        } else if (e->type == 3 || e->type == 4) {
+            unsigned bits = ExValFloatBits(e->w[4], e->w[5], &ok);
+            if (ok) ((PF_LayerSetU)(uintptr_t)(e->type == 3 ? 0x428030 : 0x428040))(L, bits);
+        } else if (e->type == 5) {
+            int v = ExValInt(e->w[4], e->w[5], &ok);
+            if (ok) ((PF_LayerSetU)(uintptr_t)0x428050)(L, (unsigned)v);
+        }
+    }
+    for (i = 0; i < nl; i++)
+        Log("ExArea: layer %d queue now holds %d tile(s)", layers[i], *(int*)(uintptr_t)(0x4e9a98 + layers[i] * 12));
+}
+
+/*
+ * Which background group (0-based index of the type 2 push times of the stage script: 0 = t 0,
+ * 1 = t 6462, 2 = t 10162, 3 = t 14392, 4 = t 17392) is shown when an area is started.
+ * F8 during a practice Extra run cycles through all groups (logged) to find the right one per area.
+ */
+#define EX_BG_GROUPS 8
+static const int g_exAreaBgGroup[EX_AREA_N] = { 0, 1, 2, 3 };
+static ExBgGroup g_exBgGroups[EX_BG_GROUPS];
+static int g_exBgGroupN = 0;
+static int g_exBgCur = -1;
+
+/* Saves a copy of every background group of the event queue; removes group `sel` (>= 1) from the queue. */
+static int ExBgSaveAll(int sel) {
+    unsigned **headp = (unsigned**)(uintptr_t)0x4ea1d8;
+    unsigned *n, *prev = NULL, *next;
+    int times[EX_BG_GROUPS], nt = 0, i, j, k;
+
+    g_exBgGroupN = 0;
+    g_exBgCur = -1;
+    for (n = *headp; n; n = (unsigned*)n[0]) {
+        int t = (int)n[1];
+        if ((int)n[2] != 2) continue;
+        for (i = 0; i < nt && times[i] != t; i++) ;
+        if (i == nt && nt < EX_BG_GROUPS) times[nt++] = t;
+    }
+    for (i = 0; i < nt; i++)
+        for (j = i + 1; j < nt; j++)
+            if (times[j] < times[i]) { int t = times[i]; times[i] = times[j]; times[j] = t; }
+    for (k = 0; k < nt; k++) {
+        g_exBgGroups[k].n = 0;
+        g_exBgGroups[k].time = times[k];
+    }
+    g_exBgGroupN = nt;
+    n = *headp;
+    while (n) {
+        int ty = (int)n[2], t = (int)n[1];
+        next = (unsigned*)n[0];
+        if (ty >= 2 && ty <= 5 && n[3]) {
+            for (k = 0; k < nt && times[k] != t; k++) ;
+            if (k < nt && g_exBgGroups[k].n < 32) {
+                unsigned *a = (unsigned*)n[3];
+                ExBgEv *e = &g_exBgGroups[k].ev[g_exBgGroups[k].n++];
+                e->type = ty;
+                for (i = 0; i < 6; i++) e->w[i] = a[i];
+                if (k == sel && sel > 0) {
+                    if (prev) prev[0] = (unsigned)(uintptr_t)next;
+                    else *headp = next;
+                    ((PF_Free)(uintptr_t)0x436b1d)(n);
+                    n = next;
+                    continue;
+                }
+            }
+        }
+        prev = n;
+        n = next;
+    }
+    for (k = 0; k < nt; k++)
+        Log("ExArea: background group %d: time %d, %d event(s)%s", k + 1, g_exBgGroups[k].time,
+            g_exBgGroups[k].n, (k == sel && sel > 0) ? " (taken out of the queue)" : "");
+    return sel > 0 && sel < nt && g_exBgGroups[sel].n > 0;
+}
+
+/*
+ * Stage background state log, to compare a practice area start with the same frame of a normal
+ * Extra playthrough:  "ExBg[natural]" is logged at the start of the BGM frame of every area in a
+ * normal run, "ExBg[practice]" right after the practice jump (both before that frame's event
+ * dispatch).  Textures are shown as letters (same letter = same texture object, in order of
+ * appearance: slots first, then the tile queue); the offset/speed/accel/cycle values are exact.
+ */
+static float ExBitsToFloat(unsigned bits) {
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+static char ExPtrLabel(unsigned *seen, int *nseen, unsigned p) {
+    int i;
+    if (!p) return '-';
+    for (i = 0; i < *nseen; i++)
+        if (seen[i] == p) return (char)('A' + i);
+    if (*nseen >= 20) return '?';
+    seen[*nseen] = p;
+    return (char)('A' + (*nseen)++);
+}
+
+static void ExLogLayerState(const char *tag, int frame) {
+    int layer;
+
+    for (layer = 0; layer < 4; layer++) {
+        unsigned *node, *obj = NULL, *sent, *q;
+        unsigned seen[20], qtex[4] = { 0, 0, 0, 0 };
+        int nseen = 0, cnt, qn = 0, guard = 0;
+        char qs[24];
+        char s0, s1, s2;
+
+        for (node = *(unsigned**)(uintptr_t)0x4ea1ac; node && guard < 4096; node = (unsigned*)node[1], guard++) {
+            unsigned *o;
+            if (IsBadReadPtr(node, 20)) break;
+            o = (unsigned*)node[4];
+            if (!o || IsBadReadPtr(o, 0x824)) continue;
+            if ((o[0x808 / 4] == 0x427e60 || o[0x81c / 4] == 0x427e60) && (int)o[2] == layer) {
+                obj = o;
+                break;
+            }
+        }
+        if (!obj) continue;
+        s0 = ExPtrLabel(seen, &nseen, obj[4]);
+        s1 = ExPtrLabel(seen, &nseen, obj[5]);
+        s2 = ExPtrLabel(seen, &nseen, obj[6]);
+        sent = *(unsigned**)(uintptr_t)(0x4e9a94 + layer * 12);
+        cnt = *(int*)(uintptr_t)(0x4e9a98 + layer * 12);
+        guard = 0;
+        if (sent && !IsBadReadPtr(sent, 12)) {
+            for (q = (unsigned*)sent[0]; q && q != sent && qn < 20 && guard++ < 64; q = (unsigned*)q[0]) {
+                if (IsBadReadPtr(q, 12)) break;
+                if (qn < 4) qtex[qn] = q[2];
+                if (qn < (int)sizeof(qs) - 1) qs[qn] = ExPtrLabel(seen, &nseen, q[2]);
+                qn++;
+            }
+        }
+        if (qn > (int)sizeof(qs) - 1) qn = (int)sizeof(qs) - 1;
+        qs[qn] = 0;
+        Log("ExBg[%s] frame=%d layer %d: offset=%.3f slots=%c%c%c tex=%08X,%08X,%08X queue(%d)=%s qtex=%08X,%08X,%08X,%08X speed=%.4f accel=%.4f cycle=%u",
+            tag, frame, layer, ExBitsToFloat(obj[3]), s0, s1, s2, obj[4], obj[5], obj[6], cnt, qs,
+            qtex[0], qtex[1], qtex[2], qtex[3],
+            ExBitsToFloat(*(volatile unsigned*)(uintptr_t)(0x4e9a80 + layer * 4)),
+            ExBitsToFloat(*(volatile unsigned*)(uintptr_t)(0x4e9a74 + layer * 4)),
+            *(volatile unsigned*)(uintptr_t)(0x4e9a68 + layer * 4));
+    }
+}
+
+/*
+ * Background settling (g_ExBgMode 2).
+ *
+ * The Area's own background is only on screen some time after the Area's BGM frame (see g_ExBgMode),
+ * so the layers are run on until every tile slot and the tile queue of the layers that received the
+ * Area's tiles hold only those tiles.  This uses the game's own layer update, so the result is a state
+ * a normal run really has (scroll offset, tile order, speeds).  During these extra frames only the
+ * background events (types 2..5) are dispatched: every other stage event (enemy spawns, BGM, player
+ * spawn, ...) is taken out of the queue and put back in order afterwards, so the stage itself still
+ * starts at the BGM frame.
+ *
+ * The Area's tiles are found by watching the layer tile queues: a push appends at the tail
+ * (node = { next, prev, texture }, sentinel at 0x4e9a94 + 12 * layer), so the nodes that were added
+ * by the dispatch of the group's time are the tiles of that group.
+ */
+#define EX_SETTLE_MAX 6000
+#define EX_NEW_MAX 8
+
+typedef struct { unsigned p[EX_NEW_MAX]; int n; } ExTiles;
+
+static unsigned *ExFindLayerObj(int layer) {
+    unsigned *node;
+    int guard = 0;
+    for (node = *(unsigned**)(uintptr_t)0x4ea1ac; node && guard < 4096; node = (unsigned*)node[1], guard++) {
+        unsigned *o;
+        if (IsBadReadPtr(node, 20)) break;
+        o = (unsigned*)node[4];
+        if (!o || IsBadReadPtr(o, 0x824)) continue;
+        if ((o[0x808 / 4] == 0x427e60 || o[0x81c / 4] == 0x427e60) && (int)o[2] == layer) return o;
+    }
+    return NULL;
+}
+
+static int ExTilesHas(const ExTiles *t, unsigned p) {
+    int i;
+    for (i = 0; i < t->n; i++)
+        if (t->p[i] == p) return 1;
+    return 0;
+}
+
+/* the last `grown` nodes of the layer's tile queue were just appended */
+static void ExTilesCapture(ExTiles *t, int layer, int grown) {
+    unsigned *sent = *(unsigned**)(uintptr_t)(0x4e9a94 + layer * 12);
+    unsigned *q;
+    int i;
+
+    t->n = 0;
+    if (!sent || IsBadReadPtr(sent, 12)) return;
+    q = (unsigned*)sent[1];
+    for (i = 0; i < grown && i < EX_NEW_MAX && q && q != sent; i++) {
+        if (IsBadReadPtr(q, 12)) break;
+        t->p[t->n++] = q[2];
+        q = (unsigned*)q[1];
+    }
+}
+
+/* every tile in the layer's slots and in its queue is one of `t` */
+static int ExLayerSettled(int layer, const ExTiles *t) {
+    unsigned *obj = ExFindLayerObj(layer);
+    unsigned *sent, *q;
+    int k, nonNull = 0, guard = 0;
+
+    if (!obj) return 1;
+    for (k = 0; k < 3; k++) {
+        if (!obj[4 + k]) continue;
+        nonNull++;
+        if (!ExTilesHas(t, obj[4 + k])) return 0;
+    }
+    if (!nonNull) return 0;
+    sent = *(unsigned**)(uintptr_t)(0x4e9a94 + layer * 12);
+    if (sent && !IsBadReadPtr(sent, 12)) {
+        for (q = (unsigned*)sent[0]; q && q != sent && guard++ < 64; q = (unsigned*)q[0]) {
+            if (IsBadReadPtr(q, 12)) break;
+            if (!ExTilesHas(t, q[2])) return 0;
+        }
+    }
+    return 1;
+}
+
+static int ExAllSettled(const ExTiles *tiles) {
+    int layer;
+    for (layer = 0; layer < 4; layer++)
+        if (tiles[layer].n > 0 && !ExLayerSettled(layer, &tiles[layer])) return 0;
+    return 1;
+}
+
+/* One frame of the stage: event dispatch, then object update (same order as the scene update).  The first
+   frame at or after `gt` whose dispatch appends tiles to a layer queue gives the area's tiles. */
+static void ExStep(int f, int gt, int *captured, ExTiles *tiles) {
+    int c0[4], layer;
+
+    for (layer = 0; layer < 4; layer++) c0[layer] = *(volatile int*)(uintptr_t)(0x4e9a98 + layer * 12);
+    if (!ExRunStageFrame(f)) return;
+    if (!*captured && f >= gt) {
+        int any = 0;
+        for (layer = 0; layer < 4; layer++) {
+            int c1 = *(volatile int*)(uintptr_t)(0x4e9a98 + layer * 12);
+            if (c1 > c0[layer]) {
+                ExTilesCapture(&tiles[layer], layer, c1 - c0[layer]);
+                any = 1;
+            }
+        }
+        if (any) *captured = 1;
+    }
+}
+
+/* merge two lists of event nodes sorted by time; on equal times `a` goes first */
+static unsigned *ExMerge(unsigned *a, unsigned *b) {
+    unsigned *head = NULL, *tail = NULL, *n;
+
+    while (a || b) {
+        if (a && (!b || (int)a[1] <= (int)b[1])) {
+            n = a;
+            a = (unsigned*)a[0];
+        } else {
+            n = b;
+            b = (unsigned*)b[0];
+        }
+        n[0] = 0;
+        if (tail) tail[0] = (unsigned)(uintptr_t)n;
+        else head = n;
+        tail = n;
+    }
+    return head;
+}
+
+/* `gt` = time of the area's background group */
+static void ExSimulateSettled(int from, int target, int gt) {
+    unsigned **headp = (unsigned**)(uintptr_t)0x4ea1d8;
+    unsigned *n, *bgH = NULL, *bgT = NULL, *hH = NULL, *hT = NULL;
+    ExTiles tiles[4];
+    int captured = 0, f, extra, heldN = 0, layer;
+
+    memset(tiles, 0, sizeof(tiles));
+    for (f = from; f < target; f++) ExStep(f, gt, &captured, tiles);
+    *(volatile int*)(uintptr_t)0x4dadf8 = target;
+    Log("ExArea: simulated frames %d..%d of events + object update", from, target - 1);
+
+    if (captured && ExAllSettled(tiles)) {
+        Log("ExArea: background of the area (group time %d) is already on screen at frame %d", gt, target);
+        return;
+    }
+    if (!captured && gt <= target) {
+        Log("ExArea: background settle skipped: no tiles were pushed at group time %d", gt);
+        return;
+    }
+
+    for (n = *headp; n; ) {
+        unsigned *next = (unsigned*)n[0];
+        n[0] = 0;
+        if ((int)n[2] >= 2 && (int)n[2] <= 5) {
+            if (bgT) bgT[0] = (unsigned)(uintptr_t)n;
+            else bgH = n;
+            bgT = n;
+        } else {
+            if (hT) hT[0] = (unsigned)(uintptr_t)n;
+            else hH = n;
+            hT = n;
+            heldN++;
+        }
+        n = next;
+    }
+    *headp = bgH;
+    for (extra = 0; extra < EX_SETTLE_MAX; extra++) {
+        ExStep(target + extra, gt, &captured, tiles);
+        if (captured && ExAllSettled(tiles)) {
+            extra++;
+            break;
+        }
+    }
+    *headp = ExMerge(hH, *headp);
+    *(volatile int*)(uintptr_t)0x4dadf8 = target;
+    for (layer = 0; layer < 4; layer++)
+        if (tiles[layer].n > 0)
+            Log("ExArea: background settle: layer %d received %d tile(s)", layer, tiles[layer].n);
+    Log("ExArea: background settle: ran %d extra frame(s) (group time %d, %d other event(s) held back)%s",
+        extra, gt, heldN, (extra >= EX_SETTLE_MAX) ? " -- LIMIT REACHED, tiles not settled" : "");
+}
+
+static unsigned char __cdecl EventDispatchHook(int frame) {
+    static int f9prev = 0;
+    if (g_exSimulatingStageFrame)
+        return ((PF_EventDispatch)(uintptr_t)0x430020)(frame);
+    int f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (f9 && !f9prev && *(volatile int*)(uintptr_t)0x4dade4 == 4)
+        Log("ExArea: marker frame=%d", frame);
+    f9prev = f9;
+    if (*(volatile int*)(uintptr_t)0x4dade4 == 4 && !g_exRun) {
+        int ai;
+        for (ai = 0; ai < EX_AREA_N; ai++)
+            if (frame == g_exAreaDefaultFrame[ai]) ExLogLayerState("natural", frame);
+    }
+    {
+        static int f8prev = 0;
+        int f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+        if (g_ExBgDebugKeys && f8 && !f8prev && g_exBgGroupN > 0 && g_exRun && *(volatile int*)(uintptr_t)0x4dade4 == 4) {
+            g_exBgCur = (g_exBgCur + 1) % g_exBgGroupN;
+            ExBgSeed(&g_exBgGroups[g_exBgCur]);
+            Log("ExArea: F8 background group %d/%d (time %d)", g_exBgCur + 1, g_exBgGroupN,
+                g_exBgGroups[g_exBgCur].time);
+        }
+        f8prev = f8;
+    }
+    if (g_exPending && frame == 0 && *(volatile int*)(uintptr_t)0x4dade4 == 4) {
+        g_exPending = 0;
+        ExLogQueue();
+    }
+    if (g_exSkipWait && *(volatile int*)(uintptr_t)0x4dade4 == 4) {
+        int bgmId = (g_exArea >= 0 && g_exArea < EX_AREA_N) ? g_exAreaBgm[g_exArea] : -1;
+        if (bgmId < 0 || bgmId >= EX_BGM_IDS) {
+            g_exSkipWait = 0;
+            Log("ExArea: invalid selected area index %d, skip cancelled", g_exArea);
+            return ((PF_EventDispatch)(uintptr_t)0x430020)(frame);
+        }
+        int target = g_exBgmTime[bgmId];
+        int haveBg;
+        if (target <= 0) target = ExFindBgmTime(bgmId);
+        if (target <= 0 && g_exArea >= 0 && g_exArea < EX_AREA_N && !g_exShorten)
+            target = g_exAreaDefaultFrame[g_exArea];
+        if (target > 0) {
+            int startFrame = frame;
+            int sel = (g_exArea >= 0 && g_exArea < EX_AREA_N) ? g_exAreaBgGroup[g_exArea] : 0;
+            int areaBgMode = g_ExBgMode;
+            g_exSkipWait = 0;
+            if (areaBgMode == 0) {
+                haveBg = ExBgSaveAll(sel);
+                ExSkipTo(target, g_exArea);
+                ExFastForward(startFrame, target);
+                if (haveBg) {
+                    g_exBgCur = sel;
+                    ExBgSeed(&g_exBgGroups[sel]);
+                }
+            } else {
+                /* Continue the game's own frame loop from the current frame. */
+                ExBgSaveAll(-1);
+                ExSkipTo(target, g_exArea);
+                if (areaBgMode == 2 && sel >= 0 && sel < g_exBgGroupN)
+                    ExSimulateSettled(startFrame, target, g_exBgGroups[sel].time);
+                else
+                    ExFastForward(startFrame, target);
+            }
+            *(volatile int*)(uintptr_t)0x4dadf8 = target;
+            ExLogLayerState("practice", target);
+            Log("ExArea: Area %d/%d jump to frame %d from frame %d (bgmId=%d, background mode %d)",
+                g_exArea + 1, g_exAreaN, target, startFrame, bgmId,
+                areaBgMode);
+            frame = target;
+        } else if (frame > 1500) {
+            g_exSkipWait = 0;
+            Log("ExArea: BGM event of area %d not seen, no skip", g_exArea + 1);
+        } else if (frame % 60 == 0) {
+            ExLogProgress(frame);
+        }
+    }
+    return ((PF_EventDispatch)(uintptr_t)0x430020)(frame);
+}
+
+typedef void (__cdecl *PF_EventInsert)(int time, void *node);
+
+/* Event creators (0x42fe60..0x430020) insert every stage event through 0x42fe30(time, node). */
+static void __cdecl EventInsertHook(int time, unsigned *node) {
+    if (node && *(volatile int*)(uintptr_t)0x4dade4 == 4) {
+        int ty = (int)node[2];
+        if (ty == 6) {
+            unsigned *b = (unsigned*)node[3];
+            if (b && b[3] < EX_BGM_IDS) {
+                g_exBgmTime[b[3]] = time;
+                Log("ExArea: BGM id %u scheduled at frame %d", b[3], time);
+            }
+        }
+        if (ty != 0) {
+            unsigned *a = (unsigned*)node[3];
+            Log("ExArea: +ev frame=%d t=%d type=%d args=%08X %08X %08X %08X %08X %08X",
+                *(volatile int*)(uintptr_t)0x4dadf8, time, ty,
+                a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0, a ? a[3] : 0, a ? a[4] : 0, a ? a[5] : 0);
+        }
+    }
+    ((PF_EventInsert)(uintptr_t)0x42fe30)(time, node);
+}
+
+static int PatchEventInsertLog(void) {
+    DWORD a;
+    int n = 0;
+
+    for (a = 0x42fe60; a < 0x430020; a++)
+        if (*(unsigned char*)(uintptr_t)a == 0xe8 &&
+            (DWORD)(a + 5 + *(DWORD*)(uintptr_t)(a + 1)) == 0x42fe30)
+            n += HookCall(a, 0x42fe30, (void*)&EventInsertHook);
+    return n;
+}
+
+static void PatchExAreaSelect(void) {
+    int n = 0;
+
+    if (!g_ExAreaSelect) return;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("ExArea: unexpected image base, skipped");
+        return;
+    }
+    n += HookCall(0x423791, 0x420c90, (void*)&PracticeUpdateHook);
+    n += HookCall(0x42407f, 0x420de0, (void*)&PracticeDrawHook);
+    n += HookCall(0x413c45, 0x430020, (void*)&EventDispatchHook);
+    Log("ExArea: patched %d/3 call sites", n);
+    Log("ExArea: event insert log: %d call site(s) hooked", PatchEventInsertLog());
 }
 
 /*
@@ -1201,6 +2390,9 @@ static HRESULT STDMETHODCALLTYPE WDD7_CreateSurface(IDirectDraw7 *self, LPDDSURF
             (unsigned long)d->dwFlags, (int)d->dwBackBufferCount, hr);
     else if (hr < 0)
         Log("DD7.CreateSurface -> hr=%08X", hr);
+    if (hr < 0 && g_fullscreenRequested && d &&
+        (d->dwFlags & DDSD_CAPS) && (d->ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE))
+        TriggerWindowFallback("CreateSurface(primary) failed");
     if (hr >= 0 && g_LowLatency && d && s && *s &&
         (d->dwFlags & DDSD_CAPS) && (d->ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE))
         HookPrimary(*s);
@@ -1267,16 +2459,18 @@ static HRESULT STDMETHODCALLTYPE WDD7_SetCooperativeLevel(IDirectDraw7 *self, HW
     if (g_StripAllowModeX && (flags & DDSCL_ALLOWMODEX)) {
         flags &= ~DDSCL_ALLOWMODEX;
     }
+    if (flags & DDSCL_EXCLUSIVE) g_fullscreenRequested = 1;
     HRESULT hr = IDirectDraw7_SetCooperativeLevel(w7->orig, hwnd, flags);
     Log("DD7.SetCooperativeLevel hwnd=%p flags=%X -> hr=%08X",
         (void*)hwnd, (unsigned)flags, hr);
     if (hr >= 0 || !g_RetryCoopLevel) return hr;
 
     if (flags & DDSCL_EXCLUSIVE) {
-        DWORD f = DDSCL_EXCLUSIVE | DDSCL_FULLSCREEN | DDSCL_ALLOWREBOOT;
+        DWORD f = DDSCL_EXCLUSIVE | DDSCL_FULLSCREEN;
         hr = IDirectDraw7_SetCooperativeLevel(w7->orig, hwnd, f);
         Log("DD7.SetCooperativeLevel retry1 flags=%X -> hr=%08X", f, hr);
         if (hr >= 0) return hr;
+        TriggerWindowFallback("SetCooperativeLevel(exclusive) failed");
     }
     {
         DWORD f = DDSCL_NORMAL | DDSCL_NOWINDOWCHANGES;
@@ -1297,14 +2491,12 @@ static HRESULT STDMETHODCALLTYPE WDD7_SetDisplayMode(IDirectDraw7 *self, DWORD w
     HRESULT hr = IDirectDraw7_SetDisplayMode(w7->orig, wd, ht, bpp, refresh, flags);
     Log("DD7.SetDisplayMode %lux%lux bpp=%lu refresh=%lu f=%X -> hr=%08X",
         (unsigned long)wd, (unsigned long)ht, (unsigned long)bpp, (unsigned long)refresh, (unsigned)flags, hr);
-    if (hr < 0 && g_RetryDisplayMode && !(refresh == 0 && flags == 0)) {
-        hr = IDirectDraw7_SetDisplayMode(w7->orig, wd, ht, bpp, 0, 0);
-        Log("DD7.SetDisplayMode refresh/flags retry -> hr=%08X", hr);
-    }
-    if (hr < 0 && g_RetryDisplayMode) {
-        DWORD b2 = (bpp == 32) ? 16 : 32;
-        hr = IDirectDraw7_SetDisplayMode(w7->orig, wd, ht, b2, 0, 0);
-        Log("DD7.SetDisplayMode bpp retry -> %lu -> hr=%08X", (unsigned long)b2, hr);
+    if (hr < 0 && g_RetryDisplayMode)
+        hr = TrySetDisplayMode(w7->orig, wd, ht, bpp, refresh, flags);
+    if (hr < 0) {
+        g_displayModeFailures++;
+        if (bpp <= 16 || g_displayModeFailures >= 2)
+            TriggerWindowFallback("SetDisplayMode failed");
     }
     return hr;
 }
@@ -1481,14 +2673,20 @@ __declspec(dllexport) HRESULT WINAPI DllUnregisterServer(void) {
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
-        LoadReal();
+        LogOpen();
+        QueryPerformanceFrequency(&g_qpcFreq);
         Log("process attach (pid=%lu)", GetCurrentProcessId());
+        LogWindowsVersion();
+        InitFallbackInstance();
+        PatchColorDepth32();
+        PatchForceWindowMode();
         PatchTitleCancel();
         PatchOptionDefaults();
         PatchPauseKeys();
         PatchResultRetry();
         PatchReplayStage();
         PatchPracticePower();
+        PatchExAreaSelect();
         PatchPauseAudio();
         PatchSoundFix();
         break;
