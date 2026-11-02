@@ -1,2 +1,4 @@
 build/
 .opencode/
+d3d9.dll
+ddraw.dll

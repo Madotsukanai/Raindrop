@@ -12,6 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+
+
+
+
 static FILE *g_log = NULL;
 static const int g_LogAll = 0;
 static const int g_StripAllowModeX = 1;
@@ -26,6 +30,7 @@ static const int g_RetryDisplayMode = 1;
 static const int g_LowLatency = SMD_LOWLATENCY;
 static const int g_UseDwmFlush = SMD_DWMFLUSH;
 static const int g_StatsIntervalMs = 5000;
+static const int g_KeyLatencyStats = 0;
 static const int g_WaitTimeoutMs = 50;
 static const int g_ForceColorDepth32 = 1;
 static const int g_AutoWindowFallback = 1;
@@ -203,6 +208,10 @@ static void PatchForceWindowMode(void) {
     Log("ForceWindow: patched (WndMode is forced on)");
 }
 
+
+
+
+
 typedef HRESULT (STDMETHODCALLTYPE *PF_Blt)(IDirectDrawSurface7*, LPRECT, LPDIRECTDRAWSURFACE7, LPRECT, DWORD, LPDDBLTFX);
 typedef HRESULT (STDMETHODCALLTYPE *PF_Flip)(IDirectDrawSurface7*, LPDIRECTDRAWSURFACE7, DWORD);
 typedef HRESULT (WINAPI *PF_DwmFlush)(void);
@@ -226,6 +235,20 @@ static Stat g_stInterval, g_stGame, g_stOrig, g_stWait, g_stDwm, g_stLatFirst, g
 static LONGLONG g_frames = 0, g_timeouts = 0, g_presses = 0;
 static LONGLONG g_prevDone = 0, g_winStart = 0;
 static int g_lastFlip = 0;
+static double g_fwSleptMs = 0.0;
+static unsigned g_fwSleeps = 0, g_fwSpins = 0;
+static double g_cpuPrevMs = 0.0;
+static unsigned g_stQuads = 0, g_stBatchCalls = 0, g_stPass = 0, g_stTexApplied = 0, g_stTexSkipped = 0;
+static int g_batchInstalled = 0;
+
+static double ProcessCpuMs(void) {
+    FILETIME c, e, k, u;
+    ULARGE_INTEGER kk, uu;
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 0.0;
+    kk.LowPart = k.dwLowDateTime; kk.HighPart = k.dwHighDateTime;
+    uu.LowPart = u.dwLowDateTime; uu.HighPart = u.dwHighDateTime;
+    return (double)(kk.QuadPart + uu.QuadPart) / 10000.0;
+}
 
 static void StatAdd(Stat *s, double v) {
     s->n++;
@@ -291,6 +314,20 @@ static void FlushStats(LONGLONG now) {
     Log("  key presses=%lld | press->next present done avg=%.2f max=%.2f ms (n=%lld) | press->frame started after press done avg=%.2f max=%.2f ms (n=%lld)",
         (long long)g_presses, StatAvg(&g_stLatFirst), g_stLatFirst.max, (long long)g_stLatFirst.n,
         StatAvg(&g_stLatGuar), g_stLatGuar.max, (long long)g_stLatGuar.n);
+    {
+        double cpu = ProcessCpuMs();
+        Log("  process cpu=%.1f%% of one core (%.0f ms in %.1fs) | frame wait sleeps=%u slept=%.1f ms spins=%u",
+            sec > 0 ? (cpu - g_cpuPrevMs) / (sec * 10.0) : 0.0, cpu - g_cpuPrevMs, sec,
+            g_fwSleeps, g_fwSleptMs, g_fwSpins);
+        g_cpuPrevMs = cpu;
+        g_fwSleeps = 0;
+        g_fwSpins = 0;
+        g_fwSleptMs = 0.0;
+        Log("  draw batching: %s quads=%u in %u draw calls, other draws=%u | texture sets applied=%u skipped=%u",
+            g_batchInstalled ? "on" : "off", g_stQuads, g_stBatchCalls, g_stPass, g_stTexApplied,
+            g_stTexSkipped);
+        g_stQuads = g_stBatchCalls = g_stPass = g_stTexApplied = g_stTexSkipped = 0;
+    }
     memset(&g_stInterval, 0, sizeof(Stat));
     memset(&g_stGame, 0, sizeof(Stat));
     memset(&g_stOrig, 0, sizeof(Stat));
@@ -371,15 +408,28 @@ static void MeasureInit(void) {
         HMODULE dwm = LoadLibraryA("dwmapi.dll");
         if (dwm) g_pDwmFlush = (PF_DwmFlush)GetProcAddress(dwm, "DwmFlush");
     }
-    HANDLE th = CreateThread(NULL, 0, KeyThread, NULL, 0, NULL);
-    if (th) CloseHandle(th);
+    HANDLE th = NULL;
+    {
+        typedef UINT (WINAPI *PF_TBP2)(UINT);
+        HMODULE mm = LoadLibraryA("winmm.dll");
+        PF_TBP2 tbp = mm ? (PF_TBP2)(void*)GetProcAddress(mm, "timeBeginPeriod") : NULL;
+        if (tbp) tbp(1);
+    }
+    if (g_KeyLatencyStats) {
+        th = CreateThread(NULL, 0, KeyThread, NULL, 0, NULL);
+        if (th) CloseHandle(th);
+    }
     g_measureReady = 1;
     Log("Measure: lowlatency=%d dwmflush=%d dwmapi=%s keythread=%s interval=%dms",
-        g_LowLatency, g_UseDwmFlush, g_pDwmFlush ? "ok" : "none", th ? "ok" : "failed", g_StatsIntervalMs);
+        g_LowLatency, g_UseDwmFlush, g_pDwmFlush ? "ok" : "none",
+        th ? "ok" : (g_KeyLatencyStats ? "failed" : "off"), g_StatsIntervalMs);
 }
+
+static void BatchFlush(void);
 
 static HRESULT STDMETHODCALLTYPE Hook_Blt(IDirectDrawSurface7 *self, LPRECT dr, LPDIRECTDRAWSURFACE7 src, LPRECT sr, DWORD flags, LPDDBLTFX fx) {
     LARGE_INTEGER a, b;
+    BatchFlush();
     QueryPerformanceCounter(&a);
     HRESULT hr = g_origBlt(self, dr, src, sr, flags, fx);
     QueryPerformanceCounter(&b);
@@ -389,6 +439,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Blt(IDirectDrawSurface7 *self, LPRECT dr, 
 
 static HRESULT STDMETHODCALLTYPE Hook_Flip(IDirectDrawSurface7 *self, LPDIRECTDRAWSURFACE7 target, DWORD flags) {
     LARGE_INTEGER a, b;
+    BatchFlush();
     QueryPerformanceCounter(&a);
     HRESULT hr = g_origFlip(self, target, flags);
     QueryPerformanceCounter(&b);
@@ -414,19 +465,23 @@ static void HookPrimary(IDirectDrawSurface7 *s) {
     Log("LowLatency: primary surface %p hooked (Blt/Flip)", (void*)s);
 }
 
-/*
- * Title screen: Cancel -> move cursor to Exit, Cancel again -> same as deciding Exit.
- *
- * Rain.exe title update function (0x422fa0, thiscall, ecx = title object):
- *   +0x2324c : selected menu index (0..6, 6 = Exit)
- *   +0x08    : state (8 = exit sequence)
- *   input object = *(void**)0x46bbec
- *   0x431540(input, id): button pressed (edge), 0x431500(input, vk): key pressed (edge)
- * Original code treats button 5 (cancel) as "ignore" and only button 7 moves the
- * cursor to Exit.  The hook below makes 5 / 7 / Esc all act as cancel, and when the
- * cursor is already on Exit it goes through the normal decide path (0x423447:
- * decide sound -> jump table -> state 8).
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 static const int g_TitleCancelExit = 1;
 
 typedef unsigned char (__attribute__((thiscall)) *PF_InputKey)(void *self, int id);
@@ -469,30 +524,30 @@ static void PatchTitleCancel(void) {
     }
 
     memset(patch, 0x90, sizeof(patch));
-    /* mov ecx,[0x46bbec] */
+
     patch[0] = 0x8b; patch[1] = 0x0d; patch[2] = 0xec; patch[3] = 0xbb; patch[4] = 0x46; patch[5] = 0x00;
-    /* push ecx */
+
     patch[6] = 0x51;
-    /* call TitleCancelHook (at 0x4233fd) */
+
     patch[7] = 0xe8;
     rel = (DWORD)(uintptr_t)&TitleCancelHook - (addrA + 7 + 5);
     memcpy(&patch[8], &rel, 4);
-    /* add esp,4 */
+
     patch[12] = 0x83; patch[13] = 0xc4; patch[14] = 0x04;
-    /* test al,al */
+
     patch[15] = 0x84; patch[16] = 0xc0;
-    /* je 0x42355a (at 0x423407, next ip 0x42340d) */
+
     patch[17] = 0x0f; patch[18] = 0x84;
     rel = 0x42355a - (addrA + 17 + 6);
     memcpy(&patch[19], &rel, 4);
-    /* patch[23..41] stay NOP (up to 0x423420) */
+
 
     if (!VirtualProtect(pa, 0x40, PAGE_EXECUTE_READWRITE, &old)) {
         Log("TitleCancel: VirtualProtect failed (err=%08X)", GetLastError());
         return;
     }
     memcpy(pa, patch, sizeof(patch));
-    /* cursor already on Exit: je 0x423553 (state 8 directly) -> je 0x423447 (decide path) */
+
     rel = 0x423447 - 0x42342c;
     memcpy((unsigned char*)0x423428, &rel, 4);
     VirtualProtect(pa, 0x40, old, &old);
@@ -500,19 +555,19 @@ static void PatchTitleCancel(void) {
     Log("TitleCancel: patched (hook=%p)", (void*)&TitleCancelHook);
 }
 
-/*
- * Option screen: D key restores default settings (defaults = config.txt values).
- *
- * Option screen object = title object + 0x5730 (updated by 0x41b270 from title state 3).
- *   +0x3308 : page (0 top menu, 1 game options, 2 key config, 3 leaving)
- *   game options page: +0x3314 Rest (initial lives; the game's g_ScreenMode/0x46c7c4, used as
- *                      the start lives by the retry function 0x419d10), +0x3318 FPS-1,
- *                      +0x331c hitrect-off, +0x3320 BGM-off, +0x3324 BGM vol,
- *                      +0x3328 SE-off,  +0x332c SE vol
- *   key config page  : rows are set with 0x41bf60(this, row, pad, type, key), exactly like the
- *                      game's own "default" row.  0x4e9240 != 0 while waiting for a key.
- * The hook replaces the `call 0x41b270` at 0x423650 and calls the original afterwards.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
 static const int g_OptionDefaultKey = 1;
 
 typedef unsigned char (__attribute__((fastcall)) *PF_OptionUpdate)(void *opt);
@@ -537,20 +592,20 @@ static unsigned char __attribute__((fastcall)) OptionUpdateHook(void *opt) {
         if (rawkey(input, 0x44)) {
             PF_PlaySe playSe = (PF_PlaySe)(uintptr_t)0x412210;
             if (page == 1) {
-                OPT_F(opt, 0x3314) = 4;    /* Rest=4 */
-                OPT_F(opt, 0x3318) = 3;    /* FPS=4 (60fps) */
-                OPT_F(opt, 0x331c) = 1;    /* ShowHitRect=off */
-                OPT_F(opt, 0x3320) = 0;    /* EnableBGM=on */
-                OPT_F(opt, 0x3324) = 100;  /* BGMVolume=100 */
-                OPT_F(opt, 0x3328) = 0;    /* EnableSE=on */
-                OPT_F(opt, 0x332c) = 80;   /* SEVolume=80 */
+                OPT_F(opt, 0x3314) = 4;
+                OPT_F(opt, 0x3318) = 3;
+                OPT_F(opt, 0x331c) = 1;
+                OPT_F(opt, 0x3320) = 0;
+                OPT_F(opt, 0x3324) = 100;
+                OPT_F(opt, 0x3328) = 0;
+                OPT_F(opt, 0x332c) = 80;
                 ((PF_SetVolume)(uintptr_t)0x4117c0)(OptionVolume(OPT_F(opt, 0x3320), OPT_F(opt, 0x3324)));
                 ((PF_SetVolume)(uintptr_t)0x4120e0)(OptionVolume(OPT_F(opt, 0x3328), OPT_F(opt, 0x332c)));
             } else {
                 PF_SetKeyRow setRow = (PF_SetKeyRow)(uintptr_t)0x41bf60;
                 int i;
-                for (i = 0; i < 4; i++) setRow(opt, i, 0, i + 1, 0);      /* Up/Left/Down/Right */
-                for (i = 4; i < 8; i++) setRow(opt, i, 0, 0, i - 4);      /* Button1..4 */
+                for (i = 0; i < 4; i++) setRow(opt, i, 0, i + 1, 0);
+                for (i = 4; i < 8; i++) setRow(opt, i, 0, 0, i - 4);
             }
             playSe((void*)(uintptr_t)0x4ea3a8, 0, 0xff);
         }
@@ -580,35 +635,35 @@ static void PatchOptionDefaults(void) {
         return;
     }
     rel = (DWORD)(uintptr_t)&OptionUpdateHook - (addr + 6 + 5);
-    memcpy(p + 7, &rel, 4);   /* call 0x41b270 -> call OptionUpdateHook */
+    memcpy(p + 7, &rel, 4);
     VirtualProtect(p, sizeof(orig), old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
     Log("OptionDefault: patched (hook=%p)", (void*)&OptionUpdateHook);
 }
 
-/*
- * Pause menu: Q -> back to title, R -> retry.
- *
- * In-game scene update (0x413ab0) opens the pause menu with button 7 and, while the menu is
- * active (DAT_004dae16 != 0), calls the menu update 0x419b30 (this = DAT_004dae08):
- *   +0x538 : menu state (6 = idle/open, 4 = "title" chosen, 5 = "retry" chosen,
- *            3 = closing, 1 = resumed).  States 4/5 fade out and then run the game's own
- *            title switch (FUN_004254d0(1,0)) / restart (FUN_00419d10).
- * The hook replaces the `call 0x419b30` at 0x413d26 and forces state 4/5 on Q/R.
- * Replay playback: the game opens no pause menu while a replay is played (button 7 stops the replay).
- * PatchReplayPause turns that branch into the normal pause open path.  While the menu is open the
- * input object's playback flag (+0x234) is cleared so the menu reads the real keys instead of the
- * replay data, and it is set again when the menu is closed (PauseReplayRestore, called from the stage
- * frame / input query hooks).  The stage frame loop does not run while paused, so the replay position
- * is kept. Title / Q stops the replay (0x432020, like the old button 7 exit). Retry / R reloads
- * the same replay file at stage 1 through the game's replay loader.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 static const int g_PauseQRKey = 1;
 
 static const int g_ReplayPause = 1;
-static int g_pauseSeen = 0;           /* a pause session is running (set on its first menu update) */
-static int g_pauseReplay = 0;         /* ... and it was opened while a replay was playing */
-static int g_pauseReplayHandled = 0;  /* ... and a title/retry transition has been requested */
+static int g_pauseSeen = 0;
+static int g_pauseReplay = 0;
+static int g_pauseReplayHandled = 0;
 static int g_replayFileId = -1;
 static int g_replayStage = 1;
 static int g_replayFileIdCaptured = 0;
@@ -618,10 +673,10 @@ typedef void (__attribute__((thiscall)) *PF_ReplayStop)(void *input);
 typedef int (__attribute__((thiscall)) *PF_ReplayLoad)(void *input, int replayId, int stage);
 typedef void (__cdecl *PF_SceneSwitch)(int a, int b);
 
-/* Called at the start of every stage frame and input query: once the pause menu is closed again,
- * hand the input object back to the replay. */
+
+
 static void PauseReplayRestore(void) {
-    if (*(volatile unsigned char*)(uintptr_t)0x4dae16 != 0) return;   /* menu still open */
+    if (*(volatile unsigned char*)(uintptr_t)0x4dae16 != 0) return;
     if (g_pauseReplay && !g_pauseReplayHandled) {
         void *input = *(void**)(uintptr_t)0x46bbec;
         if (input) {
@@ -641,15 +696,15 @@ static void __attribute__((fastcall)) PauseUpdateHook(void *menu) {
         if (g_ReplayPause && *((volatile unsigned char*)input + 0x234)) {
             g_pauseReplay = 1;
             g_pauseReplayHandled = 0;
-            *((volatile unsigned char*)input + 0x234) = 0;   /* menu uses the real keys */
+            *((volatile unsigned char*)input + 0x234) = 0;
             Log("ReplayPause: pause menu opened during replay playback");
         }
     }
     if (input && menu && OPT_F(menu, 0x538) == 6) {
         PF_InputKey rawkey = (PF_InputKey)(uintptr_t)0x431500;
         int next = 0;
-        if (rawkey(input, 0x51)) next = 4;                          /* Q: title */
-        else if (rawkey(input, 0x52)) next = 5;                    /* R: retry/restart */
+        if (rawkey(input, 0x51)) next = 4;
+        else if (rawkey(input, 0x52)) next = 5;
         if (next) {
             ((PF_PlaySe)(uintptr_t)0x412210)((void*)(uintptr_t)0x4ea3a8, 0, 0xff);
             OPT_F(menu, 0x538) = next;
@@ -658,12 +713,12 @@ static void __attribute__((fastcall)) PauseUpdateHook(void *menu) {
     ((PF_PauseUpdate)(uintptr_t)0x419b30)(menu);
     if (g_pauseReplay && !g_pauseReplayHandled && input && menu) {
         int st = OPT_F(menu, 0x538);
-        if (st == 4) {              /* title: stop the replay like the old button 7 exit */
+        if (st == 4) {
             *((volatile unsigned char*)input + 0x234) = 1;
             ((PF_ReplayStop)(uintptr_t)0x432020)(input);
             g_pauseReplayHandled = 1;
             Log("ReplayPause: title chosen, replay stopped");
-        } else if (st == 5) {       /* retry: ReplayRetryHook reloads the file at stage 1 */
+        } else if (st == 5) {
             g_pauseReplayHandled = 1;
         }
     }
@@ -691,18 +746,18 @@ static void PatchPauseKeys(void) {
         return;
     }
     rel = (DWORD)(uintptr_t)&PauseUpdateHook - (addr + 6 + 5);
-    memcpy(p + 7, &rel, 4);   /* call 0x419b30 -> call PauseUpdateHook */
+    memcpy(p + 7, &rel, 4);
     VirtualProtect(p, sizeof(orig), old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
     Log("PauseKeys: patched (hook=%p)", (void*)&PauseUpdateHook);
 }
 
-/*
- * Replay pause: in the scene update 0x413ab0, button 7 pressed while a replay plays (input object
- * +0x234 != 0) runs 0x432020 + scene switch instead of opening the pause menu:
- *   413ccf: mov al,[ecx+0x234] ; 413cd5: test al,al ; 413cd7: je 0x413cec (open the pause menu)
- * The `je` is turned into `jmp`, so the replay opens the same pause menu as a normal game.
- */
+
+
+
+
+
+
 static void PatchReplayPause(void) {
     static const unsigned char orig[10] = {
         0x8a,0x81,0x34,0x02,0x00,0x00, 0x84,0xc0, 0x74,0x13
@@ -724,26 +779,26 @@ static void PatchReplayPause(void) {
         Log("ReplayPause: VirtualProtect failed (err=%08X)", GetLastError());
         return;
     }
-    p[8] = 0xeb;   /* je -> jmp */
+    p[8] = 0xeb;
     VirtualProtect(p + 8, 1, old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
     Log("ReplayPause: patched (pause menu opens during replay playback)");
 }
 
-/*
- * Result screen: retry from the pause menu keeps the score.
- *
- * The stage clear result object (DAT_004dae0c, draw function 0x417e30, this = ecx) writes
- *   DAT_004dadf0 (score) = DAT_004dade8 (shown score) = score at result start + bonuses
- * on every draw while it is fully faded in (this+8 == 0x64).  The pause menu retry
- * (0x419d10) clears both and only *requests* a scene switch (DAT_004e93c0 = next scene,
- * DAT_004e93bc = current scene); the switch happens after this frame's draw, so the draw
- * writes the old score back and the restarted game inherits it.
- * The hook replaces the `call 0x417e30` at 0x413ec2 (scene draw 0x413d30) and, when a
- * scene switch is already pending, undoes what the draw wrote to the score variables.
- * (In the normal flow the final value was already committed by earlier frames and the
- * result object is faded out by the time it switches, so nothing changes there.)
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 static const int g_ResultRetryFix = 1;
 
 typedef void (__attribute__((fastcall)) *PF_ResultDraw)(void *obj);
@@ -785,31 +840,31 @@ static void PatchResultRetry(void) {
         return;
     }
     rel = (DWORD)(uintptr_t)&ResultDrawHook - (addr + 6 + 5);
-    memcpy(p + 7, &rel, 4);   /* call 0x417e30 -> call ResultDrawHook */
+    memcpy(p + 7, &rel, 4);
     VirtualProtect(p, sizeof(orig), old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
     Log("ResultRetry: patched (hook=%p)", (void*)&ResultDrawHook);
 }
 
-/*
- * Replay menu: invisible stage choices below stage 1-3.
- *
- * Replay menu object = title object + 0x8ad0 (updated by 0x421ee0 from title state 6).
- * After a replay is chosen from the list (+0x27f4 != 0) the stage select screen shows at most 3
- * stage rows, but the number of cursor positions is taken from the replay header copy at
- * +0x2700: BYTE +0x2711 (+1), or 1 when BYTE +0x271e (extra) is set.  A header value above 2
- * therefore creates invisible choices; confirming one starts the replay with stage 4+
- * ([+0x27e8]+1 is passed to 0x431fe0), which shows the ending etc.
- * The hook replaces the `call 0x421ee0` at 0x4236b4 and clamps the menu's header copy (and the
- * cursor) to the 3 visible stages before calling the original.  The replay file is not touched.
- */
+
+
+
+
+
+
+
+
+
+
+
+
 static const int g_ReplayStageFix = 1;
 
 typedef void (__attribute__((fastcall)) *PF_ReplayUpdate)(void *obj);
 
 static void __attribute__((fastcall)) ReplayUpdateHook(void *obj) {
     unsigned char *o = (unsigned char*)obj;
-    if (o[0x27f4] != 0 && o[0x271e] == 0) {          /* stage select, not extra */
+    if (o[0x27f4] != 0 && o[0x271e] == 0) {
         if (o[0x2711] > 2) {
             Log("ReplayStage: header stage byte %u -> 2", (unsigned)o[0x2711]);
             o[0x2711] = 2;
@@ -844,25 +899,25 @@ static void PatchReplayStage(void) {
         return;
     }
     rel = (DWORD)(uintptr_t)&ReplayUpdateHook - (addr + 6 + 5);
-    memcpy(p + 7, &rel, 4);   /* call 0x421ee0 -> call ReplayUpdateHook */
+    memcpy(p + 7, &rel, 4);
     VirtualProtect(p, sizeof(orig), old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
     Log("ReplayStage: patched (hook=%p)", (void*)&ReplayUpdateHook);
 }
 
-/*
- * Replay desync fix (Proton / Wine): x87 control word.
- *
- * The game computes object positions in x87 floating point, and its replays only reproduce when every
- * run uses the same precision.  Rain.exe asks DirectDraw for DDSCL_EXCLUSIVE|FULLSCREEN|ALLOWREBOOT
- * without DDSCL_FPUPRESERVE, so on Windows Direct3D 7 switches the FPU to single precision (24 bit
- * mantissa, all exceptions masked, round to nearest = control word 0x007F) when the device is created.
- * Under Proton the control word of the game thread can be different (53 bit 0x027F, or changed by a
- * driver / audio library), which makes the simulation, and so the replay, drift.
- * The control word is forced to g_ReplayFpuCw at the start of every stage frame (event dispatch hook)
- * and at every input query; the first change and the value at every stage start are logged so a
- * mismatch with the Windows value can be seen in Smd_ddraw.log.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
 static const int g_ReplayFpuFix = 1;
 static const unsigned short g_ReplayFpuCw = 0x007F;
 static int g_fpuLogLeft = 40;
@@ -892,7 +947,7 @@ static void FpuEnforce(const char *where, int frame) {
     }
 }
 
-/* Trace the actual input-query path used by gameplay while replay data is active. */
+
 typedef unsigned char (__attribute__((thiscall)) *PF_ReplayInputQuery)(void *self, int id,
                                                                        int delay);
 static PF_ReplayInputQuery g_replayInputQueryOrig = NULL;
@@ -959,25 +1014,29 @@ static void PatchReplayInputTrace(void) {
     Log("ReplayInput: query trace hook installed");
 }
 
-/*
- * Practice start: stage 2 starts with power level 6 (6 boxes on the HUD), stage 3 with MAX.
- *
- * Power = DWORD 0x4dadd0 (0..7; the HUD draws power+1 boxes, 7 is MAX).  0x4dadd4 is the item
- * counter: power p is reached when the counter >= threshold T[p] (DWORD table at 0x45ae00 + 4*p,
- * T[0] is not used), and the HUD gauge is counter - T[p].
- * The title starts a game through 0x423880(stage) (stdcall, `ret 4`) from title state 0xb; it zeroes
- * power and counter and only requests the scene switch.  Practice start = BYTE 0x4dade0 != 0, set
- * by the stage select menu.  The hook replaces the `call 0x423880` at 0x42377f, calls the original and
- * then, for practice stage 2/3, writes the power and a matching counter.  The pause menu retry
- * (0x419d10, stdcall, stage on the stack, called from 0x419c9e/0x419cad/0x419cb9) is hooked the same
- * way, so retrying a practice stage 2/3 gives the same power.
- */
-static const int g_PracticeStage2Power = 5;   /* 5 => 6 boxes on the HUD */
-static const int g_PracticeStage3Power = 7;   /* 7 => MAX */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+static const int g_PracticeStage2Power = 5;
+static const int g_PracticeStage3Power = 7;
 
 typedef void (__stdcall *PF_GameStart)(int stage);
 
-/* Writes the practice power for `stage` (call after the game's own start/retry code has zeroed it). */
+
 static void ApplyPracticePower(int stage, const char *what) {
     if ((stage == 2 || stage == 3) && *(volatile unsigned char*)(uintptr_t)0x4dade0 != 0) {
         int p = (stage == 2) ? g_PracticeStage2Power : g_PracticeStage3Power;
@@ -991,28 +1050,28 @@ static void ApplyPracticePower(int stage, const char *what) {
     }
 }
 
-/*
- * Practice: Extra stage area select (state shared with the hooks further below).
- *
- * g_exStartReq : set by the Practice menu when the Extra row is decided
- * g_exRun      : the running Extra stage was started from the Practice menu
- * g_exPending  : at the first stage frame (frame counter 0x4dadf8 == 0) the event queue is
- *                logged and, for a practice run, fast-forwarded to the selected area
- */
+
+
+
+
+
+
+
+
 #define EX_MAX_AREAS 16
 #define EX_AREA_N 4
 #define EX_BGM_IDS 16
 #define EX_MAIN_WAIT_IP 810192
 static const int g_ExAreaSelect = 1;
-/* Background of a practice Extra area start:
- * 0: old behaviour, the selected area's own background group is seeded from a clean state.
- * 1: the exact stage state of a normal run at the area's BGM frame, including the complete scene
- *    update sequence for every simulated frame.
- * 2: like 1, then the layers are run on (with the game's own layer update, other stage events held
- *    back) until the tiles of the area's background group fill the layers. Areas 2 and 4 use this
- *    to complete their background transition while holding other stage events. */
+
+
+
+
+
+
+
 static const int g_ExBgMode = 1;
-/* F8 during a practice Extra run cycles the background groups (diagnosis only). */
+
 static const int g_ExBgDebugKeys = 0;
 static const int g_exAreaBgm[EX_AREA_N] = { 2, 3, 4, 5 };
 static const int g_exAreaDefaultFrame[EX_AREA_N] = { 362, 6612, 8962, 14192 };
@@ -1024,7 +1083,7 @@ static int g_exRun = 0;
 static int g_exPending = 0;
 static int g_exSkipWait = 0;
 static int g_exShorten = 0;
-/* Guard while replaying the game's own per-frame stage routine from the area jump. */
+
 static int g_exSimulatingStageFrame = 0;
 
 typedef unsigned char (__cdecl *PF_Op)(void *thread, void *args);
@@ -1099,14 +1158,14 @@ static void ExOnRetry(int stage) {
     }
 }
 
-/* title -> game start: replaces `call 0x423880` at 0x42377f */
+
 static void __stdcall GameStartHook(int stage) {
     ((PF_GameStart)(uintptr_t)0x423880)(stage);
     ExOnGameStart(stage);
     ApplyPracticePower(stage, "start");
 }
 
-/* pause menu retry: replaces the three `call 0x419d10` in 0x419b30 (stdcall, stage on the stack) */
+
 static void __stdcall RetryHook(int stage) {
     if (g_pauseReplay) {
         void *input = *(void**)(uintptr_t)0x46bbec;
@@ -1126,7 +1185,7 @@ static void __stdcall RetryHook(int stage) {
     ApplyPracticePower(stage, "retry");
 }
 
-/* Redirects the `call rel32` at callAddr (which must call `target`) to `hook`. */
+
 static int HookCall(DWORD callAddr, DWORD target, void *hook) {
     unsigned char *p = (unsigned char*)callAddr;
     DWORD old, rel, cur;
@@ -1151,7 +1210,7 @@ static int HookCall(DWORD callAddr, DWORD target, void *hook) {
     return 1;
 }
 
-/* Sample the main per-frame subsystems so a bullet-heavy slowdown can be attributed. */
+
 typedef unsigned char (__cdecl *PF_FrameNoArg)(void);
 typedef struct { LONGLONG ticks, maxTicks; unsigned calls; } PerfStat;
 static PerfStat g_gamePerf[7];
@@ -1217,7 +1276,7 @@ static void PatchGamePerf(void) {
     Log("GamePerf: patched %d/6 frame subsystems", n);
 }
 
-/* Remember the replay-list index passed by the game's replay selection screen. */
+
 static int __attribute__((fastcall)) ReplayLoadCaptureHook(void *input, void *edx,
                                                             int replayId, int stage) {
     (void)edx;
@@ -1246,42 +1305,42 @@ static void PatchPracticePower(void) {
         Log("PracticePower: unexpected image base, skipped");
         return;
     }
-    n += HookCall(0x42377f, 0x423880, (void*)&GameStartHook);   /* title state 0xb */
-    n += HookCall(0x419c9e, 0x419d10, (void*)&RetryHook);       /* pause retry, practice */
-    n += HookCall(0x419cad, 0x419d10, (void*)&RetryHook);       /* pause retry, extra */
-    n += HookCall(0x419cb9, 0x419d10, (void*)&RetryHook);       /* pause retry, normal */
+    n += HookCall(0x42377f, 0x423880, (void*)&GameStartHook);
+    n += HookCall(0x419c9e, 0x419d10, (void*)&RetryHook);
+    n += HookCall(0x419cad, 0x419d10, (void*)&RetryHook);
+    n += HookCall(0x419cb9, 0x419d10, (void*)&RetryHook);
     Log("PracticePower: patched %d/4 call sites", n);
 }
 
-/*
- * Practice menu: Extra stage row with left/right area select.
- *
- * Practice menu object = title object + 0x22e90 (thiscall, ecx = object):
- *   init 0x420b40, update 0x420c90 (called from 0x423791), draw 0x420de0 (called from 0x42407f)
- *   +0x08 cursor, +0x0c fade-in (0..0x80), +0x10 font texture, +0x18 header row,
- *   +0x100 + 0xe8*i stage rows (3 rows, y = 0x78 + 0x20*i), row colour at row+0xd8
- * Original update/draw work for at most 3 stage rows (count = DWORD 0x46bc2c, 1..3).  When all three
- * stages are available and Extra is unlocked (DWORD 0x46bc00), the update is replaced by a copy of
- * the original with a 4th cursor position (the Extra row, y = 0xd8). The draw count is raised to 5
- * so the panel grows by two rows; custom rows show "Extra" at y = 0xd8 and the area selector at
- * y = 0xf8.
- * Deciding the Extra row starts stage 4 like the title's Extra entry (lives = config Rest 0x46c7c4,
- * practice flag off) and remembers the selected area (g_exArea).
- *
- * Event queue: the stage script is a time ordered event queue (sorted singly linked list at 0x4ea1d8,
- * node = { next, time, type, args* }); 0x430020(frame) runs every node whose time <= frame once per
- * frame and frees it.  type 0 = enemy spawn, type 1 = player spawn, 2..6 = effects/background/music.
- *
- * Area start: Script4.dat schedules BGM changes as event type 6. The BGM ID is args[3]; IDs 2, 3,
- * 4 and 5 mark areas 1..4. Runtime traces confirm the DAT schedule at frames 362, 6612, 8962 and
- * 14192 respectively. For a
- * practice run the opening timeline wait is bypassed directly to IP 810248 (with timeline counter = 362),
- * scheduling the full stage events at frame 0. Once the target area's BGM event is known, enemy
- * spawns (type 0) and earlier BGMs (type 6) earlier than it are removed (player spawn type 1 and
- * background events are preserved), and the frame counter 0x4dadf8 is set to its time, so the
- * remaining earlier events (player spawn, background, music, ...) are run at once by the
- * following dispatch.  No settings file is used.  Every Extra start logs the BGM event times.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 typedef unsigned char (__attribute__((thiscall)) *PF_InputHold)(void *self, int id, int delay);
 typedef unsigned char (__attribute__((fastcall)) *PF_PracticeFn)(void *obj);
 typedef void (__attribute__((thiscall)) *PF_RowCtor)(void *row);
@@ -1295,7 +1354,7 @@ typedef void (__cdecl *PF_Free)(void *p);
 static char g_exRowBuf[EX_MAX_AREAS][0xe8] __attribute__((aligned(16)));
 static char g_exLabelRow[0xe8] __attribute__((aligned(16)));
 static int g_exRowInit[EX_MAX_AREAS];
-static void *g_exRowTex[EX_MAX_AREAS];   /* texture the row was set up with (changes when the menu is re-created) */
+static void *g_exRowTex[EX_MAX_AREAS];
 static int g_exLabelInit;
 static void *g_exLabelTex;
 static int g_exLastFade = 0;
@@ -1360,7 +1419,7 @@ static unsigned char __attribute__((fastcall)) PracticeUpdateHook(void *obj) {
         return ((PF_PracticeFn)(uintptr_t)0x420c90)(obj);
     if (*cur < 0 || *cur >= rows) *cur = 0;
 
-    if (edge(input, 4) || rawkey(input, 0xd)) {                 /* decide */
+    if (edge(input, 4) || rawkey(input, 0xd)) {
         *(int*)(scene + 0xc) = 0;
         if (*cur < 3) {
             *(int*)(scene + 0x10) = *cur + 1;
@@ -1376,17 +1435,17 @@ static unsigned char __attribute__((fastcall)) PracticeUpdateHook(void *obj) {
         }
         *(int*)(scene + 8) = 0xb;
     }
-    if (hold(input, 5, 0) || hold(input, 7, 0))                 /* cancel */
+    if (hold(input, 5, 0) || hold(input, 7, 0))
         *(int*)(scene + 8) = 2;
-    if (hold(input, 0, 0xf)) {                                  /* up */
+    if (hold(input, 0, 0xf)) {
         *cur = (rows + *cur - 1) % rows;
         playSe((void*)(uintptr_t)0x4ea3b8, 0, 0xff);
     }
-    if (hold(input, 1, 0xf)) {                                  /* down */
+    if (hold(input, 1, 0xf)) {
         *cur = (*cur + 1) % rows;
         playSe((void*)(uintptr_t)0x4ea3b8, 0, 0xff);
     }
-    if (*cur == 3) {                                            /* left / right: area */
+    if (*cur == 3) {
         if (hold(input, 2, 0xf)) {
             g_exArea = (g_exArea + g_exAreaN - 1) % g_exAreaN;
             playSe((void*)(uintptr_t)0x4ea3b8, 0, 0xff);
@@ -1409,13 +1468,13 @@ static unsigned char __attribute__((fastcall)) PracticeDrawHook(void *obj) {
     int saved = *count;
     int fade = *(int*)((char*)obj + 0xc);
 
-    /* the menu's fade-in restarts at 0 every time it is opened: our row was built from the old
-       menu's texture, so drop it and build it again from the current one */
+
+
     if (fade < g_exLastFade) ExRowsReset();
     g_exLastFade = fade;
     if (!ExRowAvailable())
         return ((PF_PracticeFn)(uintptr_t)0x420de0)(obj);
-    *count = 5;                                  /* background panel: Extra label plus Area row */
+    *count = 5;
     r = ((PF_PracticeFn)(uintptr_t)0x420de0)(obj);
     *count = saved;
     if (*(int*)((char*)obj + 0xc) * 6 > 0xff) {
@@ -1431,7 +1490,11 @@ static unsigned char __attribute__((fastcall)) PracticeDrawHook(void *obj) {
     return r;
 }
 
-/* Extra stage event queue (sorted list at 0x4ea1d8): log it, or fast-forward it. */
+
+
+
+
+
 static void ExLogQueue(void) {
     unsigned *n = *(unsigned**)(uintptr_t)0x4ea1d8;
     int cnt[8] = { 0 }, tmin[8], tmax[8], i;
@@ -1458,17 +1521,17 @@ static void ExLogQueue(void) {
 static void ExSkipTo(int target, int area) {
     unsigned **headp = (unsigned**)(uintptr_t)0x4ea1d8;
     unsigned *prev = NULL, *n = *headp;
-    const int dropOldBg = 0;   /* dropping old pushes was wrong: the layer update (0x427e60) consumes them */
-    int dropped = 0, bgDropped = 0;
+    const int dropOldBg = 0;
+    int dropped = 0, bgDropped = 0, spawnLogged = 0;
     unsigned layerKey[8];
     int layerLast[8], nLayers = 0, li;
 
-    /* Background texture pushes (type 2: args[3] = layer, args[5] = texture id) are appended to a
-       per-layer FIFO, and the front of the FIFO is what is drawn.  Running every earlier push at
-       the jump puts the Area 1 textures in front of the target area's ones, so the background of
-       Area 1 stays on screen.  Find the latest push time per layer before the target here, and
-       drop the older pushes of that layer below (pushes made at the same time -- one background
-       made of several textures -- are all kept). */
+
+
+
+
+
+
     for (n = *headp; n; n = (unsigned*)n[0]) {
         unsigned *a = (unsigned*)n[3];
         if (!dropOldBg || (int)n[2] != 2 || (int)n[1] >= target || !a) continue;
@@ -1491,14 +1554,20 @@ static void ExSkipTo(int target, int area) {
         int ty = (int)n[2];
         int drop = 0;
 
-        /* All areas: drop enemy spawns (0) and earlier BGM starts (6) before the target.
-           Everything else -- player spawn (1) and all background events (2: pushTex,
-           3: scroll speed, 4: scroll pos, 5: blend mode) -- is kept.  The kept background
-           events run at the jump via the normal dispatch, so the resulting texture FIFO and
-           scroll state are exactly what the natural Extra playthrough has at that frame
-           (the game pushes every area background onto layer 1). */
+
+
+
+
+
+
         if (t < target && (ty == 0 || ty == 6)) drop = 1;
-        /* older background pushes of a layer (superseded by a later push before the target) */
+        if (drop && ty == 0 && n[3] && !IsBadReadPtr((void*)(uintptr_t)n[3], 24) && spawnLogged < 800) {
+            unsigned *sa = (unsigned*)(uintptr_t)n[3];
+            spawnLogged++;
+            Log("ExArea: dropped spawn t=%d args=%08X %08X %08X %08X %08X %08X", t,
+                sa[0], sa[1], sa[2], sa[3], sa[4], sa[5]);
+        }
+
         if (!drop && ty == 2 && t < target && n[3]) {
             unsigned *a = (unsigned*)n[3];
             for (li = 0; li < nLayers; li++) {
@@ -1539,8 +1608,8 @@ static void ExLogProgress(int frame) {
         g_exArea + 1, frame, total, bgm);
 }
 
-/* The insert hook may miss an event that was already queued.  Resolve the selected area's
-   BGM marker from the live queue too, so the jump does not depend only on insertion tracking. */
+
+
 static int ExFindBgmTime(int bgmId) {
     unsigned *n = *(unsigned**)(uintptr_t)0x4ea1d8;
     for (; n; n = (unsigned*)n[0]) {
@@ -1552,9 +1621,9 @@ static int ExFindBgmTime(int bgmId) {
     return 0;
 }
 
-/* Replay one complete normal stage tick (the update block at 0x413c39). The event-dispatch
-   call inside that routine is hooked, so EventDispatchHook bypasses its Practice logic while
-   this guard is set and lets the game's original dispatcher run. */
+
+
+
 static int ExRunStageFrame(int frame) {
     typedef unsigned char (__cdecl *PF_Update)(void);
     unsigned char ok;
@@ -1566,22 +1635,22 @@ static int ExRunStageFrame(int frame) {
     return ok && *(volatile int*)(uintptr_t)0x4dadf8 == frame + 1;
 }
 
-/*
- * Run the stage's frame loop up to `target` without drawing, matching the scene update 0x413ab0.
- * The background layers
- * (type 2..5 events + layer update 0x427e60) are state machines: type 2 appends textures to a
- * per-layer queue, the layer update pops tiles into 3 slots as the scroll offset (+0xc, advanced by
- * the speed array 0x4e9a80) passes the tile height, and type 5 sets how many tiles of the queue are
- * recycled.  Running only the events at once leaves the queue/offset in the Area 1 state, so the
- * layers are brought to the state of a natural run by simulating the frames.
- */
+
+
+
+
+
+
+
+
+
 static void ExFastForward(int from, int target) {
     int f;
 
-    /* `from` is the first frame whose event dispatch has not run yet.  The frames before it were
-       already run by the game itself (the stage script has only just been started and queued its
-       events), so the simulation must continue from there.  Starting at 0 would run the object
-       update -- and so scroll the background layers -- once more than a normal playthrough. */
+
+
+
+
     for (f = from; f < target; f++) {
         if (!ExRunStageFrame(f)) {
             Log("ExArea: normal frame update stopped at %d", f);
@@ -1592,20 +1661,20 @@ static void ExFastForward(int from, int target) {
     Log("ExArea: simulated frames %d..%d of events + object update", from, target - 1);
 }
 
-/*
- * Area background seeding.
- *
- * The stage's backgrounds change at their own times (type 2 events: Area 1 at 0, Area 2 at 6462,
- * Area 3 at 10162, Area 4 at 14392 -- not at the BGM times used as the area start), and a pushed tile
- * only appears after the tiles in front of it have scrolled out.  For a practice run the selected
- * area should show its own background from the start, so the area's background group (all type 2..5
- * events at the group's time) is taken out of the event queue before the frames are simulated and
- * applied afterwards: the layer's tile queue and its tile slots/scroll offset are cleared, the area's
- * textures are queued and its speed/cycle values set, exactly with the game's own functions
- * (0x427d40 push, 0x428030 speed, 0x428040 accel, 0x428050 cycle count).
- * Event args words: [2],[3] = layer (tag, payload), [4],[5] = value or texture (tag, payload);
- * tag 0 = float bits, tag 1 = int (the only tags used by the stage script).
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 typedef struct { int type; unsigned w[6]; } ExBgEv;
 typedef struct { int n; int time; ExBgEv ev[32]; } ExBgGroup;
 static ExBgGroup g_exBgGroup;
@@ -1629,7 +1698,7 @@ static unsigned ExValFloatBits(unsigned tag, unsigned payload, int *ok) {
     return 0;
 }
 
-/* Takes the background group of `area` (1..) out of the event queue.  Returns 1 if one was found. */
+
 static int ExBgExtract(int area, ExBgGroup *g) {
     unsigned **headp = (unsigned**)(uintptr_t)0x4ea1d8;
     unsigned *n, *prev = NULL, *next;
@@ -1674,7 +1743,7 @@ static int ExBgExtract(int area, ExBgGroup *g) {
     return g->n > 0;
 }
 
-/* Empties the tile queue of a layer (list of the game: sentinel at 0x4e9a94 + layer*12, count at +4). */
+
 static void ExQueueClear(int layer) {
     unsigned *sent = *(unsigned**)(uintptr_t)(0x4e9a94 + layer * 12);
     int *cnt = (int*)(uintptr_t)(0x4e9a98 + layer * 12);
@@ -1691,7 +1760,7 @@ static void ExQueueClear(int layer) {
     }
 }
 
-/* Clears the tile slots and the scroll offset of the layer's update object (update function 0x427e60). */
+
 static int ExLayerObjectReset(int layer) {
     unsigned *node;
     int found = 0;
@@ -1750,18 +1819,18 @@ static void ExBgSeed(const ExBgGroup *g) {
         Log("ExArea: layer %d queue now holds %d tile(s)", layers[i], *(int*)(uintptr_t)(0x4e9a98 + layers[i] * 12));
 }
 
-/*
- * Which background group (0-based index of the type 2 push times of the stage script: 0 = t 0,
- * 1 = t 6462, 2 = t 10162, 3 = t 14392, 4 = t 17392) is shown when an area is started.
- * F8 during a practice Extra run cycles through all groups (logged) to find the right one per area.
- */
+
+
+
+
+
 #define EX_BG_GROUPS 8
 static const int g_exAreaBgGroup[EX_AREA_N] = { 0, 1, 2, 3 };
 static ExBgGroup g_exBgGroups[EX_BG_GROUPS];
 static int g_exBgGroupN = 0;
 static int g_exBgCur = -1;
 
-/* Saves a copy of every background group of the event queue; removes group `sel` (>= 1) from the queue. */
+
 static int ExBgSaveAll(int sel) {
     unsigned **headp = (unsigned**)(uintptr_t)0x4ea1d8;
     unsigned *n, *prev = NULL, *next;
@@ -1812,23 +1881,23 @@ static int ExBgSaveAll(int sel) {
     return sel > 0 && sel < nt && g_exBgGroups[sel].n > 0;
 }
 
-/*
- * Stage background state log, to compare a practice area start with the same frame of a normal
- * Extra playthrough:  "ExBg[natural]" is logged at the start of the BGM frame of every area in a
- * normal run, "ExBg[practice]" right after the practice jump (both before that frame's event
- * dispatch).  Textures are shown as letters (same letter = same texture object, in order of
- * appearance: slots first, then the tile queue); the offset/speed/accel/cycle values are exact.
- */
+
+
+
+
+
+
+
 static float ExBitsToFloat(unsigned bits) {
     float f;
     memcpy(&f, &bits, 4);
     return f;
 }
 
-/* Texture id helpers.  The stage script's background textures live in a runtime table created by
-   0x4097b0(type, w, h, name, name2, flag): pointer array at 0x46c884, entry count at 0x46c888,
-   total loads ever at 0x46c890.  Tiles queue texture OBJECT pointers, so the id is found by a
-   reverse lookup; the counts show whether the table was fully populated at the time. */
+
+
+
+
 static unsigned ExTextureTableN(void) {
     return *(volatile unsigned*)(uintptr_t)0x46c888;
 }
@@ -1841,12 +1910,12 @@ static int ExTexId(unsigned p) {
     unsigned n = ExTextureTableN() / 4, i;
     unsigned volatile **tbl;
 
-    if (!p) return -2;                      /* null texture pointer */
+    if (!p) return -2;
     tbl = (unsigned volatile **)*(void *volatile *)(uintptr_t)0x46c884;
     if (!tbl || IsBadReadPtr(tbl, ExTextureTableN())) return -3;
     for (i = 0; i < n; i++)
         if ((unsigned)(uintptr_t)tbl[i] == p) return (int)i;
-    return -1;                              /* not in the table (freed since) */
+    return -1;
 }
 
 static char ExPtrLabel(unsigned *seen, int *nseen, unsigned p) {
@@ -1857,6 +1926,39 @@ static char ExPtrLabel(unsigned *seen, int *nseen, unsigned p) {
     if (*nseen >= 20) return '?';
     seen[*nseen] = p;
     return (char)('A' + (*nseen)++);
+}
+
+
+
+static void ExLogObjects(const char *tag, int frame) {
+    unsigned keys[32][6];
+    int cnt[32];
+    int nk = 0, total = 0, guard = 0, j;
+    unsigned *node;
+
+    for (node = *(unsigned**)(uintptr_t)0x4ea1ac; node && guard < 8192; node = (unsigned*)node[1], guard++) {
+        unsigned *o;
+        unsigned k[6];
+        if (IsBadReadPtr(node, 20)) break;
+        o = (unsigned*)node[4];
+        if (!o || IsBadReadPtr(o, 0x824)) continue;
+        total++;
+        k[0] = o[0x808 / 4]; k[1] = o[0x80c / 4]; k[2] = o[0x810 / 4];
+        k[3] = o[0x814 / 4]; k[4] = o[0x81c / 4]; k[5] = o[0x820 / 4];
+        for (j = 0; j < nk; j++)
+            if (!memcmp(keys[j], k, sizeof(k))) break;
+        if (j == nk) {
+            if (nk >= 32) continue;
+            memcpy(keys[nk], k, sizeof(k));
+            cnt[nk] = 0;
+            nk++;
+        }
+        cnt[j]++;
+    }
+    Log("ExObj[%s] frame=%d objects=%d kinds=%d", tag, frame, total, nk);
+    for (j = 0; j < nk; j++)
+        Log("ExObj[%s] frame=%d n=%d f808=%08X f80c=%08X f810=%08X f814=%08X f81c=%08X f820=%08X",
+            tag, frame, cnt[j], keys[j][0], keys[j][1], keys[j][2], keys[j][3], keys[j][4], keys[j][5]);
 }
 
 static void ExLogLayerState(const char *tag, int frame) {
@@ -1906,23 +2008,24 @@ static void ExLogLayerState(const char *tag, int frame) {
             *(volatile unsigned*)(uintptr_t)(0x4e9a68 + layer * 4),
             ExTextureTableN(), ExTextureLoadedN());
     }
+    ExLogObjects(tag, frame);
 }
 
-/*
- * Background settling (g_ExBgMode 2).
- *
- * The Area's own background is only on screen some time after the Area's BGM frame (see g_ExBgMode),
- * so the layers are run on until every tile slot and the tile queue of the layers that received the
- * Area's tiles hold only those tiles.  This uses the game's own layer update, so the result is a state
- * a normal run really has (scroll offset, tile order, speeds).  During these extra frames only the
- * background events (types 2..5) are dispatched: every other stage event (enemy spawns, BGM, player
- * spawn, ...) is taken out of the queue and put back in order afterwards, so the stage itself still
- * starts at the BGM frame.
- *
- * The Area's tiles are found by watching the layer tile queues: a push appends at the tail
- * (node = { next, prev, texture }, sentinel at 0x4e9a94 + 12 * layer), so the nodes that were added
- * by the dispatch of the group's time are the tiles of that group.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #define EX_SETTLE_MAX 6000
 #define EX_NEW_MAX 8
 
@@ -1948,7 +2051,7 @@ static int ExTilesHas(const ExTiles *t, unsigned p) {
     return 0;
 }
 
-/* the last `grown` nodes of the layer's tile queue were just appended */
+
 static void ExTilesCapture(ExTiles *t, int layer, int grown) {
     unsigned *sent = *(unsigned**)(uintptr_t)(0x4e9a94 + layer * 12);
     unsigned *q;
@@ -1964,7 +2067,7 @@ static void ExTilesCapture(ExTiles *t, int layer, int grown) {
     }
 }
 
-/* every tile in the layer's slots and in its queue is one of `t` */
+
 static int ExLayerSettled(int layer, const ExTiles *t) {
     unsigned *obj = ExFindLayerObj(layer);
     unsigned *sent, *q;
@@ -1994,8 +2097,8 @@ static int ExAllSettled(const ExTiles *tiles) {
     return 1;
 }
 
-/* One frame of the stage: event dispatch, then object update (same order as the scene update).  The first
-   frame at or after `gt` whose dispatch appends tiles to a layer queue gives the area's tiles. */
+
+
 static void ExStep(int f, int gt, int *captured, ExTiles *tiles) {
     int c0[4], layer;
 
@@ -2014,7 +2117,7 @@ static void ExStep(int f, int gt, int *captured, ExTiles *tiles) {
     }
 }
 
-/* merge two lists of event nodes sorted by time; on equal times `a` goes first */
+
 static unsigned *ExMerge(unsigned *a, unsigned *b) {
     unsigned *head = NULL, *tail = NULL, *n;
 
@@ -2034,7 +2137,7 @@ static unsigned *ExMerge(unsigned *a, unsigned *b) {
     return head;
 }
 
-/* `gt` = time of the area's background group */
+
 static void ExSimulateSettled(int from, int target, int gt) {
     unsigned **headp = (unsigned**)(uintptr_t)0x4ea1d8;
     unsigned *n, *bgH = NULL, *bgT = NULL, *hH = NULL, *hT = NULL;
@@ -2143,7 +2246,7 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
                     ExBgSeed(&g_exBgGroups[sel]);
                 }
             } else {
-                /* Continue the game's own frame loop from the current frame. */
+
                 ExBgSaveAll(-1);
                 ExSkipTo(target, g_exArea);
                 if (areaBgMode == 2 && sel >= 0 && sel < g_exBgGroupN)
@@ -2182,10 +2285,10 @@ static unsigned char __cdecl EventDispatchHook(int frame) {
 
 typedef void (__cdecl *PF_EventInsert)(int time, void *node);
 
-/* Background texture push (event type 2 dispatch, 0x4300b4 -> 0x427d40(tex, args+8, layer):
-   as 0x427d40 reads its tex id at [esp+8], the stack holds (layer, args+8) at the call, so the
-   dispatch actually passes (layer, args+8, tex).  The log shows the resolved texture object and
-   (via its table index) why it may be a wrong image. */
+
+
+
+
 static void __cdecl BgPushHook(int layer, unsigned *argsP, unsigned tex) {
     if (*(volatile int*)(uintptr_t)0x4dade4 == 4) {
         union { unsigned b; float f; } v;
@@ -2199,7 +2302,7 @@ static void __cdecl BgPushHook(int layer, unsigned *argsP, unsigned tex) {
     ((PF_LayerSetU3)(uintptr_t)0x427d40)(layer, (unsigned)(uintptr_t)argsP, tex);
 }
 
-/* Event creators (0x42fe60..0x430020) insert every stage event through 0x42fe30(time, node). */
+
 static void __cdecl EventInsertHook(int time, unsigned *node) {
     if (node && *(volatile int*)(uintptr_t)0x4dade4 == 4) {
         int ty = (int)node[2];
@@ -2231,8 +2334,8 @@ static int PatchEventInsertLog(void) {
     return n;
 }
 
-/* The FPU fix runs from EventDispatchHook; install it on its own when the Extra area select (which
- * normally installs the same hook) is turned off. */
+
+
 static void PatchReplayFpu(void) {
     if (!g_ReplayFpuFix) return;
     Log("FpuFix: x87 control word at attach %04X, forcing %04X from the stage frame/input hooks",
@@ -2263,21 +2366,25 @@ static void PatchExAreaSelect(void) {
         Log("ExArea: background push log hooked");
 }
 
-/*
- * Pause menu: pause BGM and sound effects while the pause menu is open.
- *
- * Both BGM (streamed ogg) and SE live in DirectSound secondary buffers created through the game's
- * IDirectSound (global 0x4dada8, created by `call 0x450190` (DirectSoundCreate thunk) at 0x411f1c).
- * That call is hooked so that the IDirectSound vtable slots CreateSoundBuffer (+0x0c) and
- * DuplicateSoundBuffer (+0x14) can be wrapped; every non-primary buffer is recorded, and the
- * Release slot of the buffer vtable is wrapped to drop released buffers from the record.
- * A small thread watches BYTE 0x4dae16 (pause menu active):
- *   0 -> 1 : Stop() every buffer that is playing right now and remember it (and DSBSTATUS_LOOPING)
- *   1 -> 0 : Play() the remembered buffers again (the play cursor is kept by Stop/Play), unless the
- *            pause menu is closing for retry/title (pause object *0x4dae08, state at +0x538 is 4/5),
- *            where the scene change takes over and nothing is resumed.
- * Sounds started while the menu is open (cursor / decide SE) are not touched.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 static const int g_PauseAudio = 1;
 
 #define AUDIO_MAX 1024
@@ -2305,7 +2412,7 @@ static int PatchVtblSlot(void **slot, void *hook, void **orig) {
     return 1;
 }
 
-static void AudioRemove(void *buf) {   /* caller holds g_audioCs */
+static void AudioRemove(void *buf) {
     int i;
     for (i = 0; i < g_audioN; i++) {
         if ((void*)g_audio[i].buf == buf) {
@@ -2485,32 +2592,32 @@ static void PatchPauseAudio(void) {
     Log("PauseAudio: patched (thread %s)", th ? "ok" : "failed");
 }
 
-/*
- * Sound effect playback fix.
- *
- * SE play function (0x412210, thiscall, ecx = SE object, stack: pan, volume, ret 8):
- *   +0x00 : IDirectSoundBuffer** (duplicated buffers of one SE, used round-robin)
- *   +0x04 : buffer count
- *   +0x08 : index of the buffer to use next
- *   +0x0c : per-SE volume byte
- *   0x4dad9c : global SE volume byte, 0x46c82c : EnableSoundStop
- * Original behaviour:
- *   - GetStatus failure returns without advancing the index, so one broken buffer
- *     blocks that SE forever.
- *   - DSBSTATUS_BUFFERLOST is never handled; Play() on a lost buffer is silent.
- *   - A buffer that is not playing is started with Play() only, without rewinding
- *     the play cursor (relies on the driver resetting it after the buffer ended).
- *     If the cursor is left at the end the SE finishes instantly and nothing is heard.
- * The replacement below always advances the index, restores lost buffers, rewinds
- * the cursor before every Play() and retries once when Play() reports a lost buffer.
- * Volume/pan are computed exactly like the original (constants are read from the exe).
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 static const int g_SeFix = 1;
-static const int g_SePanLimit = 0;   /* clamp |pan| of SE (0 = always centered, 10000 = original panning) */
-static const int g_SeTrace = 1;   /* log rare SE calls / anomalies to Smd_ddraw.log */
+static const int g_SePanLimit = 0;
+static const int g_SeTrace = 1;
 static int g_seTraceCount = 0;
 #define SE_TRACE_MAX 4000
-#define SE_TRACE_RARE 20          /* log the first N calls of every SE object individually */
+#define SE_TRACE_RARE 20
 
 typedef struct { void *se; int count; unsigned calls, idle; } SeStat;
 static SeStat g_seStat[64];
@@ -2568,7 +2675,7 @@ static void __attribute__((thiscall)) SePlayHook(void *se, int pan, int vol) {
 
     if (!bufs || count <= 0) return;
     if (idx < 0 || idx >= count) idx = 0;
-    /* advance first so that a broken buffer can never block the round-robin */
+
     *(int*)((char*)se + 8) = (idx + 1 >= count) ? 0 : idx + 1;
 
     buf = bufs[idx];
@@ -2650,13 +2757,264 @@ static void PatchSoundFix(void) {
         return;
     }
     rel = (DWORD)(uintptr_t)&SePlayHook - (addr + 5);
-    p[0] = 0xe9;              /* jmp SePlayHook (original body is never entered again) */
+    p[0] = 0xe9;
     memcpy(p + 1, &rel, 4);
     p[5] = 0x90;
     VirtualProtect(p, 6, old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, 6);
     Log("SeFix: patched (hook=%p)", (void*)&SePlayHook);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+static const int g_BatchDraw = 1;
+#define BATCH_MAX_QUADS 1024
+#define BATCH_FVF 0x1c4
+#define BATCH_VTX_DWORDS 8
+
+typedef HRESULT (STDMETHODCALLTYPE *PF_DevDrawPrim)(void*, DWORD, DWORD, LPVOID, DWORD, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *PF_DevSetTexture)(void*, DWORD, void*);
+
+static PF_DevDrawPrim g_devDrawPrim = NULL;
+static PF_DevSetTexture g_devSetTexture = NULL;
+static void *g_devSelf = NULL;
+static unsigned g_bverts[BATCH_MAX_QUADS * 6 * BATCH_VTX_DWORDS];
+static int g_bquads = 0;
+static int g_batchFailed = 0;
+static void *g_texApplied = NULL;
+static int g_texKnown = 0;
+static void *g_texPending = NULL;
+static int g_texHasPending = 0;
+static unsigned char *g_stubMem = NULL;
+static unsigned g_stubUsed = 0;
+
+static void BatchApplyTexture(void) {
+    if (!g_texHasPending) return;
+    g_texHasPending = 0;
+    if (g_devSelf && g_devSetTexture && (!g_texKnown || g_texPending != g_texApplied)) {
+        g_devSetTexture(g_devSelf, 0, g_texPending);
+        g_texApplied = g_texPending;
+        g_texKnown = 1;
+        g_stTexApplied++;
+    } else {
+        g_stTexSkipped++;
+    }
+    if (g_texPending) {
+        IDirectDrawSurface7_Release((IDirectDrawSurface7*)g_texPending);
+        g_texPending = NULL;
+    }
+}
+
+
+
+static void BatchFlush(void) {
+    if (g_bquads > 0) {
+        if (g_devSelf && g_devDrawPrim) {
+            g_devDrawPrim(g_devSelf, 4 , BATCH_FVF, g_bverts,
+                          (DWORD)g_bquads * 6, 0);
+            g_stBatchCalls++;
+        }
+        g_bquads = 0;
+    }
+    BatchApplyTexture();
+}
+
+static HRESULT STDMETHODCALLTYPE BatchDrawPrimitive(void *self, DWORD type, DWORD fvf, LPVOID verts,
+                                                    DWORD count, DWORD flags) {
+    g_devSelf = self;
+    if (type == 6  && fvf == BATCH_FVF && count == 4 && flags == 0 && verts) {
+        const unsigned *s = (const unsigned*)verts;
+        unsigned *d;
+        if (g_texHasPending) {
+            if (!g_texKnown || g_texPending != g_texApplied) BatchFlush();
+            else BatchApplyTexture();
+        }
+        if (g_bquads >= BATCH_MAX_QUADS) BatchFlush();
+        d = g_bverts + (size_t)g_bquads * 6 * BATCH_VTX_DWORDS;
+        memcpy(d, s, 3 * BATCH_VTX_DWORDS * 4);
+        memcpy(d + 3 * BATCH_VTX_DWORDS, s, BATCH_VTX_DWORDS * 4);
+        memcpy(d + 4 * BATCH_VTX_DWORDS, s + 2 * BATCH_VTX_DWORDS, 2 * BATCH_VTX_DWORDS * 4);
+        g_bquads++;
+        g_stQuads++;
+        return 0;
+    }
+    BatchFlush();
+    g_stPass++;
+    return g_devDrawPrim(self, type, fvf, verts, count, flags);
+}
+
+static HRESULT STDMETHODCALLTYPE BatchSetTexture(void *self, DWORD stage, void *tex) {
+    g_devSelf = self;
+    if (stage != 0) {
+        BatchFlush();
+        return g_devSetTexture(self, stage, tex);
+    }
+    if (g_texHasPending && g_texPending)
+        IDirectDrawSurface7_Release((IDirectDrawSurface7*)g_texPending);
+    if (tex) IDirectDrawSurface7_AddRef((IDirectDrawSurface7*)tex);
+    g_texPending = tex;
+    g_texHasPending = 1;
+    return 0;
+}
+
+
+static void *BatchMakeStub(void *orig) {
+    unsigned char *p;
+    DWORD rel, holder;
+
+    if (!g_stubMem) {
+        g_stubMem = (unsigned char*)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        g_stubUsed = 0;
+    }
+    if (!g_stubMem || g_stubUsed + 32 > 4096) return NULL;
+    p = g_stubMem + g_stubUsed;
+    g_stubUsed += 32;
+    p[0] = 0x60; p[1] = 0x9c; p[2] = 0xe8;
+    rel = (DWORD)(uintptr_t)&BatchFlush - (DWORD)(uintptr_t)(p + 7);
+    memcpy(p + 3, &rel, 4);
+    p[7] = 0x9d; p[8] = 0x61; p[9] = 0xff; p[10] = 0x25;
+    holder = (DWORD)(uintptr_t)(p + 16);
+    memcpy(p + 11, &holder, 4);
+    memcpy(p + 16, &orig, 4);
+    return p;
+}
+
+static int BatchStubSlots(void **vt, const unsigned char *slots, int n) {
+    int i, ok = 0;
+    for (i = 0; i < n; i++) {
+        void *stub = BatchMakeStub(vt[slots[i]]);
+        void *old = NULL;
+        if (stub && PatchVtblSlot(&vt[slots[i]], stub, &old)) ok++;
+    }
+    return ok;
+}
+
+static void BatchTryInstall(void) {
+
+
+
+
+    static const unsigned char devSlots[] = { 5, 6, 8, 10, 11, 13, 14, 16, 18, 20, 26, 29, 30, 31, 32,
+                                              34, 37, 39, 43, 44, 45 };
+
+
+    static const unsigned char surfSlots[] = { 6, 7, 17, 25, 26, 27, 32 };
+    static const unsigned char surfBltFlip[] = { 5, 11 };
+    void **obj, **vt, **svt;
+    void *dev, *old = NULL;
+    int nd, ns = 0;
+
+    if (g_batchInstalled || g_batchFailed || !g_BatchDraw) return;
+    obj = *(void***)(uintptr_t)0x46c85c;
+    if (!obj || IsBadReadPtr(obj, 8)) return;
+    dev = obj[1];
+    if (!dev || IsBadReadPtr(dev, 4)) return;
+    vt = *(void***)dev;
+    if (!vt || IsBadReadPtr(vt, 48 * sizeof(void*))) { g_batchFailed = 1; return; }
+    if (!g_primary) return;
+    svt = *(void***)g_primary;
+    if (!svt || IsBadReadPtr(svt, 40 * sizeof(void*))) { g_batchFailed = 1; return; }
+
+    g_devSelf = dev;
+    nd = BatchStubSlots(vt, devSlots, (int)sizeof(devSlots));
+    ns = BatchStubSlots(svt, surfSlots, (int)sizeof(surfSlots));
+    if (!g_origBlt) ns += BatchStubSlots(svt, surfBltFlip, (int)sizeof(surfBltFlip));
+    if (!PatchVtblSlot(&vt[35], (void*)&BatchSetTexture, &old)) { g_batchFailed = 1; return; }
+    g_devSetTexture = (PF_DevSetTexture)old;
+    if (!PatchVtblSlot(&vt[25], (void*)&BatchDrawPrimitive, &old)) {
+        g_batchFailed = 1;
+        return;
+    }
+    g_devDrawPrim = (PF_DevDrawPrim)old;
+    g_batchInstalled = 1;
+    Log("Batch: device %p (vtbl %p) hooked: %d flush slots, %d surface slots, DrawPrimitive + SetTexture",
+        dev, (void*)vt, nd, ns);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+static const int g_FrameWaitSleep = 1;
+static const double g_FrameWaitMarginMs = 2.0;
+
+typedef unsigned (__attribute__((fastcall)) *PF_FrameTimer)(int *ctx);
+
+static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
+    unsigned r;
+    BatchTryInstall();
+    r = ((PF_FrameTimer)(uintptr_t)0x424f20)(ctx);
+    if (g_FrameWaitSleep && (r & 0xff) == 0) {
+        unsigned acc = (unsigned)ctx[3], dacc = (unsigned)ctx[4], per = (unsigned)ctx[1];
+        double rem = 30000.0 - (double)acc;
+        if (per > 0 && per < 1000000) {
+            double d = (double)per - (double)dacc;
+            if (d < rem) rem = d;
+        }
+        rem /= 1800.0;
+        if (rem > g_FrameWaitMarginMs + 1.0 && rem < 100.0) {
+            LARGE_INTEGER a, b;
+            QueryPerformanceCounter(&a);
+            MsgWaitForMultipleObjects(0, NULL, FALSE, (DWORD)(rem - g_FrameWaitMarginMs), QS_ALLINPUT);
+            QueryPerformanceCounter(&b);
+            g_fwSleeps++;
+            g_fwSleptMs += TicksToMs(b.QuadPart - a.QuadPart);
+        } else {
+            g_fwSpins++;
+        }
+    }
+    return r;
+}
+
+static void PatchFrameWait(void) {
+    DWORD a;
+    int n = 0;
+
+    if (!g_FrameWaitSleep && !g_BatchDraw) return;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("FrameWait: unexpected image base, skipped");
+        return;
+    }
+    for (a = 0x425330; a < 0x425570; a++)
+        if (*(unsigned char*)(uintptr_t)a == 0xe8 &&
+            (DWORD)(a + 5 + *(DWORD*)(uintptr_t)(a + 1)) == 0x424f20)
+            n += HookCall(a, 0x424f20, (void*)&FrameTimerHook);
+    Log("FrameWait: %d call site(s) hooked (margin %.1f ms)", n, g_FrameWaitMarginMs);
+}
+
+
+
+
 
 static HMODULE g_real = NULL;
 static FARPROC p_DirectDrawCreate;
@@ -3068,6 +3426,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         PatchGamePerf();
         PatchPauseAudio();
         PatchSoundFix();
+        PatchFrameWait();
         break;
     case DLL_PROCESS_DETACH:
         Log("process detach");

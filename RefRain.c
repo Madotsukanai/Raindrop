@@ -4,6 +4,10 @@
 #include <mmsystem.h>
 #include <stdio.h>
 
+
+
+
+
 static volatile int g_ShowStageMenu = 0;
 static volatile int g_StageSelected = 0;
 static volatile int g_PracticeMode = 0;
@@ -19,6 +23,7 @@ static volatile int g_AutoNavTimer = 0;
 static volatile int g_SimulatedKeyAction = SIMKEY_NONE;
 static volatile DWORD g_PracticeChar = 0;
 static volatile int g_CancelToTitle = 0;
+static volatile int g_PauseRetryAll = 0;
 static volatile int g_MenuCursor = 0;
 static volatile int g_ActiveColumn = 0;
 static volatile int g_LifeCursor = 2;
@@ -82,6 +87,10 @@ static void LogMessage(const char *format, ...) {
         fclose(fp);
     }
 }
+
+
+
+
 
 struct Vertex2D {
     float x, y, z, rhw;
@@ -267,6 +276,10 @@ static void UpdateSelectedCr(void) {
     g_SelectedCrDword = u.dw;
 }
 
+
+
+
+
 static void PlaySoundDirect(DWORD pSoundObj) {
     if (!pSoundObj || pSoundObj < 0x10000 || pSoundObj > 0x7fff0000) return;
 
@@ -325,6 +338,14 @@ static inline int IsReplayOrDemo(void) {
 typedef unsigned char (__attribute__((thiscall)) *PFN_IsKey)(void *this, int key);
 static PFN_IsKey orig_IsKeyPressed = (PFN_IsKey)0x00431760;
 static PFN_IsKey orig_IsKeyTriggered = (PFN_IsKey)0x004317a0;
+static int g_PauseMenuHotkeyAction = 0;
+static int g_PauseMenuHotkeyDowns = 0;
+static int g_PauseMenuHotkeyTarget = 0;
+static DWORD g_PauseMenuHotkeyNextTick = 0;
+static volatile int g_PauseMenuOpen = 0;
+static void PauseDiagKey(int key);
+static int g_PauseMenuSyntheticKey = -1;
+static DWORD g_PauseMenuSyntheticUntil = 0;
 
 static inline int MatchSimulatedKey(int action, int key) {
     switch (action) {
@@ -586,7 +607,9 @@ static void InstallWrapperDetour(DWORD target, DWORD detourFn, DWORD trampolineO
     }
 }
 
-// ===== Input latency instrumentation + tick-time input re-poll =====
+
+
+
 static volatile LONGLONG g_LatQpcFreq = 0;
 static volatile LONGLONG g_LatLastRenderQpc = 0;
 static volatile LONGLONG g_LatLastKeyPollQpc = 0;
@@ -603,6 +626,85 @@ static PFN_GetKeyboardState_t orig_GetKeyboardState = NULL;
 
 static BOOL WINAPI Mine_GetKeyboardState(PBYTE p) {
     BOOL r = orig_GetKeyboardState(p);
+    if (r && p) {
+        DWORD scene = *(volatile DWORD*)0x5c073c;
+        int inStage = ((scene >= 2 && scene <= 7) || scene == 10);
+        static int qWasDown = 0;
+        static int rWasDown = 0;
+        static int escWasDown = 0;
+        DWORD now = GetTickCount();
+        int qDown = (GetAsyncKeyState('Q') & 0x8000) != 0;
+        int rDown = (GetAsyncKeyState('R') & 0x8000) != 0;
+        int escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+
+        if (inStage) {
+            if (escDown && !escWasDown) {
+                g_PauseMenuOpen = !g_PauseMenuOpen;
+                g_PauseMenuHotkeyAction = 0;
+                LogMessage("Pause menu state: %s (ESC)", g_PauseMenuOpen ? "open" : "closed");
+            }
+            if (g_PauseMenuOpen && !g_PauseMenuHotkeyAction) {
+                if (qDown && !qWasDown) {
+                    g_PauseMenuHotkeyAction = 1;
+                    g_PauseMenuHotkeyDowns = 0;
+                    g_PauseMenuHotkeyTarget = 3;
+                    g_PauseMenuHotkeyNextTick = now;
+                    LogMessage("Pause hotkey Q: selecting Return to Title");
+                } else if (rDown && !rWasDown) {
+                    g_PauseMenuHotkeyAction = 1;
+                    g_PauseMenuHotkeyDowns = 0;
+                    g_PauseMenuHotkeyTarget = 2;
+                    g_PauseMenuHotkeyNextTick = now;
+                    g_PauseRetryAll = 1;
+                    LogMessage("Pause hotkey R: selecting Retry All");
+                }
+            }
+            qWasDown = qDown;
+            rWasDown = rDown;
+            escWasDown = escDown;
+
+            if (g_PauseMenuSyntheticKey >= 0 && now < g_PauseMenuSyntheticUntil)
+                p[g_PauseMenuSyntheticKey] |= 0x80;
+            else
+                g_PauseMenuSyntheticKey = -1;
+
+            if (g_PauseMenuHotkeyAction &&
+                (LONG)(now - g_PauseMenuHotkeyNextTick) >= 0) {
+                int key = -1;
+                if (g_PauseMenuHotkeyDowns < 4) {
+                    key = VK_UP;
+                } else if (g_PauseMenuHotkeyDowns < 4 + g_PauseMenuHotkeyTarget) {
+                    key = VK_DOWN;
+                } else {
+                    key = 'Z';
+                    g_PauseMenuHotkeyAction = 0;
+                    g_PauseMenuOpen = 0;
+                    LogMessage("Pause hotkey: injecting decide key");
+                }
+                g_PauseMenuHotkeyDowns++;
+                g_PauseMenuSyntheticKey = key;
+                g_PauseMenuSyntheticUntil = now + 45;
+                g_PauseMenuHotkeyNextTick = now + 180;
+                p[key] |= 0x80;
+                if (key == VK_UP)
+                    LogMessage("Pause hotkey: injecting UP (%d/4)", g_PauseMenuHotkeyDowns);
+                else if (key == VK_DOWN)
+                    LogMessage("Pause hotkey: injecting DOWN (%d/%d)",
+                               g_PauseMenuHotkeyDowns - 4, g_PauseMenuHotkeyTarget);
+            }
+        } else {
+            g_PauseMenuOpen = 0;
+            g_PauseMenuHotkeyAction = 0;
+            g_PauseMenuSyntheticKey = -1;
+            qWasDown = rWasDown = escWasDown = 0;
+        }
+
+        if (g_PauseMenuOpen && !g_PauseMenuHotkeyAction &&
+            ((p['Z'] | p[VK_RETURN] | p[VK_SPACE]) & 0x80)) {
+            g_PauseMenuOpen = 0;
+            LogMessage("Pause menu state: closed (decide)");
+        }
+    }
     if (g_LatQpcFreq) {
         LARGE_INTEGER li;
         QueryPerformanceCounter(&li);
@@ -742,6 +844,10 @@ unsigned char __attribute__((thiscall)) Hook_IsKeyPressed(void *this, int key) {
 
     return orig_IsKeyPressed(this, key);
 }
+
+
+
+
 
 static inline int GetConceptReactorKey(void) {
     DWORD pConfig = *(volatile DWORD*)0x5ac9b0;
@@ -993,7 +1099,6 @@ static int OrigGetGameInfoInt(const char *key, int format) {
 
 unsigned char __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key) {
     DWORD currentScene = *(volatile DWORD*)0x5c073c;
-
     if (g_ShowStageMenu) return 0;
 
     if (g_CancelDebounceActive && MatchSimulatedKey(SIMKEY_CANCEL, key)) {
@@ -1009,6 +1114,12 @@ unsigned char __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key)
     }
 
     unsigned char res = orig_IsKeyTriggered(this, key);
+    if (res) PauseDiagKey(key);
+    if (g_PauseMenuOpen && res &&
+        (key == 'Z' || key == VK_RETURN || key == VK_SPACE)) {
+        g_PauseMenuOpen = 0;
+        LogMessage("Pause menu state: closed (decide)");
+    }
 
     if (currentScene == 1 && g_RefrainWindowState == 1 && IsRefrainWindowOpen() && !g_ShowStageMenu && !g_AutoAdvanceToDifficulty && !IsReplayOrDemo() && res) {
         if (key == VK_UP || key == 'W' || key == 'w' || key == 0x26 || key == 0xC8) {
@@ -1079,6 +1190,10 @@ DWORD __cdecl HandleSetLives(DWORD origLives) {
     }
     return origLives;
 }
+
+
+
+
 
 void __attribute__((naked)) Hook_SetLives(void) {
     __asm__ __volatile__(
@@ -2178,6 +2293,10 @@ void __cdecl HandleSceneCheck(DWORD *pEdx) {
     }
 }
 
+
+
+
+
 static char *GetReplayGameState(void) {
     char *pInputMgr = *(char**)0x5ac9b4;
     if (pInputMgr && (DWORD)pInputMgr > 0x10000 && !IsBadReadPtr(pInputMgr, 0x20)) {
@@ -2218,6 +2337,43 @@ static int ReplayHasStage(int stage) {
 DWORD __cdecl HandleTrans(void) {
     DWORD prevScene = *(volatile DWORD*)0x5c073c;
     DWORD nextScene = *(volatile DWORD*)0x5c0740;
+
+    if (g_PauseRetryAll && prevScene != nextScene &&
+        (prevScene == 2 || (prevScene >= 3 && prevScene <= 10))) {
+        g_PauseRetryAll = 0;
+        if (g_PracticeMode && g_PracticeStage >= 1 && g_PracticeStage <= 5) {
+            DWORD retryScene = 2 + (DWORD)g_PracticeStage;
+            g_StageSelected = 1;
+            g_ShowStageMenu = 0;
+            g_AutoAdvanceToDifficulty = 0;
+            g_AutoNavPhase = 0;
+            g_AutoNavTimer = 0;
+            g_DifficultyConfirmed = 0;
+            g_SimulatedKeyAction = SIMKEY_NONE;
+            g_PendingStageInitStats = 1;
+            g_StageInitRenderFrames = 0;
+            InterlockedExchange(&g_PendingReset, 1);
+            ResetStageScore();
+            *(volatile DWORD*)0x5c0740 = retryScene;
+            LogMessage("Pause hotkey R: restarting current Practice stage %d (scene=%lu), skipping Practice menu",
+                       g_PracticeStage, retryScene);
+            return prevScene;
+        }
+
+        g_PracticeMode = 0;
+        g_PracticeStage = 0;
+        g_StageSelected = 1;
+        g_ShowStageMenu = 0;
+        g_AutoAdvanceToDifficulty = 0;
+        g_AutoNavPhase = 0;
+        g_AutoNavTimer = 0;
+        g_DifficultyConfirmed = 0;
+        g_SimulatedKeyAction = SIMKEY_NONE;
+        RestoreGlobalData();
+        LogMessage("Pause hotkey R: allowing native Retry All transition without Practice menu (prev=%lu next=%lu)",
+                   prevScene, nextScene);
+        return prevScene;
+    }
 
     if (g_CancelToTitle) {
         g_CancelToTitle = 0;
@@ -2405,6 +2561,10 @@ __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion) {
     return NULL;
 }
 
+
+
+
+
 static void ResetStageScore(void) {
     UpdateSelectedLives();
     UpdateSelectedMefa();
@@ -2463,6 +2623,101 @@ static void ResetStageScore(void) {
 
     LogMessage("ResetStageScore: Score and player stats reset (Lives=%d, MEFA=%f (dw=0x%08X), CR=%f (dw=0x%08X), GameState=0x%p)",
                g_SelectedLives, uMefa.f, uMefa.dw, uCr.f, uCr.dw, pGameState);
+}
+
+/* ---- PauseDiag: ポーズメニューの調査用ログ (ゲーム動作は変更しない) ----
+ * stage_select.log の "PauseDiag:" 行を共有する。
+ *  - シーン変数 0x5c073c(現在) / 0x5c0740(次) / 0x5c0744 / 0x4d237c(リプレイ枠) / 0x5b8e68 の変化
+ *  - フレームカウンタ 0x5abb78 が止まった(=ポーズ)/再開した瞬間の、ゲーム変数領域の差分
+ *  - IsKeyTriggered が true を返したキー
+ */
+static const int g_PauseDiag = 1;
+#define PD_NRANGE 6
+#define PD_MAXDW 128
+static const DWORD g_pdRange[PD_NRANGE][2] = {
+    { 0x5abb60, 0x5abbc0 }, { 0x5b8e00, 0x5b8e70 }, { 0x5ac4c0, 0x5ac4f0 },
+    { 0x5ac670, 0x5ac680 }, { 0x4d2370, 0x4d2380 }, { 0x5c0730, 0x5c0760 }
+};
+static volatile int g_pdFrozen = 0;
+
+static void PauseDiagKey(int key) {
+    if (!g_PauseDiag) return;
+    LogMessage("PauseDiag: IsKeyTriggered key=0x%02X scene=%lu next=%lu frame=%lu frozen=%d", key,
+               *(volatile DWORD*)0x5c073c, *(volatile DWORD*)0x5c0740,
+               *(volatile DWORD*)0x5abb78, g_pdFrozen);
+}
+
+static int PauseDiagSnap(DWORD *dst, DWORD *addrs) {
+    int n = 0;
+    for (int r = 0; r < PD_NRANGE; r++) {
+        for (DWORD a = g_pdRange[r][0]; a < g_pdRange[r][1] && n < PD_MAXDW; a += 4) {
+            addrs[n] = a;
+            dst[n] = IsBadReadPtr((void*)a, 4) ? 0 : *(volatile DWORD*)a;
+            n++;
+        }
+    }
+    return n;
+}
+
+static void PauseDiagDiff(const char *tag, const DWORD *a, const DWORD *b, const DWORD *addrs, int n) {
+    int shown = 0;
+    for (int i = 0; i < n; i++) {
+        if (a[i] != b[i] && shown < 40) {
+            LogMessage("PauseDiag: %s [0x%08X] %08X -> %08X", tag, addrs[i], a[i], b[i]);
+            shown++;
+        }
+    }
+    if (!shown) LogMessage("PauseDiag: %s no differences", tag);
+}
+
+static DWORD WINAPI PauseDiagThread(LPVOID param) {
+    DWORD prevScene = 0xffffffff, prevNext = 0xffffffff, prevPend = 0xffffffff;
+    DWORD prevSlot = 0xffffffff, prevObj = 0xffffffff, lastFrame = 0xffffffff;
+    DWORD lastMove = GetTickCount();
+    DWORD before[PD_MAXDW], during[PD_MAXDW], after[PD_MAXDW], addrs[PD_MAXDW];
+    int n = 0, haveBefore = 0;
+    (void)param;
+    LogMessage("PauseDiag: active (scene vars / frame freeze diff / triggered keys)");
+    for (;;) {
+        DWORD sc, nx, pd, slot, obj, fr;
+        Sleep(1);
+        sc = *(volatile DWORD*)0x5c073c;
+        nx = *(volatile DWORD*)0x5c0740;
+        pd = *(volatile DWORD*)0x5c0744;
+        slot = *(volatile DWORD*)0x4d237c;
+        obj = *(volatile DWORD*)0x5b8e68;
+        if (sc != prevScene || nx != prevNext || pd != prevPend || slot != prevSlot || obj != prevObj) {
+            LogMessage("PauseDiag: scene cur=%lu next=%lu pend=%lu replaySlot=%ld sceneObj=%08lX frame=%lu mode=%lu",
+                       sc, nx, pd, (long)slot, obj, *(volatile DWORD*)0x5abb78, *(volatile DWORD*)0x4d2378);
+            prevScene = sc; prevNext = nx; prevPend = pd; prevSlot = slot; prevObj = obj;
+        }
+        if (!((sc >= 2 && sc <= 7) || sc == 10)) {
+            if (g_pdFrozen) g_pdFrozen = 0;
+            haveBefore = 0;
+            lastFrame = 0xffffffff;
+            continue;
+        }
+        fr = *(volatile DWORD*)0x5abb78;
+        if (fr != lastFrame) {
+            lastFrame = fr;
+            lastMove = GetTickCount();
+            if (g_pdFrozen) {
+                g_pdFrozen = 0;
+                n = PauseDiagSnap(after, addrs);
+                LogMessage("PauseDiag: frame counter running again (frame=%lu) -> pause closed", fr);
+                PauseDiagDiff("resume", during, after, addrs, n);
+            } else {
+                n = PauseDiagSnap(before, addrs);
+                haveBefore = 1;
+            }
+        } else if (!g_pdFrozen && haveBefore && GetTickCount() - lastMove > 200) {
+            g_pdFrozen = 1;
+            n = PauseDiagSnap(during, addrs);
+            LogMessage("PauseDiag: frame counter frozen at %lu -> pause open? (scene=%lu)", fr, sc);
+            PauseDiagDiff("freeze", before, during, addrs, n);
+        }
+    }
+    return 0;
 }
 
 static DWORD WINAPI HotkeyThread(LPVOID param) {
@@ -2863,6 +3118,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) {
         LogMessage("RefRain stage select mod loaded.");
         InstallHooks();
         CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
+        if (g_PauseDiag) CreateThread(NULL, 0, PauseDiagThread, NULL, 0, NULL);
     }
     return TRUE;
 }
