@@ -2087,7 +2087,7 @@ static void ExSimulateSettled(int from, int target, int gt) {
         extra, gt, heldN, (extra >= EX_SETTLE_MAX) ? " -- LIMIT REACHED, tiles not settled" : "");
 }
 
-static unsigned char __cdecl EventDispatchHook(int frame) {
+static unsigned char __cdecl EventDispatchImpl(int frame) {
     static int f9prev = 0;
     FpuEnforce("stage", frame);
     PauseReplayRestore();
@@ -2165,6 +2165,19 @@ static unsigned char __cdecl EventDispatchHook(int frame) {
         }
     }
     return ((PF_EventDispatch)(uintptr_t)0x430020)(frame);
+}
+
+static unsigned char __cdecl EventDispatchHook(int frame) {
+    LARGE_INTEGER a, b;
+    unsigned char result;
+    QueryPerformanceCounter(&a);
+    result = EventDispatchImpl(frame);
+    QueryPerformanceCounter(&b);
+    LONGLONG dt = b.QuadPart - a.QuadPart;
+    g_gamePerf[0].ticks += dt;
+    if (dt > g_gamePerf[0].maxTicks) g_gamePerf[0].maxTicks = dt;
+    g_gamePerf[0].calls++;
+    return result;
 }
 
 typedef void (__cdecl *PF_EventInsert)(int time, void *node);
@@ -3052,6 +3065,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         PatchPracticePower();
         PatchExAreaSelect();
         PatchReplayFpu();
+        PatchGamePerf();
         PatchPauseAudio();
         PatchSoundFix();
         break;
