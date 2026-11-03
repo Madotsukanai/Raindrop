@@ -652,7 +652,9 @@ static void __attribute__((fastcall)) PauseUpdateHook(void *menu) {
             Log("ReplayPause: pause menu opened during replay playback");
         }
     }
-    if (input && menu && OPT_F(menu, 0x538) == 6) {
+    /* menu+0xc is the command input mode flag (set when the 4th item is chosen); the typed letters must not
+       act as the Q/R shortcuts while a command is being entered. */
+    if (input && menu && OPT_F(menu, 0x538) == 6 && OPT_F(menu, 0xc) == 0) {
         PF_InputKey rawkey = (PF_InputKey)(uintptr_t)0x431500;
         int next = 0;
         if (rawkey(input, 0x51)) next = 4;
@@ -927,6 +929,10 @@ static int g_exAreaChoice = 0;
 static int g_exRun = 0;
 static int g_exBossSelected = 0;
 static int g_exBossRun = 0;
+static int g_exBoss2Kill = 0;         /* Boss 2 practice: defeat Boss 1 at once (see ExBoss2Step) */
+static int g_exBoss2KillFrames = 0;
+static int g_exBoss2Logged = 0;
+static unsigned *g_exBoss1Obj = NULL;   /* the Boss 1 object being defeated (so that Boss 2 is never touched) */
 
 typedef void (__stdcall *PF_GameStart)(int stage);
 
@@ -971,7 +977,25 @@ static int g_exSkipWait = 0;
 static int g_exShorten = 0;
 
 static int g_exSimulatingStageFrame = 0;
+static int g_exBossRunLogged = 0;
 static volatile int g_exMuteSe = 0;   /* 1 while a practice skip fast-forwards: sound effects are not played */
+static int g_exBgmMuted = 0;
+static int g_exBgmSavedVol = 0;
+
+/* The BGM follows g_exMuteSe: it is silenced while a practice skip fast-forwards and the volume the
+   option screen set (0x45ab14, written by 0x4117c0) is restored afterwards. */
+static void ExBgmMuteSync(void) {
+    if (g_exMuteSe && !g_exBgmMuted) {
+        g_exBgmSavedVol = *(volatile unsigned char*)(uintptr_t)0x45ab14;
+        ((PF_SetVolume)(uintptr_t)0x4117c0)(0);
+        g_exBgmMuted = 1;
+        Log("ExArea: BGM muted for the fast-forward (volume %d)", g_exBgmSavedVol);
+    } else if (!g_exMuteSe && g_exBgmMuted) {
+        g_exBgmMuted = 0;
+        ((PF_SetVolume)(uintptr_t)0x4117c0)(g_exBgmSavedVol);
+        Log("ExArea: BGM volume restored to %d", g_exBgmSavedVol);
+    }
+}
 
 typedef unsigned char (__cdecl *PF_Op)(void *thread, void *args);
 static PF_Op g_origOp2 = NULL;
@@ -1030,10 +1054,15 @@ static void ExArm(void) {
     g_exSkipWait = 1;
 }
 
+static void ExDlgInstall(void);
+
 static void ExOnGameStart(int stage) {
     g_exRun = (stage == 4) && g_exStartReq;
     g_exBossRun = g_exRun ? g_exBossSelected : 0;
+    g_exBoss2Kill = 0;
     g_exStartReq = 0;
+    /* hook the VM before the practice fast-forward so the dialogue is not shown while it runs */
+    if (g_exBossRun >= 1) ExDlgInstall();
     if (stage == 4) {
         g_exPending = 1;
         ExArm();
@@ -1068,6 +1097,8 @@ static void __stdcall RetryHook(int stage) {
         return;
     }
     ((PF_GameStart)(uintptr_t)0x419d10)(stage);
+    if (stage == 4 && g_exRun)
+        *(volatile int*)(uintptr_t)0x4dadd8 = *(volatile int*)(uintptr_t)0x46c7c4;
     ExOnRetry(stage);
     ApplyPracticePower(stage, "retry");
 }
@@ -1090,6 +1121,43 @@ static int HookCall(DWORD callAddr, DWORD target, void *hook) {
         return 0;
     }
     rel = (DWORD)(uintptr_t)hook - (callAddr + 5);
+    memcpy(p + 1, &rel, 4);
+    VirtualProtect(p, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    return 1;
+}
+
+static unsigned char __attribute__((naked)) PracticeFlagStub(void) {
+    __asm__ volatile(
+        "pushl %ecx\n\t"
+        "pushl %edx\n\t"
+        "movzbl 0x4dade0, %eax\n\t"
+        "testl %eax, %eax\n\t"
+        "je 1f\n\t"
+        "cmpl $4, 0x4dade4\n\t"
+        "jne 1f\n\t"
+        "xorl %eax, %eax\n"
+        "1:\n\t"
+        "popl %edx\n\t"
+        "popl %ecx\n\t"
+        "ret");
+}
+
+static int PatchPracticeFlagRead(DWORD addr) {
+    unsigned char *p = (unsigned char*)addr;
+    DWORD old, rel, imm;
+
+    memcpy(&imm, p + 1, 4);
+    if (p[0] != 0xa0 || imm != 0x4dade0) {
+        Log("PracticeFlag: unexpected bytes at 0x%08X, skipped", addr);
+        return 0;
+    }
+    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old)) {
+        Log("PracticeFlag: VirtualProtect failed at 0x%08X (err=%08X)", addr, GetLastError());
+        return 0;
+    }
+    rel = (DWORD)(uintptr_t)&PracticeFlagStub - (addr + 5);
+    p[0] = 0xe8;
     memcpy(p + 1, &rel, 4);
     VirtualProtect(p, 5, old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, 5);
@@ -1190,6 +1258,8 @@ static void PatchPracticePower(void) {
         return;
     }
     n += HookCall(0x42377f, 0x423880, (void*)&GameStartHook);
+    n += PatchPracticeFlagRead(0x413b9a);
+    n += PatchPracticeFlagRead(0x417df2);
     n += HookCall(0x419c9e, 0x419d10, (void*)&RetryHook);
     n += HookCall(0x419cad, 0x419d10, (void*)&RetryHook);
     n += HookCall(0x419cb9, 0x419d10, (void*)&RetryHook);
@@ -1287,7 +1357,7 @@ static unsigned char __attribute__((fastcall)) PracticeUpdateHook(void *obj) {
             g_exBossSelected = 0;
         } else {
             *(int*)(scene + 0x10) = 4;
-            *(volatile unsigned char*)(uintptr_t)0x4dade0 = 0;
+            *(volatile unsigned char*)(uintptr_t)0x4dade0 = 1;
             *(volatile int*)(uintptr_t)0x4dadd8 = *(volatile int*)(uintptr_t)0x46c7c4;
             g_exStartReq = 1;
             g_exBossSelected = (g_exAreaChoice >= EX_AREA_N) ? g_exAreaChoice - EX_AREA_N + 1 : 0;
@@ -2012,10 +2082,246 @@ static void ExPracticeRestoreState(const ExPracticeSave *s) {
     *(volatile unsigned char*)(uintptr_t)0x4dae17 = s->cleared;
 }
 
+/* Boss intro dialogue investigation: after a Boss practice jump, log the first few calls of every VM
+   opcode handler (thread ip / wait / args) for EX_TR_FRAMES frames, to find the dialogue opcodes. */
+#define EX_TR_N 40
+#define EX_TR_FRAMES 2400
+static const int g_ExDlgTrace = 0;      /* 1: log VM opcodes after a Boss practice jump */
+/* The lines are only suppressed AFTER the fast-forward: while simulating they are shown as usual so the boss
+   script stays at its first dialogue wait, as in the real game (not showing them there makes the script run
+   ahead, the practice then starts in the middle of the attack and the battle BGM op18 is muted).
+   After the jump the message that the simulation left open is closed (0x4ea548 = message active, cleared by
+   the engine itself 0x434740 when a line ends) and later op21 lines are not shown. */
+static const int g_ExBossDlgSkip = 1;   /* 1: skip the Boss 1 intro dialogue in Boss practice */
+static const int g_ExBossDlgDump = 0;   /* 1: dump the script bytes of the dialogue region to the log */
+/* Boss 1 main thread (from ExTrace): the first dialogue line is op21 at ip 649740; the script resumes
+   at the op0 at ip 650448 (right before the BGM op18). op21 is 20 bytes and the VM adds the size of the
+   current instruction after the handler returns, so ip is set to END - 20 and the handler is not run. */
+#define EX_B1_DLG_FIRST 649740
+#define EX_B1_DLG_LO 649400
+#define EX_B1_DLG_END 650448
+static PF_Op g_trOrig[EX_TR_N];
+static int g_trInstalled = 0;
+static volatile int g_trOn = 0;
+static int g_trEndFrame = 0;
+static int g_trCnt[EX_TR_N];
+#define EX_TR_SEEN 8192
+static unsigned g_trSeen[EX_TR_SEEN];
+static int g_trLines = 0;
+static volatile int g_trDlgArmed = 0;
+
+/* true the first time this (opcode, ip) pair is seen in the current trace */
+static int ExTrFirst(int op, int ip) {
+    unsigned key = ((unsigned)op << 24) ^ (unsigned)ip ^ 0x80000000u;
+    unsigned h = (key * 2654435761u) >> 19, n;
+    for (n = 0; n < EX_TR_SEEN; n++, h = (h + 1) % EX_TR_SEEN) {
+        if (g_trSeen[h] == key) return 0;
+        if (g_trSeen[h] == 0) { g_trSeen[h] = key; return 1; }
+    }
+    return 0;
+}
+
+static void ExDumpScript(void *args, int ip) {
+    /* args points 4 bytes (instruction header) past the instruction start, ip is the instruction offset */
+    const unsigned char *base = (const unsigned char*)args - 4 - ip;
+    int from = 649600, to = 650800, a;
+
+    if (IsBadReadPtr(base + from, to - from)) {
+        Log("ExScript: range not readable (base=%p)", base);
+        return;
+    }
+    Log("ExScript: dump ip %d..%d (base=%p)", from, to, base);
+    for (a = from; a < to; a += 32) {
+        const unsigned *w = (const unsigned*)(base + a);
+        Log("ExScript: %d: %08X %08X %08X %08X %08X %08X %08X %08X", a,
+            w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    }
+}
+
+static int g_dlgSkipLog = 0;
+static int g_dlgShownLog = 0;
+
+static unsigned char ExTrCommon(int i, void *thr, void *args) {
+    unsigned char r;
+    if (i == 21 && g_exBossRun >= 1 && !g_exSimulatingStageFrame && g_dlgShownLog < 80) {
+        /* every dialogue line the script asks for after a Boss practice jump (shown or suppressed below) */
+        int ip0 = *(int*)((char*)thr + 0x14);
+        int suppressed = g_ExBossDlgSkip && ip0 >= EX_B1_DLG_LO && ip0 < EX_B1_DLG_END;
+        g_dlgShownLog++;
+        Log("ExDlg: Boss %d op21 thr=%p ip=%d line=%d frame=%d -> %s", g_exBossRun, thr, ip0,
+            IsBadReadPtr(args, 8) ? -1 : (int)((unsigned*)args)[1],
+            *(volatile int*)(uintptr_t)0x4dadf8, suppressed ? "suppressed" : "SHOWN");
+    }
+    if (i == 21 && g_ExBossDlgSkip && g_exBossRun >= 1 && !g_exSimulatingStageFrame) {
+        /* Boss 1 intro: each dialogue line is [op21 show line N][op6 loop until system var 0x1D == 0]
+           [op2 wait 1][op4 jump back]. Not showing the line leaves var 0x1D at 0, so the loop is left at
+           once, while the boss entrance ops between the lines still run. */
+        int ip = *(int*)((char*)thr + 0x14);
+        if (ip >= EX_B1_DLG_LO && ip < EX_B1_DLG_END) {
+            if (g_dlgSkipLog < 12) {
+                g_dlgSkipLog++;
+                Log("ExArea: Boss 1 dialogue line not shown (ip=%d line=%d frame=%d sim=%d)", ip,
+                    IsBadReadPtr(args, 8) ? -1 : (int)((unsigned*)args)[1],
+                    *(volatile int*)(uintptr_t)0x4dadf8, g_exSimulatingStageFrame);
+            }
+            return 1;
+        }
+    }
+    if (g_ExBossDlgDump && i == 21 && g_exBossRun >= 1 && g_trDlgArmed &&
+        *(int*)((char*)thr + 0x14) == EX_B1_DLG_FIRST) {
+        g_trDlgArmed = 0;
+        ExDumpScript(args, EX_B1_DLG_FIRST);
+    }
+    r = g_trOrig[i](thr, args);
+    if (g_trOn && !g_exSimulatingStageFrame && g_trLines < 3000 &&
+        ExTrFirst(i, *(int*)((char*)thr + 0x14))) {
+        unsigned *a = (unsigned*)args;
+        int ok = a && !IsBadReadPtr(a, 16);
+        g_trCnt[i]++;
+        g_trLines++;
+        Log("ExTrace: op%d thr=%p ip=%d wait=%d ret=%d frame=%d args=%08X %08X %08X %08X", i, thr,
+            *(int*)((char*)thr + 0x14), *(int*)((char*)thr + 0x10), (int)r,
+            *(volatile int*)(uintptr_t)0x4dadf8,
+            ok ? a[0] : 0, ok ? a[1] : 0, ok ? a[2] : 0, ok ? a[3] : 0);
+    }
+    return r;
+}
+#define EX_TR_DEF(i) static unsigned char __cdecl ExTr##i(void *t, void *a) { return ExTrCommon(i, t, a); }
+EX_TR_DEF(0) EX_TR_DEF(1) EX_TR_DEF(3) EX_TR_DEF(4) EX_TR_DEF(5) EX_TR_DEF(6) EX_TR_DEF(7)
+EX_TR_DEF(8) EX_TR_DEF(9) EX_TR_DEF(10) EX_TR_DEF(11) EX_TR_DEF(12) EX_TR_DEF(13) EX_TR_DEF(14)
+EX_TR_DEF(15) EX_TR_DEF(16) EX_TR_DEF(17) EX_TR_DEF(18) EX_TR_DEF(19) EX_TR_DEF(20) EX_TR_DEF(21)
+EX_TR_DEF(22) EX_TR_DEF(23) EX_TR_DEF(24) EX_TR_DEF(25) EX_TR_DEF(26) EX_TR_DEF(27) EX_TR_DEF(28)
+EX_TR_DEF(29) EX_TR_DEF(30) EX_TR_DEF(31) EX_TR_DEF(32) EX_TR_DEF(33) EX_TR_DEF(34) EX_TR_DEF(35)
+EX_TR_DEF(36) EX_TR_DEF(37) EX_TR_DEF(38) EX_TR_DEF(39)
+
+static void ExTraceStart(int target) {
+    static PF_Op hooks[EX_TR_N] = {
+        ExTr0, ExTr1, NULL, ExTr3, ExTr4, ExTr5, ExTr6, ExTr7, ExTr8, ExTr9, ExTr10, ExTr11, ExTr12,
+        ExTr13, ExTr14, ExTr15, ExTr16, ExTr17, ExTr18, ExTr19, ExTr20, ExTr21, ExTr22, ExTr23, ExTr24,
+        ExTr25, ExTr26, ExTr27, ExTr28, ExTr29, ExTr30, ExTr31, ExTr32, ExTr33, ExTr34, ExTr35, ExTr36,
+        ExTr37, ExTr38, ExTr39
+    };
+    void **tbl = *(void***)(uintptr_t)0x4ea1fc;
+    int i, n = 0;
+    DWORD old;
+
+    if ((!g_ExDlgTrace && !g_ExBossDlgSkip) || !tbl) return;
+    g_trDlgArmed = g_ExBossDlgSkip;
+    if (!g_trInstalled) {
+        for (i = 0; i < EX_TR_N; i++) {
+            DWORD p = (DWORD)(uintptr_t)tbl[i];
+            if (!hooks[i] || p < 0x401000 || p >= 0x460000) continue;
+            if (!g_ExDlgTrace && i != 21) continue;
+            if (!VirtualProtect(&tbl[i], sizeof(void*), PAGE_READWRITE, &old)) continue;
+            g_trOrig[i] = (PF_Op)tbl[i];
+            Log("ExTrace: opcode %d handler at 0x%08X", i, p);
+            tbl[i] = (void*)hooks[i];
+            VirtualProtect(&tbl[i], sizeof(void*), old, &old);
+            n++;
+        }
+        g_trInstalled = 1;
+        Log("ExTrace: hooked %d opcode handler(s)", n);
+    }
+    if (target < 0) return;   /* install only */
+    g_dlgSkipLog = 0;
+    g_dlgShownLog = 0;
+    memset(g_trCnt, 0, sizeof(g_trCnt));
+    memset(g_trSeen, 0, sizeof(g_trSeen));
+    g_trLines = 0;
+    g_trEndFrame = target + EX_TR_FRAMES;
+    g_trOn = g_ExDlgTrace;
+    Log("ExTrace: logging opcodes from frame %d to %d", target, g_trEndFrame);
+}
+
+static void ExDlgInstall(void) {
+    ExTraceStart(-1);
+}
+
+/* Boss 2 practice.  Boss 2 appears after Boss 1 is defeated, at a frame that depends on how fast the player
+   wins, so there is no fixed frame to jump to.  The practice jumps to the Boss 1 start like the Boss 1 practice
+   and then defeats Boss 1 at once (its hit points are set to 0 every frame) so that the script goes on to
+   Boss 2 by itself.  The Boss 2 BGM (g_exBossBgm[1], seen by ExVmBgmHook) ends the defeating.
+   Boss 1 is found as the only enemy object with a large hit point value (+0x2c, as for the player object);
+   candidates are logged so the rule can be adjusted. */
+/* The game keeps the current boss in DWORD 0x4dae04: the enemy spawn (0x42fa70) stores the new object there
+   when it is created with the boss flag, and the object removal (0x42ea40) clears it again.  The boss hit
+   points are the FLOAT at object+0x48 (1.0 = full; the HUD gauge 0x414710 draws it): the hit handler
+   (object+0x818 = 0x42a1a0, called as handler(self, shot)) subtracts the shot's +0x48 and, when the value is
+   <= 0, runs the defeat (score, hit box off, thread flag +0x0c = 1).  The old rule (int at +0x2c, 500..2000000)
+   never matched anything: +0x2c is a counter that starts at 0. */
+static unsigned *ExFindBossCandidate(int logIt) {
+    unsigned *boss = *(unsigned**)(uintptr_t)0x4dae04;
+
+    if (!boss || IsBadReadPtr(boss, 0x824)) return NULL;
+    if (logIt)
+        Log("ExArea: boss object=%p type=%u hp(+0x48)=%.3f flags(+0x40)=%08X hitbox(+0x109)=%u", (void*)boss,
+            boss[1], *(float*)((char*)boss + 0x48), boss[0x40 / 4], (unsigned)*((unsigned char*)boss + 0x109));
+    return boss;
+}
+
+static void ExBoss2Step(int frame) {
+    static unsigned char fakeShot[0x830] __attribute__((aligned(16)));
+    unsigned *boss;
+    float hp;
+
+    g_exBoss2KillFrames++;
+    if (g_exBoss2KillFrames > 3600) {
+        g_exBoss2Kill = 0;
+        Log("ExArea: Boss 2 practice: Boss 2 not seen within %d frames, giving up", g_exBoss2KillFrames);
+        return;
+    }
+    boss = ExFindBossCandidate(g_exBoss2KillFrames % 120 == 1);
+    if (!boss) {
+        if (g_exBoss1Obj) {
+            Log("ExArea: Boss 2 practice: Boss 1 object %p is gone (frame %d, %d frame(s) after the jump)",
+                (void*)g_exBoss1Obj, frame, g_exBoss2KillFrames);
+            g_exBoss1Obj = NULL;
+        }
+        return;
+    }
+    if (g_exBoss2KillFrames < 60) return;          /* let the Boss 1 entrance run first */
+    if (!g_exBoss1Obj) {
+        g_exBoss1Obj = boss;
+        Log("ExArea: Boss 2 practice: Boss 1 object %p found (hp=%.3f)", (void*)boss, *(float*)((char*)boss + 0x48));
+    } else if (boss != g_exBoss1Obj) {
+        /* a different boss object: this is Boss 2, leave it alone */
+        g_exBoss2Kill = 0;
+        Log("ExArea: Boss 2 appeared (object %p, hp=%.3f) %d frame(s) after the Boss 1 jump", (void*)boss,
+            *(float*)((char*)boss + 0x48), g_exBoss2KillFrames);
+        return;
+    }
+    hp = *(float*)((char*)boss + 0x48);
+    if (hp > 0.0f) {
+        *(float*)((char*)boss + 0x48) = 0.0f;
+        if (g_exBoss2Logged < 20) {
+            g_exBoss2Logged++;
+            Log("ExArea: Boss 2 practice: boss object %p hp %.3f -> 0 (frame %d)", (void*)boss, (double)hp, frame);
+        }
+    }
+    /* The defeat itself runs inside the hit handler; with hp <= 0 one call is enough (the shot only has to
+       look like a player shot: type 2 at +0x04, damage at +0x48).  Not repeated once the hit box is off. */
+    if (*((unsigned char*)boss + 0x109) != 0 && g_exBoss2KillFrames % 10 == 0) {
+        typedef void (__cdecl *PF_HitHandler)(void *self, void *other);
+        PF_HitHandler hit = (PF_HitHandler)(uintptr_t)boss[0x818 / 4];
+        if (hit && !IsBadCodePtr((FARPROC)hit)) {
+            *(int*)(fakeShot + 0x04) = 2;
+            *(float*)(fakeShot + 0x48) = 1.0f;
+            hit(boss, fakeShot);
+            Log("ExArea: Boss 2 practice: Boss 1 hit handler %p called (frame %d, hitbox now %u)", (void*)hit, frame,
+                (unsigned)*((unsigned char*)boss + 0x109));
+        }
+    }
+}
+
 static unsigned char __cdecl EventDispatchImpl(int frame) {
     static int f9prev = 0;
     FpuEnforce("stage", frame);
     PauseReplayRestore();
+    ExBgmMuteSync();
+    if (g_trOn && frame > g_trEndFrame) {
+        g_trOn = 0;
+        Log("ExTrace: finished at frame %d", frame);
+    }
     if (g_exSimulatingStageFrame)
         return ((PF_EventDispatch)(uintptr_t)0x430020)(frame);
     int f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
@@ -2038,12 +2344,28 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         }
         f8prev = f8;
     }
+    if (g_exBoss2Kill && !g_exSimulatingStageFrame)
+        ExBoss2Step(frame);
+    if (g_exBossRun == 1 && !g_exBoss2Kill && !g_exSimulatingStageFrame && g_exBossRunLogged < 400) {
+        /* Boss 1 practice (played normally): log when the current boss object changes or dies */
+        static unsigned *lastBoss = NULL;
+        unsigned *b = *(unsigned**)(uintptr_t)0x4dae04;
+        if (b != lastBoss) {
+            g_exBossRunLogged++;
+            if (b && !IsBadReadPtr(b, 0x824))
+                Log("ExDlg: Boss 1 practice: current boss object -> %p type=%u hp=%.3f (frame %d)", (void*)b, b[1],
+                    *(float*)((char*)b + 0x48), frame);
+            else
+                Log("ExDlg: Boss 1 practice: current boss object -> none (frame %d, was %p)", frame, (void*)lastBoss);
+            lastBoss = b;
+        }
+    }
     if (g_exPending && frame == 0 && *(volatile int*)(uintptr_t)0x4dade4 == 4) {
         g_exPending = 0;
         ExLogQueue();
     }
     if (g_exSkipWait && *(volatile int*)(uintptr_t)0x4dade4 == 4) {
-        int bossIndex = g_exBossRun - 1;
+        int bossIndex = (g_exBossRun >= 1) ? 0 : -1;   /* Boss 2: jump to Boss 1, then defeat it */
         int isBoss = bossIndex >= 0 && bossIndex < 2;
         int bgmId = isBoss ? g_exBossBgm[bossIndex] :
             ((g_exArea >= 0 && g_exArea < EX_AREA_N) ? g_exAreaBgm[g_exArea] : -1);
@@ -2096,6 +2418,13 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
             *(volatile int*)(uintptr_t)0x4dadf8 = target;
             g_exMuteSe = 0;
             ExPracticeRestoreState(&sv);
+            if (isBoss) ExTraceStart(target);
+            if (isBoss && g_ExBossDlgSkip && g_exBossRun >= 1) {
+                Log("ExArea: closing the dialogue message left open by the simulation (active=%d line=%d)",
+                    *(volatile unsigned char*)(uintptr_t)0x4ea548, *(volatile int*)(uintptr_t)0x4ea514);
+                *(volatile unsigned char*)(uintptr_t)0x4ea548 = 0;
+                g_dlgSkipLog = 0;
+            }
             ExLogLayerState("practice", target);
             if (isBoss) {
                 void *pl = *(void**)(uintptr_t)0x4e9ad4;
@@ -2112,6 +2441,13 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
             else
                 Log("ExArea: Area %d/%d jump to frame %d from frame %d (bgmId=%d, background mode %d)",
                     g_exArea + 1, g_exAreaN, target, startFrame, bgmId, areaBgMode);
+            if (isBoss && g_exBossRun == 2) {
+                g_exBoss2Kill = 1;
+                g_exBoss2KillFrames = 0;
+                g_exBoss2Logged = 0;
+                g_exBoss1Obj = NULL;
+                Log("ExArea: Boss 2 practice: Boss 1 is defeated at once so that the script goes on to Boss 2");
+            }
             frame = target;
         } else if (frame > 1500) {
             g_exSkipWait = 0;
@@ -2248,6 +2584,11 @@ static int __cdecl ExVmBgmHook(int id) {
             if (g_exBossBgmTime[1] <= 0 || frame < g_exBossBgmTime[1])
                 g_exBossBgmTime[1] = frame;
         }
+        if (g_exBoss2Kill && id == g_exBossBgm[1] && !g_exSimulatingStageFrame) {
+            g_exBoss2Kill = 0;
+            Log("ExArea: Boss 2 started (BGM id=%d at frame %d, %d frame(s) after the Boss 1 jump)", id,
+                frame, g_exBoss2KillFrames);
+        }
         if (g_exVmBgmLog)
             Log("ExArea: VM bgm id=%d frame=%d (sim=%d)", id, frame,
                 g_exSimulatingStageFrame ? 1 : 0);
@@ -2260,9 +2601,12 @@ static int __cdecl ExVmBgmHook(int id) {
 static const int g_PauseAudio = 1;
 
 #define AUDIO_MAX 1024
-typedef struct { IDirectSoundBuffer *buf; int paused, looping, posValid; DWORD pos; } AudioBuf;
+typedef struct { IDirectSoundBuffer *buf; int paused, looping, posValid; DWORD pos, settled; } AudioBuf;
 static AudioBuf g_audio[AUDIO_MAX];
 static int g_audioN = 0;
+static IDirectSoundBuffer *g_chkBuf = NULL;
+static DWORD g_chkPos = 0;
+static DWORD g_chkTick = 0;
 static CRITICAL_SECTION g_audioCs;
 
 typedef HRESULT (STDMETHODCALLTYPE *PF_DSCreateBuf)(IDirectSound*, LPCDSBUFFERDESC, LPDIRECTSOUNDBUFFER*, LPUNKNOWN);
@@ -2373,6 +2717,7 @@ static HRESULT WINAPI DSCreateHook(LPCGUID guid, LPDIRECTSOUND *pp, LPUNKNOWN un
 static void AudioPause(void) {
     int i, n = 0;
     EnterCriticalSection(&g_audioCs);
+    g_chkBuf = NULL;
     for (i = 0; i < g_audioN; i++) {
         DWORD st = 0;
         IDirectSoundBuffer *b = g_audio[i].buf;
@@ -2385,9 +2730,20 @@ static void AudioPause(void) {
             g_audio[i].posValid = SUCCEEDED(posHr);
             if (g_audio[i].posValid) g_audio[i].pos = pos;
             IDirectSoundBuffer_Stop(b);
-            if (g_audio[i].looping)
-                Log("PauseAudio: loop buffer %p saved play cursor %lu (hr=%08X)",
-                    (void*)b, (unsigned long)g_audio[i].pos, (unsigned)posHr);
+            g_audio[i].settled = g_audio[i].pos;
+            if (g_audio[i].looping) {
+                DWORD last = g_audio[i].pos, now = 0;
+                int k, same = 0;
+                for (k = 0; k < 20 && same < 3; k++) {
+                    Sleep(1);
+                    if (FAILED(IDirectSoundBuffer_GetCurrentPosition(b, &now, NULL))) break;
+                    if (k > 0 && now == last) same++; else same = 0;
+                    last = now;
+                }
+                g_audio[i].settled = last;
+                Log("PauseAudio: loop buffer %p saved play cursor %lu, settled at %lu after stop (hr=%08X)",
+                    (void*)b, (unsigned long)g_audio[i].pos, (unsigned long)g_audio[i].settled, (unsigned)posHr);
+            }
             n++;
         }
     }
@@ -2396,7 +2752,7 @@ static void AudioPause(void) {
 }
 
 static void AudioResume(int doPlay) {
-    int i, n = 0, fixed = 0;
+    int i, n = 0;
     EnterCriticalSection(&g_audioCs);
     for (i = 0; i < g_audioN; i++) {
         if (!g_audio[i].paused) continue;
@@ -2410,20 +2766,22 @@ static void AudioResume(int doPlay) {
                     IDirectSoundBuffer_Restore(b);
                 }
                 IDirectSoundBuffer_GetCurrentPosition(b, &cur, NULL);
-                if (g_audio[i].posValid &&
-                    SUCCEEDED(IDirectSoundBuffer_SetCurrentPosition(b, g_audio[i].pos))) fixed++;
                 IDirectSoundBuffer_Play(b, 0, 0, g_audio[i].looping ? DSBPLAY_LOOPING : 0);
                 if (g_audio[i].looping) {
                     IDirectSoundBuffer_GetCurrentPosition(b, &after, NULL);
-                    Log("PauseAudio: loop buffer %p resumed: stopped=%lu before_play=%lu after_play=%lu",
-                        (void*)b, (unsigned long)g_audio[i].pos, (unsigned long)cur, (unsigned long)after);
+                    Log("PauseAudio: loop buffer %p resumed: saved=%lu settled=%lu before_play=%lu after_play=%lu",
+                        (void*)b, (unsigned long)g_audio[i].pos, (unsigned long)g_audio[i].settled,
+                        (unsigned long)cur, (unsigned long)after);
+                    g_chkBuf = b;
+                    g_chkPos = after;
+                    g_chkTick = GetTickCount();
                 }
                 n++;
             }
         }
     }
     LeaveCriticalSection(&g_audioCs);
-    Log("PauseAudio: %s %d buffers (cursor restored on %d)", doPlay ? "resumed" : "dropped (retry/title)", n, fixed);
+    Log("PauseAudio: %s %d buffers", doPlay ? "resumed" : "dropped (retry/title)", n);
 }
 
 static DWORD WINAPI PauseAudioThread(LPVOID unused) {
@@ -2432,6 +2790,30 @@ static DWORD WINAPI PauseAudioThread(LPVOID unused) {
     for (;;) {
         int cur;
         Sleep(5);
+        if (g_chkBuf && GetTickCount() - g_chkTick >= 150) {
+            int k;
+            EnterCriticalSection(&g_audioCs);
+            for (k = 0; k < g_audioN; k++) {
+                if (g_audio[k].buf == g_chkBuf) {
+                    DWORD now = 0, size = 0, adv, avg = 0;
+                    DSBCAPS caps;
+                    WAVEFORMATEX wf;
+                    memset(&caps, 0, sizeof(caps));
+                    caps.dwSize = sizeof(caps);
+                    memset(&wf, 0, sizeof(wf));
+                    IDirectSoundBuffer_GetCurrentPosition(g_chkBuf, &now, NULL);
+                    if (SUCCEEDED(IDirectSoundBuffer_GetCaps(g_chkBuf, &caps))) size = caps.dwBufferBytes;
+                    if (SUCCEEDED(IDirectSoundBuffer_GetFormat(g_chkBuf, &wf, sizeof(wf), NULL))) avg = wf.nAvgBytesPerSec;
+                    adv = (now >= g_chkPos) ? now - g_chkPos : now + size - g_chkPos;
+                    Log("PauseAudio: resume check: cursor advanced %lu bytes (%lu ms of audio) in %lu ms",
+                        (unsigned long)adv, avg ? (unsigned long)((unsigned long long)adv * 1000 / avg) : 0UL,
+                        (unsigned long)(GetTickCount() - g_chkTick));
+                    break;
+                }
+            }
+            LeaveCriticalSection(&g_audioCs);
+            g_chkBuf = NULL;
+        }
         cur = (*(volatile unsigned char*)(uintptr_t)0x4dae16) != 0;
         if (cur && !prev) {
             AudioPause();
@@ -5277,6 +5659,45 @@ __declspec(dllexport) HRESULT WINAPI DllUnregisterServer(void) {
     return ((PF_FPOCH)p_DllUnregisterServer)();
 }
 
+/*
+ * Extra practice: no replay save prompt.
+ *
+ * When a stage ends, the scene update (0x413ab0) goes to the title for a practice run (BYTE 0x4dade0 != 0)
+ * and to scene 5 (replay save prompt) otherwise: `push 0; push 5; call 0x4254d0` at 0x413bdb.  The Extra
+ * practice is started like a normal Extra run (0x4dade0 = 0), so it ended in the replay save prompt.
+ * Every `push 0; push 5; call 0x4254d0` (cdecl, 0x4254d0(scene, force)) in the code is redirected to a hook
+ * that asks for the title (scene 1) instead while an Extra practice run (g_exRun) is active.
+ */
+typedef void (__cdecl *PF_SceneSwitch)(int scene, int force);
+
+static void __cdecl StageEndSceneHook(int scene, int force) {
+    if (scene == 5 && g_exRun) {
+        Log("ExArea: practice run ended, going to the title instead of the replay save scene");
+        scene = 1;
+    }
+    ((PF_SceneSwitch)(uintptr_t)0x4254d0)(scene, force);
+}
+
+static void PatchExNoReplaySave(void) {
+    unsigned char *p = (unsigned char*)(uintptr_t)0x401000;
+    unsigned char *end = (unsigned char*)(uintptr_t)0x450000;
+    int n = 0;
+
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("ExNoReplaySave: unexpected image base, skipped");
+        return;
+    }
+    for (; p + 9 <= end; p++) {
+        if (p[0] == 0x6a && p[1] == 0x00 && p[2] == 0x6a && p[3] == 0x05 && p[4] == 0xe8) {
+            if (HookCall((DWORD)(uintptr_t)(p + 4), 0x4254d0, (void*)&StageEndSceneHook)) {
+                Log("ExNoReplaySave: hooked scene 5 switch at 0x%08X", (unsigned)(uintptr_t)(p + 4));
+                n++;
+            }
+        }
+    }
+    Log("ExNoReplaySave: patched %d call site(s)", n);
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
@@ -5298,6 +5719,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         PatchReplayInputTrace();
         PatchPracticePower();
         PatchExAreaSelect();
+        PatchExNoReplaySave();
         PatchReplayFpu();
         PatchGamePerf();
         PatchPauseAudio();
