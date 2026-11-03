@@ -56,7 +56,7 @@ Stage 2 starts with power level 6, and Stage 3 starts at maximum power.
 
 - Extra stage selection in the Practice menu
 
-After clearing all stages, you can select Extra in Practice and use the left and right keys to choose Area 1–4. You can start practicing from the selected area. Background rendering is currently incorrect in some areas.
+After clearing all stages, select Extra in Practice and use the left and right keys to cycle through Area 1/4–4/4, Boss 1/2, and Boss 2/2. Practice starts from the selected area or boss fight.
 
 ### RefRain
 

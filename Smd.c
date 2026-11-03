@@ -922,20 +922,31 @@ static void PatchReplayInputTrace(void) {
 
 static const int g_PracticeStage2Power = 5;
 static const int g_PracticeStage3Power = 7;
+static int g_exArea = 0;
+static int g_exAreaChoice = 0;
+static int g_exRun = 0;
+static int g_exBossSelected = 0;
+static int g_exBossRun = 0;
 
 typedef void (__stdcall *PF_GameStart)(int stage);
 
 static void ApplyPracticePower(int stage, const char *what) {
-    if ((stage == 2 || stage == 3) && *(volatile unsigned char*)(uintptr_t)0x4dade0 != 0) {
-        int p = (stage == 2) ? g_PracticeStage2Power : g_PracticeStage3Power;
-        if (p < 0) return;
-        if (p > 7) p = 7;
-        *(volatile int*)(uintptr_t)0x4dadd0 = p;
-        *(volatile int*)(uintptr_t)0x4dadd4 =
-            (p > 0) ? *(volatile int*)(uintptr_t)(0x45ae00 + 4 * p) : 0;
-        Log("PracticePower: stage %d %s, power=%d counter=%d", stage, what, p,
-            *(volatile int*)(uintptr_t)0x4dadd4);
+    int p;
+    if (stage == 2 || stage == 3) {
+        if (*(volatile unsigned char*)(uintptr_t)0x4dade0 == 0) return;
+        p = (stage == 2) ? g_PracticeStage2Power : g_PracticeStage3Power;
+    } else if (stage == 4 && g_exRun && (g_exArea >= 1 || g_exBossSelected > 0)) {
+        p = 7;
+    } else {
+        return;
     }
+    if (p < 0) return;
+    if (p > 7) p = 7;
+    *(volatile int*)(uintptr_t)0x4dadd0 = p;
+    *(volatile int*)(uintptr_t)0x4dadd4 =
+        (p > 0) ? *(volatile int*)(uintptr_t)(0x45ae00 + 4 * p) : 0;
+    Log("PracticePower: stage %d %s, power=%d counter=%d", stage, what, p,
+        *(volatile int*)(uintptr_t)0x4dadd4);
 }
 
 #define EX_MAX_AREAS 16
@@ -949,16 +960,18 @@ static const int g_ExBgMode = 1;
 static const int g_ExBgDebugKeys = 0;
 static const int g_exAreaBgm[EX_AREA_N] = { 2, 3, 4, 5 };
 static const int g_exAreaDefaultFrame[EX_AREA_N] = { 362, 6612, 8962, 14192 };
+static const int g_exBossBgm[2] = { 6, 7 };
+static const int g_exBossDefaultFrame[2] = { 19074, 0 };
 static int g_exBgmTime[EX_BGM_IDS];
+static int g_exBossBgmTime[2];
 static int g_exAreaN = EX_AREA_N;
-static int g_exArea = 0;
 static int g_exStartReq = 0;
-static int g_exRun = 0;
 static int g_exPending = 0;
 static int g_exSkipWait = 0;
 static int g_exShorten = 0;
 
 static int g_exSimulatingStageFrame = 0;
+static volatile int g_exMuteSe = 0;   /* 1 while a practice skip fast-forwards: sound effects are not played */
 
 typedef unsigned char (__cdecl *PF_Op)(void *thread, void *args);
 static PF_Op g_origOp2 = NULL;
@@ -990,6 +1003,7 @@ static void ExArm(void) {
     DWORD old;
 
     memset(g_exBgmTime, 0, sizeof(g_exBgmTime));
+    memset(g_exBossBgmTime, 0, sizeof(g_exBossBgmTime));
     g_exSkipWait = 0;
     g_exShorten = 0;
     g_exOpLog = g_exRun ? 40 : 0;
@@ -1018,6 +1032,7 @@ static void ExArm(void) {
 
 static void ExOnGameStart(int stage) {
     g_exRun = (stage == 4) && g_exStartReq;
+    g_exBossRun = g_exRun ? g_exBossSelected : 0;
     g_exStartReq = 0;
     if (stage == 4) {
         g_exPending = 1;
@@ -1221,7 +1236,10 @@ static void ExRowEnsure(void *obj, int area) {
     memset(row, 0, 0xe8);
     ((PF_RowCtor)(uintptr_t)0x41fdf0)(row);
     ((PF_RowSetup)(uintptr_t)0x41ff10)(row, *(void**)((char*)obj + 0x10), 0x120, 0xf8, 0, 0, 0x100, 0x100, 0);
-    ((PF_RowText)(uintptr_t)0x41ff80)(row, 0x10, 0xc, 8, 9, 0xb, "Area %d/%d", area + 1, g_exAreaN);
+    if (area < EX_AREA_N)
+        ((PF_RowText)(uintptr_t)0x41ff80)(row, 0x10, 0xc, 8, 9, 0xb, "Area %d/%d", area + 1, g_exAreaN);
+    else
+        ((PF_RowText)(uintptr_t)0x41ff80)(row, 0x10, 0xc, 8, 9, 0xb, "Boss %d/2", area - EX_AREA_N + 1);
     *(int*)(row + 0xac) = 0x3f4ccccd;
     *(int*)(row + 0xb0) = 0x3f4ccccd;
     *(int*)(row + 0xd8) = 0x505050;
@@ -1266,12 +1284,18 @@ static unsigned char __attribute__((fastcall)) PracticeUpdateHook(void *obj) {
             *(volatile unsigned char*)(uintptr_t)0x4dade0 = 1;
             *(volatile int*)(uintptr_t)0x4dadd8 = *(int*)(uintptr_t)(0x46bc14 + 4 * *cur) - 1;
             g_exStartReq = 0;
+            g_exBossSelected = 0;
         } else {
             *(int*)(scene + 0x10) = 4;
             *(volatile unsigned char*)(uintptr_t)0x4dade0 = 0;
             *(volatile int*)(uintptr_t)0x4dadd8 = *(volatile int*)(uintptr_t)0x46c7c4;
             g_exStartReq = 1;
-            Log("ExArea: Extra practice start, area %d/%d", g_exArea + 1, g_exAreaN);
+            g_exBossSelected = (g_exAreaChoice >= EX_AREA_N) ? g_exAreaChoice - EX_AREA_N + 1 : 0;
+            if (!g_exBossSelected) g_exArea = g_exAreaChoice;
+            if (g_exBossSelected)
+                Log("ExArea: Boss %d practice start", g_exBossSelected);
+            else
+                Log("ExArea: Extra practice start, area %d/%d", g_exArea + 1, g_exAreaN);
         }
         *(int*)(scene + 8) = 0xb;
     }
@@ -1287,11 +1311,13 @@ static unsigned char __attribute__((fastcall)) PracticeUpdateHook(void *obj) {
     }
     if (*cur == 3) {
         if (hold(input, 2, 0xf)) {
-            g_exArea = (g_exArea + g_exAreaN - 1) % g_exAreaN;
+            g_exAreaChoice = (g_exAreaChoice + g_exAreaN + 1) % (g_exAreaN + 2);
+            if (g_exAreaChoice < g_exAreaN) g_exArea = g_exAreaChoice;
             playSe((void*)(uintptr_t)0x4ea3b8, 0, 0xff);
         }
         if (hold(input, 3, 0xf)) {
-            g_exArea = (g_exArea + 1) % g_exAreaN;
+            g_exAreaChoice = (g_exAreaChoice + 1) % (g_exAreaN + 2);
+            if (g_exAreaChoice < g_exAreaN) g_exArea = g_exAreaChoice;
             playSe((void*)(uintptr_t)0x4ea3b8, 0, 0xff);
         }
     }
@@ -1318,8 +1344,8 @@ static unsigned char __attribute__((fastcall)) PracticeDrawHook(void *obj) {
     if (*(int*)((char*)obj + 0xc) * 6 > 0xff) {
         char *row;
         ExLabelEnsure(obj);
-        ExRowEnsure(obj, g_exArea);
-        row = g_exRowBuf[g_exArea];
+        ExRowEnsure(obj, g_exAreaChoice);
+        row = g_exRowBuf[g_exAreaChoice];
         *(int*)(g_exLabelRow + 0xd8) = (*(int*)((char*)obj + 8) == 3) ? 0xffffff : 0x505050;
         *(int*)(row + 0xd8) = (*(int*)((char*)obj + 8) == 3) ? 0xffffff : 0x505050;
         ((PF_RowDraw)(uintptr_t)0x420270)(g_exLabelRow, 0);
@@ -1374,6 +1400,22 @@ static void ExSkipTo(int target, int area) {
         }
     }
     n = *headp;
+
+    {
+        /* If no BGM event starts exactly at the target (the boss area), keep the BGM that would be
+           playing there: take the latest earlier BGM event and move it to the target frame. */
+        unsigned *q, *keepBgm = NULL;
+        int bestT = -1, exact = 0;
+        for (q = *headp; q; q = (unsigned*)q[0]) {
+            if ((int)q[2] != 6) continue;
+            if ((int)q[1] == target) exact = 1;
+            else if ((int)q[1] < target && (int)q[1] > bestT) { bestT = (int)q[1]; keepBgm = q; }
+        }
+        if (!exact && keepBgm) {
+            Log("ExArea: BGM event at t=%d kept and moved to the target frame %d", bestT, target);
+            keepBgm[1] = (unsigned)target;
+        }
+    }
 
     while (n) {
         unsigned *next = (unsigned*)n[0];
@@ -1936,6 +1978,40 @@ static void ExSimulateSettled(int from, int target, int gt) {
         extra, gt, heldN, (extra >= EX_SETTLE_MAX) ? " -- LIMIT REACHED, tiles not settled" : "");
 }
 
+typedef struct {
+    int lives, gameOverCountdown, stageEnd;
+    int miss, bombs;
+    unsigned char continueUi, resultUi, cleared;
+} ExPracticeSave;
+
+static void ExPracticeSaveState(ExPracticeSave *s) {
+    s->lives = *(volatile int*)(uintptr_t)0x4dadd8;
+    s->gameOverCountdown = *(volatile int*)(uintptr_t)0x45ae00;
+    s->stageEnd = *(volatile int*)(uintptr_t)0x45adfc;
+    s->miss = *(volatile int*)(uintptr_t)0x4dadc0;
+    s->bombs = *(volatile int*)(uintptr_t)0x4dadc4;
+    s->resultUi = *(volatile unsigned char*)(uintptr_t)0x4dae14;
+    s->continueUi = *(volatile unsigned char*)(uintptr_t)0x4dae15;
+    s->cleared = *(volatile unsigned char*)(uintptr_t)0x4dae17;
+}
+
+static void ExPracticeRestoreState(const ExPracticeSave *s) {
+    Log("ExArea: practice state after skip: lives=%d countdown=%d end=%d miss=%d c4=%d ui=%d/%d/%d -> restoring lives=%d countdown=%d",
+        *(volatile int*)(uintptr_t)0x4dadd8, *(volatile int*)(uintptr_t)0x45ae00,
+        *(volatile int*)(uintptr_t)0x45adfc, *(volatile int*)(uintptr_t)0x4dadc0,
+        *(volatile int*)(uintptr_t)0x4dadc4, *(volatile unsigned char*)(uintptr_t)0x4dae14,
+        *(volatile unsigned char*)(uintptr_t)0x4dae15, *(volatile unsigned char*)(uintptr_t)0x4dae17,
+        s->lives, s->gameOverCountdown);
+    *(volatile int*)(uintptr_t)0x4dadd8 = s->lives;
+    *(volatile int*)(uintptr_t)0x45ae00 = s->gameOverCountdown;
+    *(volatile int*)(uintptr_t)0x45adfc = s->stageEnd;
+    *(volatile int*)(uintptr_t)0x4dadc0 = s->miss;
+    *(volatile int*)(uintptr_t)0x4dadc4 = s->bombs;
+    *(volatile unsigned char*)(uintptr_t)0x4dae14 = s->resultUi;
+    *(volatile unsigned char*)(uintptr_t)0x4dae15 = s->continueUi;
+    *(volatile unsigned char*)(uintptr_t)0x4dae17 = s->cleared;
+}
+
 static unsigned char __cdecl EventDispatchImpl(int frame) {
     static int f9prev = 0;
     FpuEnforce("stage", frame);
@@ -1967,21 +2043,38 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         ExLogQueue();
     }
     if (g_exSkipWait && *(volatile int*)(uintptr_t)0x4dade4 == 4) {
-        int bgmId = (g_exArea >= 0 && g_exArea < EX_AREA_N) ? g_exAreaBgm[g_exArea] : -1;
+        int bossIndex = g_exBossRun - 1;
+        int isBoss = bossIndex >= 0 && bossIndex < 2;
+        int bgmId = isBoss ? g_exBossBgm[bossIndex] :
+            ((g_exArea >= 0 && g_exArea < EX_AREA_N) ? g_exAreaBgm[g_exArea] : -1);
         if (bgmId < 0 || bgmId >= EX_BGM_IDS) {
             g_exSkipWait = 0;
-            Log("ExArea: invalid selected area index %d, skip cancelled", g_exArea);
+            Log("ExArea: invalid practice selection (area=%d boss=%d), skip cancelled", g_exArea, g_exBossRun);
             return ((PF_EventDispatch)(uintptr_t)0x430020)(frame);
         }
         int target = g_exBgmTime[bgmId];
         int haveBg;
-        if (target <= 0) target = ExFindBgmTime(bgmId);
-        if (target <= 0 && g_exArea >= 0 && g_exArea < EX_AREA_N && !g_exShorten)
+        if (isBoss && g_exBossBgmTime[bossIndex] > 0) {
+            target = g_exBossBgmTime[bossIndex];
+            Log("ExArea: Boss %d name-matched bgm frame %d", g_exBossRun, target);
+        }
+        if (isBoss && target <= 0) {
+            target = g_exBossBgmTime[bossIndex];
+            if (target <= 0) target = ExFindBgmTime(bgmId);
+        }
+        if (target <= 0 && isBoss) target = g_exBossDefaultFrame[bossIndex];
+        if (target <= 0 && !isBoss && g_exArea >= 0 && g_exArea < EX_AREA_N && !g_exShorten)
             target = g_exAreaDefaultFrame[g_exArea];
         if (target > 0) {
             int startFrame = frame;
-            int sel = (g_exArea >= 0 && g_exArea < EX_AREA_N) ? g_exAreaBgGroup[g_exArea] : 0;
+            int sel = isBoss ? 3 : ((g_exArea >= 0 && g_exArea < EX_AREA_N) ? g_exAreaBgGroup[g_exArea] : 0);
             int areaBgMode = g_ExBgMode;
+            /* The fast-forward runs the real stage update with no input, so the player is hit over and
+               over while the frames are simulated. Keep the state the run started with (lives, game-over
+               countdown, game-over/continue flags) and put it back after the jump. */
+            ExPracticeSave sv;
+            ExPracticeSaveState(&sv);
+            g_exMuteSe = 1;
             g_exSkipWait = 0;
             if (areaBgMode == 0) {
                 haveBg = ExBgSaveAll(sel);
@@ -2001,14 +2094,29 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
                     ExFastForward(startFrame, target);
             }
             *(volatile int*)(uintptr_t)0x4dadf8 = target;
+            g_exMuteSe = 0;
+            ExPracticeRestoreState(&sv);
             ExLogLayerState("practice", target);
-            Log("ExArea: Area %d/%d jump to frame %d from frame %d (bgmId=%d, background mode %d)",
-                g_exArea + 1, g_exAreaN, target, startFrame, bgmId,
-                areaBgMode);
+            if (isBoss) {
+                void *pl = *(void**)(uintptr_t)0x4e9ad4;
+                if (pl) {
+                    *(int*)((char*)pl + 0x8) = 0;
+                    if (*(int*)((char*)pl + 0x2c) <= 0) *(int*)((char*)pl + 0x2c) = 5;
+                    *(int*)((char*)pl + 0x14) = 0;
+                    Log("ExArea: revived player (state=%d hp=%d)", *(int*)((char*)pl + 0x8), *(int*)((char*)pl + 0x2c));
+                }
+            }
+            if (isBoss)
+                Log("ExArea: Boss %d jump to frame %d from frame %d (bgmId=%d, background mode %d)",
+                    g_exBossRun, target, startFrame, bgmId, areaBgMode);
+            else
+                Log("ExArea: Area %d/%d jump to frame %d from frame %d (bgmId=%d, background mode %d)",
+                    g_exArea + 1, g_exAreaN, target, startFrame, bgmId, areaBgMode);
             frame = target;
         } else if (frame > 1500) {
             g_exSkipWait = 0;
-            Log("ExArea: BGM event of area %d not seen, no skip", g_exArea + 1);
+            if (isBoss) Log("ExArea: BGM event for Boss %d not seen, no skip", g_exBossRun);
+            else Log("ExArea: BGM event of area %d not seen, no skip", g_exArea + 1);
         } else if (frame % 60 == 0) {
             ExLogProgress(frame);
         }
@@ -2088,6 +2196,11 @@ static void PatchReplayFpu(void) {
         Log("FpuFix: stage frame hook installed");
 }
 
+typedef int (__cdecl *PF_VmBgm)(int id);
+static int g_exVmBgmLog = 1;
+static int __cdecl ExVmBgmHook(int id);
+static int __cdecl ExVmSpawnHook(void *a, void *b);
+
 static void PatchExAreaSelect(void) {
     int n = 0;
 
@@ -2103,6 +2216,45 @@ static void PatchExAreaSelect(void) {
     Log("ExArea: event insert log: %d call site(s) hooked", PatchEventInsertLog());
     if (HookCall(0x4300b4, 0x427d40, (void*)&BgPushHook))
         Log("ExArea: background push log hooked");
+    if (HookCall(0x42f0c3, 0x433740, (void*)&ExVmBgmHook))
+        Log("ExArea: VM bgm op hooked");
+    if (HookCall(0x42f475, 0x42a030, (void*)&ExVmSpawnHook))
+        Log("ExArea: VM spawn op hooked");
+}
+
+typedef int (__cdecl *PF_VmSpawnReg)(void *a, void *b);
+static int __cdecl ExVmSpawnHook(void *a, void *b) {
+    unsigned *p = (unsigned*)b;
+    int frame = g_exSimulatingStageFrame ? g_exSimulatingStageFrame :
+        *(volatile int*)(uintptr_t)0x4dadf8;
+    if (g_exVmBgmLog && frame >= 17000 && frame <= 26000)
+        Log("ExArea: VM spawn frame=%d sim=%d s=%08X a=%08X a2=%08X a3=%08X a4=%08X",
+            frame, g_exSimulatingStageFrame ? 1 : 0, (unsigned)(uintptr_t)b,
+            p ? p[0] : 0, p ? p[1] : 0, p ? p[2] : 0, p ? p[3] : 0);
+    return ((PF_VmSpawnReg)(uintptr_t)0x42a030)(a, b);
+}
+
+static int __cdecl ExVmBgmHook(int id) {
+    int frame;
+    if (id >= 0 && id < EX_BGM_IDS) {
+        frame = g_exSimulatingStageFrame ? g_exSimulatingStageFrame :
+            *(volatile int*)(uintptr_t)0x4dadf8;
+        if (frame < g_exBgmTime[id] || g_exBgmTime[id] <= 0)
+            g_exBgmTime[id] = frame;
+        if (id == g_exBossBgm[0]) {
+            if (g_exBossBgmTime[0] <= 0 || frame < g_exBossBgmTime[0])
+                g_exBossBgmTime[0] = frame;
+        } else if (id == g_exBossBgm[1]) {
+            if (g_exBossBgmTime[1] <= 0 || frame < g_exBossBgmTime[1])
+                g_exBossBgmTime[1] = frame;
+        }
+        if (g_exVmBgmLog)
+            Log("ExArea: VM bgm id=%d frame=%d (sim=%d)", id, frame,
+                g_exSimulatingStageFrame ? 1 : 0);
+    }
+    if (g_exSimulatingStageFrame)
+        return 0;
+    return ((PF_VmBgm)(uintptr_t)0x433740)(id);
 }
 
 static const int g_PauseAudio = 1;
@@ -2375,6 +2527,7 @@ static void __attribute__((thiscall)) SePlayHook(void *se, int pan, int vol) {
     DWORD status = 0;
     HRESULT hr;
 
+    if (g_exMuteSe || g_exSimulatingStageFrame) return;   /* silent during the practice fast-forward */
     if (!bufs || count <= 0) return;
     if (idx < 0 || idx >= count) idx = 0;
 
