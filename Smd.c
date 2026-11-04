@@ -1703,11 +1703,11 @@ static void ExRowEnsure(void *obj, int area) {
     g_exRowTex[area] = tex;
     memset(row, 0, 0xe8);
     ((PF_RowCtor)(uintptr_t)0x41fdf0)(row);
-    ((PF_RowSetup)(uintptr_t)0x41ff10)(row, *(void**)((char*)obj + 0x10), 0x120, 0xf8, 0, 0, 0x100, 0x100, 0);
+    ((PF_RowSetup)(uintptr_t)0x41ff10)(row, *(void**)((char*)obj + 0x10), 0xe0, 0xf8, 0, 0, 0x100, 0x100, 0);
     if (area < EX_AREA_N)
         ((PF_RowText)(uintptr_t)0x41ff80)(row, 0x10, 0xc, 8, 9, 0xb, "< Area %d/%d >", area + 1, g_exAreaN);
     else
-        ((PF_RowText)(uintptr_t)0x41ff80)(row, 0x10, 0xc, 8, 9, 0xb, "Boss %d/2", area - EX_AREA_N + 1);
+        ((PF_RowText)(uintptr_t)0x41ff80)(row, 0x10, 0xc, 8, 9, 0xb, "< Boss %d/2 >", area - EX_AREA_N + 1);
     *(int*)(row + 0xac) = 0x3f4ccccd;
     *(int*)(row + 0xb0) = 0x3f4ccccd;
     *(int*)(row + 0xd8) = 0x505050;
