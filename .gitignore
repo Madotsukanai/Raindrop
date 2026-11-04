@@ -3,3 +3,4 @@ build/
 .smd_extract/
 d3d9.dll
 ddraw.dll
+extract_smd.sh
