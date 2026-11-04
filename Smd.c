@@ -5493,7 +5493,6 @@ typedef struct { float x, y, z, rhw; DWORD color; float u, v; } D7Quad;
 static int D7_BltToDev(const RECT *drIn, D7Surf *s, const RECT *srIn, int useKey) {
     RECT dr, sr;
     IDirect3DTexture9 *t;
-    IDirect3DStateBlock9 *sb = g_d7.sb;
     IDirect3DDevice9 *dev = g_d7.dev;
     D7Quad q[4];
     float x0, y0, x1, y1, u0, v0, u1, v1;
@@ -6842,7 +6841,7 @@ static HRESULT STDMETHODCALLTYPE WDD7_GetMonitorFrequency(IDirectDraw7 *self, LP
 static HRESULT STDMETHODCALLTYPE WDD7_GetScanLine(IDirectDraw7 *self, LPDWORD s) {
     return IDirectDraw7_GetScanLine(((DD7W*)self)->orig, s);
 }
-static HRESULT STDMETHODCALLTYPE WDD7_GetVerticalBlankStatus(IDirectDraw7 *self, WINBOOL *b) {
+static HRESULT STDMETHODCALLTYPE WDD7_GetVerticalBlankStatus(IDirectDraw7 *self, BOOL *b) {
     return IDirectDraw7_GetVerticalBlankStatus(((DD7W*)self)->orig, b);
 }
 static HRESULT STDMETHODCALLTYPE WDD7_Initialize(IDirectDraw7 *self, GUID *g) {
