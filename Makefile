@@ -27,13 +27,13 @@ smd: $(BUILD)/ddraw.dll
 smd-debug: $(BUILD)/debug/ddraw.dll
 
 $(BUILD)/debug/ddraw.dll: $(BUILD)/Smd_debug.o | $(BUILD)/debug
-	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldinput -ldxguid
 
 $(BUILD)/Smd_debug.o: Smd.c | $(BUILD)
 	$(CC) -c -o $@ $< $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS)
 
 $(BUILD)/ddraw.dll: $(BUILD)/Smd.o
-	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldinput -ldxguid
 
 $(BUILD)/Smd.o: Smd.c | $(BUILD)
 	$(CC) -c -o $@ $< $(SMD_CFLAGS) $(SMD_DEFS)

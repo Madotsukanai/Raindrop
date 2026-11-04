@@ -1,10 +1,12 @@
 #define CINTERFACE
 #define COBJMACROS
+#define DIRECTINPUT_VERSION 0x0800
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <ddraw.h>
 #include <d3d9.h>
 #include <mmsystem.h>
+#include <dinput.h>
 #include <mmreg.h>
 #include <dsound.h>
 #include <math.h>
@@ -43,6 +45,7 @@ static void ExeDirFile(const char *name, char *out) {
     strcat(out, name);
 }
 
+#ifdef SMD_DEBUG_BUILD
 static void LogOpen(void) {
     if (g_log) return;
     char path[MAX_PATH];
@@ -70,6 +73,10 @@ static void Log(const char *fmt, ...) {
         }
     }
 }
+#else
+static void LogOpen(void) {}
+static void Log(const char *fmt, ...) { (void)fmt; }
+#endif
 
 static void LogWindowsVersion(void) {
     typedef LONG (WINAPI *PF_RtlGetVersion)(OSVERSIONINFOW*);
@@ -577,9 +584,11 @@ static int OptionVolume(int off, int vol);
 static int HookCall(DWORD callAddr, DWORD target, void *hook);
 
 static char g_OptionDefaultRow[0xe8] __attribute__((aligned(16)));
-static void *g_OptionDefaultTex;    /* private 256x256 text surface of the Default row */
 static void *g_OptionDefaultScene;  /* first texture of the option screen the row was built for */
 static int g_OptionDefaultRowInit;
+static char g_OptionDefaultLabelRow[0xe8] __attribute__((aligned(16)));
+static void *g_OptionDefaultLabelScene;
+static int g_OptionDefaultLabelReady;
 typedef void *(__cdecl *PF_CreateTexture)(int w, int h, const char *name, int flag);
 
 static void OptionApplyDefaults(void *opt, int page) {
@@ -610,178 +619,28 @@ static void OptionApplyDefaults(void *opt, int page) {
  * embedded font object (ctor 0x407ec0, init 0x407fa0, dtor 0x407f30) - not a texture, so it must never
  * be handed to the row setup (0x41ff10) / text (0x41ff80) functions.
  * The option screen is rebuilt (textures re-created by 0x41ad00) every time the title screen is built,
- * so the row and its surface are rebuilt whenever +0x00 changes.
+ * so the row and its surface are rebuilt whenever +0x00 changes.  The game's native text renderer is
+ * used so this label shares the option menu's built-in font style.
  */
-static void OptionDefaultDrawText(void *opt) {
-    void *scene = *(void**)opt;
-    int selected = OPT_F(opt, 0x3310) == 7;
-    if (!scene) return;
-    if (!g_OptionDefaultRowInit || g_OptionDefaultScene != scene) {
-        void *tex = ((PF_CreateTexture)(uintptr_t)0x4097b0)(0x100, 0x100, (const char*)(uintptr_t)0x45b1c4, 1);
-        if (!tex) {
-            Log("OptionDefault: text surface creation failed");
-            return;
-        }
-        g_OptionDefaultRowInit = 1;
-        g_OptionDefaultScene = scene;
-        g_OptionDefaultTex = tex;
-        memset(g_OptionDefaultRow, 0, sizeof(g_OptionDefaultRow));
-        ((PF_OptionRowCtor)(uintptr_t)0x41fdf0)(g_OptionDefaultRow);
-        ((PF_OptionRowSetup)(uintptr_t)0x41ff10)(g_OptionDefaultRow, tex, 0xd4, 0x14c, 0, 0, 0x100, 0x100, 0);
-        ((PF_OptionRowText)(uintptr_t)0x41ff80)(g_OptionDefaultRow, 0x10, 0xc, 8, 9, 0xb, "Default");
-        *(int*)(g_OptionDefaultRow + 0xac) = 0x3f4ccccd;
-        *(int*)(g_OptionDefaultRow + 0xb0) = 0x3f4ccccd;
-        Log("OptionDefault: Default row built (scene=%p tex=%p)", scene, tex);
-    }
-    *(int*)(g_OptionDefaultRow + 0x20) = 0xff;   /* alpha: the option screen sets it per frame, 0xff once faded in */
-    *(int*)(g_OptionDefaultRow + 0xd8) = selected ? 0xffffff : 0xa0a0a0;
-    ((PF_OptionRowDraw)(uintptr_t)0x420270)(g_OptionDefaultRow, 0);
-}
-
-/*
- * Preferred way to show the Default row: the other labels of the option screen are cut out of one
- * 256x256 picture (option+4, 8 labels of 128x32 at x=0).  The right half of it is unused, so
- * "Default" is rendered there with GDI (Arial, white, anti-aliased) and drawn as a normal label row
- * (same blending, alpha and position handling as the others).  If the picture cannot be written the
- * game's own text row (OptionDefaultDrawText) is used instead.
- */
-typedef void (__attribute__((thiscall)) *PF_OptionRowDrawT)(void *row);
-
-static char g_OptionLabelRow[0xe8] __attribute__((aligned(16)));
-static void *g_OptionLabelScene;
-static int g_OptionLabelMode;     /* 0: not built, 1: label in the atlas, 2: fallback to the text row */
-static int g_optPrevEnter;
-
-static DWORD OptPackMask(DWORD mask, unsigned v8) {
-    unsigned shift = 0, bits = 0;
-    if (!mask) return 0;
-    while (shift < 32 && !((mask >> shift) & 1)) shift++;
-    while (shift + bits < 32 && ((mask >> (shift + bits)) & 1)) bits++;
-    if (bits > 8) bits = 8;
-    if (!bits) return 0;
-    return ((DWORD)(v8 >> (8 - bits)) << shift) & mask;
-}
-
-static int OptionRenderDefaultLabel(void *tex, int rx, int ry) {
-    enum { LW = 128, LH = 32 };
-    IDirectDrawSurface7 *surf;
-    DDSURFACEDESC2 d;
-    BITMAPINFO bi;
-    HDC dc;
-    HBITMAP bmp, oldBmp;
-    HFONT font, oldFont = NULL;
-    unsigned char *bits = NULL;
-    int x, y, bytes, bpp, ok = 0, nonEmpty = 0;
-    DWORD rm, gm, bm, am;
-
-    if (!tex || IsBadReadPtr(tex, 4)) return 0;
-    surf = *(IDirectDrawSurface7**)tex;
-    if (!surf || IsBadReadPtr(surf, 4)) return 0;
-
-    dc = CreateCompatibleDC(NULL);
-    if (!dc) return 0;
-    memset(&bi, 0, sizeof(bi));
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = LW;
-    bi.bmiHeader.biHeight = -LH;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&bits, NULL, 0);
-    if (!bmp || !bits) {
-        DeleteDC(dc);
-        return 0;
-    }
-    oldBmp = (HBITMAP)SelectObject(dc, bmp);
-    memset(bits, 0, LW * LH * 4);
-    font = CreateFontA(-19, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                       DEFAULT_PITCH | FF_SWISS, "Arial");
-    if (font) oldFont = (HFONT)SelectObject(dc, font);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(255, 255, 255));
-    TextOutA(dc, 1, 6, "Default", 7);
-    GdiFlush();
-
-    memset(&d, 0, sizeof(d));
-    d.dwSize = sizeof(d);
-    if (SUCCEEDED(IDirectDrawSurface7_Lock(surf, NULL, &d, DDLOCK_WAIT, NULL))) {
-        bpp = (int)d.ddpfPixelFormat.dwRGBBitCount;
-        rm = d.ddpfPixelFormat.dwRBitMask;
-        gm = d.ddpfPixelFormat.dwGBitMask;
-        bm = d.ddpfPixelFormat.dwBBitMask;
-        am = (d.ddpfPixelFormat.dwFlags & DDPF_ALPHAPIXELS) ? d.ddpfPixelFormat.dwRGBAlphaBitMask : 0;
-        bytes = bpp / 8;
-        if ((d.ddpfPixelFormat.dwFlags & DDPF_RGB) && (bpp == 16 || bpp == 32) && d.lpSurface &&
-            (!d.dwWidth || d.dwWidth >= (DWORD)(rx + LW)) && (!d.dwHeight || d.dwHeight >= (DWORD)(ry + LH))) {
-            for (y = 0; y < LH && !nonEmpty; y++) {
-                unsigned char *p = (unsigned char*)d.lpSurface + (size_t)(ry + y) * d.lPitch + (size_t)rx * bytes;
-                for (x = 0; x < LW; x++, p += bytes) {
-                    DWORD v = bytes == 4 ? *(DWORD*)p : *(WORD*)p;
-                    if (am ? (v & am) : v) { nonEmpty = 1; break; }
-                }
-            }
-            if (!nonEmpty) {
-                for (y = 0; y < LH; y++) {
-                    unsigned char *p = (unsigned char*)d.lpSurface + (size_t)(ry + y) * d.lPitch + (size_t)rx * bytes;
-                    for (x = 0; x < LW; x++, p += bytes) {
-                        unsigned a = bits[(y * LW + x) * 4 + 1];
-                        DWORD pix = 0;
-                        if (a) {
-                            if (am) pix = OptPackMask(am, a) | OptPackMask(rm, 255) | OptPackMask(gm, 255) | OptPackMask(bm, 255);
-                            else    pix = OptPackMask(rm, a) | OptPackMask(gm, a) | OptPackMask(bm, a);
-                        }
-                        if (bytes == 4) *(DWORD*)p = pix;
-                        else            *(WORD*)p = (WORD)pix;
-                    }
-                }
-                ok = 1;
-            } else {
-                Log("OptionDefault: atlas region (%d,%d) is not empty", rx, ry);
-            }
-        } else {
-            Log("OptionDefault: atlas surface not usable (bpp=%d flags=%08X %lux%lu)", bpp,
-                (unsigned)d.ddpfPixelFormat.dwFlags, (unsigned long)d.dwWidth, (unsigned long)d.dwHeight);
-        }
-        IDirectDrawSurface7_Unlock(surf, NULL);
-    } else {
-        Log("OptionDefault: atlas surface Lock failed");
-    }
-
-    if (oldFont) SelectObject(dc, oldFont);
-    if (font) DeleteObject(font);
-    SelectObject(dc, oldBmp);
-    DeleteObject(bmp);
-    DeleteDC(dc);
-    return ok;
-}
+static int g_OptionDefaultLabelReady;
 
 static void OptionDefaultDraw(void *opt) {
-    void *scene = *(void**)opt;
-    void *atlas = *(void**)((char*)opt + 4);
-    int selected = OPT_F(opt, 0x3310) == 7;
-
-    if (!scene) return;
-    if (g_OptionLabelScene != scene) {
-        g_OptionLabelScene = scene;
-        g_OptionLabelMode = 2;
-        if (atlas && OptionRenderDefaultLabel(atlas, 0x80, 0)) {
-            memset(g_OptionLabelRow, 0, sizeof(g_OptionLabelRow));
-            ((PF_OptionRowCtor)(uintptr_t)0x41fdf0)(g_OptionLabelRow);
-            ((PF_OptionRowSetup)(uintptr_t)0x41ff10)(g_OptionLabelRow, atlas, 0xe4, 0x152, 0x80, 0, 0x80, 0x20, 0);
-            g_OptionLabelMode = 1;
-            Log("OptionDefault: Default label rendered into the option atlas %p", atlas);
-        } else {
-            Log("OptionDefault: atlas label unavailable, using the game's text row");
-        }
+    typedef void (__attribute__((thiscall)) *PF_OptionLabelDraw)(void *row);
+    char *source = (char*)opt + 0x1d48 + 8 * 0xe8;
+    double targetY = 338.0;
+    if (g_OptionDefaultLabelScene != *(void**)opt) {
+        g_OptionDefaultLabelScene = *(void**)opt;
+        memcpy(g_OptionDefaultLabelRow, source, sizeof(g_OptionDefaultLabelRow));
+        memcpy(g_OptionDefaultLabelRow + 0x10, &targetY, sizeof(targetY));
+        g_OptionDefaultLabelReady = 1;
     }
-    if (g_OptionLabelMode == 1) {
-        OPT_F(g_OptionLabelRow, 0x20) = selected ? 0xff : 0x66;   /* same alphas as the other labels */
-        ((PF_OptionRowDrawT)(uintptr_t)0x4200a0)(g_OptionLabelRow);
-    } else {
-        OptionDefaultDrawText(opt);
+    if (g_OptionDefaultLabelReady) {
+        OPT_F(g_OptionDefaultLabelRow, 0x20) = OPT_F(opt, 0x3310) == 7 ? 0xff : 0x66;
+        ((PF_OptionLabelDraw)(uintptr_t)0x4200a0)(g_OptionDefaultLabelRow);
     }
 }
+
+static int g_optPrevEnter;
 
 static int OptionVolume(int off, int vol) {
     double v = off ? *(double*)(uintptr_t)0x453cc0 : (double)vol * *(double*)(uintptr_t)0x453cb8;
@@ -918,6 +777,8 @@ static const int g_ReplayPause = 1;
 static int g_pauseSeen = 0;
 static int g_pauseReplay = 0;
 static int g_pauseReplayHandled = 0;
+static int g_pauseAfterLoad = 0;
+static int g_pauseLoadArmed = 0;
 static int g_replayFileId = -1;
 static int g_replayStage = 1;
 static int g_replayFileIdCaptured = 0;
@@ -1266,6 +1127,18 @@ static int g_exAreaChoice = 0;
 static int g_exRun = 0;
 static int g_exBossSelected = 0;
 static int g_exBossRun = 0;
+static int g_practiceBossStage = 0;
+static int g_practiceBossActive = 0;
+static int g_practiceBossTarget = 0;
+static int g_practiceBgmLastId = -1;
+static int g_practiceBossSeekingSecondForm = 0;
+static int g_practiceBossFormBgmChanged = 0;
+static int g_practiceBossLiveTransition = 0;
+static int g_practiceBossLiveKillAtFrame = 0;
+static int g_practiceBossLiveDefeated = 0;
+static int g_practiceBossLiveMissing = 0;
+static unsigned *g_practiceBossLiveFirstObject = NULL;
+static int g_practiceStage3EventLog = 0;
 static int g_exBoss2Kill = 0;         /* Boss 2 practice: defeat Boss 1 at once (see ExBoss2Step) */
 static int g_exBoss2Transition = 0;   /* suppress dialogue until Boss 2's battle BGM starts */
 static int g_exBoss2KillFrames = 0;
@@ -1284,9 +1157,16 @@ typedef void (__stdcall *PF_GameStart)(int stage);
 
 static void ApplyPracticePower(int stage, const char *what) {
     int p;
-    if (stage == 2 || stage == 3) {
+    if (stage == 1 && g_practiceBossActive && g_practiceBossStage == stage &&
+        g_practiceBossTarget == 1) {
+        p = 5;
+    } else if (stage == 2 || stage == 3) {
         if (*(volatile unsigned char*)(uintptr_t)0x4dade0 == 0) return;
-        p = (stage == 2) ? g_PracticeStage2Power : g_PracticeStage3Power;
+        if ((stage == 2 || stage == 3) && g_practiceBossActive &&
+            g_practiceBossStage == stage && g_practiceBossTarget >= 1)
+            p = 7;
+        else
+            p = (stage == 2) ? g_PracticeStage2Power : g_PracticeStage3Power;
     } else if (stage == 4 && g_exRun && (g_exArea >= 1 || g_exBossSelected > 0)) {
         p = 7;
     } else {
@@ -1319,6 +1199,9 @@ static int g_exBgmTime[EX_BGM_IDS];
 static int g_exBossBgmTime[2];
 static int g_exAreaN = EX_AREA_N;
 static int g_exStartReq = 0;
+static int g_practiceBossChoice[3];
+static int g_practiceBossStart = 0;
+static int g_practiceBossPending = 0;
 static int g_exPending = 0;
 static int g_exSkipWait = 0;
 static int g_exShorten = 0;
@@ -1434,8 +1317,28 @@ static void ExOnRetry(int stage) {
 }
 
 static void __stdcall GameStartHook(int stage) {
+    g_pauseAfterLoad = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    g_pauseLoadArmed = 1;
+    Log("Pause: stage %d load started (Escape held=%d)", stage, g_pauseAfterLoad);
+    g_practiceBossPending = g_practiceBossStart == stage;
+    if (g_practiceBossPending) {
+        g_practiceBgmLastId = -1;
+        g_practiceBossSeekingSecondForm = 0;
+        g_practiceBossFormBgmChanged = 0;
+        g_practiceBossLiveTransition = 0;
+        g_practiceBossLiveKillAtFrame = 0;
+        g_practiceBossLiveDefeated = 0;
+        g_practiceBossLiveMissing = 0;
+        g_practiceBossLiveFirstObject = NULL;
+        g_practiceStage3EventLog = 0;
+    }
     ((PF_GameStart)(uintptr_t)0x423880)(stage);
     ExOnGameStart(stage);
+    if (g_practiceBossPending) {
+        ExDlgInstall();
+        Log("PracticeBoss: stage %d boss start requested", stage);
+    }
+    g_practiceBossStart = 0;
     ApplyPracticePower(stage, "start");
 }
 
@@ -1454,6 +1357,18 @@ static void __stdcall RetryHook(int stage) {
         return;
     }
     ((PF_GameStart)(uintptr_t)0x419d10)(stage);
+    if (g_practiceBossActive && stage == g_practiceBossStage) {
+        g_practiceBgmLastId = -1;
+        g_practiceBossSeekingSecondForm = 0;
+        g_practiceBossFormBgmChanged = 0;
+        g_practiceBossLiveTransition = 0;
+        g_practiceBossLiveKillAtFrame = 0;
+        g_practiceBossLiveDefeated = 0;
+        g_practiceBossLiveMissing = 0;
+        g_practiceBossLiveFirstObject = NULL;
+        g_practiceBossPending = 1;
+        Log("PracticeBoss: retry requested; Stage %d will seek to the selected boss again", stage);
+    }
     if (stage == 4 && g_exRun)
         *(volatile int*)(uintptr_t)0x4dadd8 = *(volatile int*)(uintptr_t)0x46c7c4;
     ExOnRetry(stage);
@@ -1532,6 +1447,8 @@ static const char *g_gamePerfName[7] = {
 static unsigned char PerfCall(int slot, DWORD target) {
     LARGE_INTEGER a, b;
     unsigned char result;
+    if (g_exSimulatingStageFrame)
+        return ((PF_FrameNoArg)(uintptr_t)target)();
     QueryPerformanceCounter(&a);
     result = ((PF_FrameNoArg)(uintptr_t)target)();
     QueryPerformanceCounter(&b);
@@ -1546,6 +1463,10 @@ static unsigned char PerfCall(int slot, DWORD target) {
 
 static void PerfFlush(int frame) {
     int i;
+    if (g_exSimulatingStageFrame) {
+        memset(g_gamePerf, 0, sizeof(g_gamePerf));
+        return;
+    }
     if (frame < 0 || frame % 300 != 299) return;
     for (i = 0; i < 7; i++) {
         PerfStat *s = &g_gamePerf[i];
@@ -1596,13 +1517,13 @@ static void DebugDisablePlayerHitbox(void) {
 static unsigned char __cdecl PerfObjectUpdate(void) { return PerfCall(1, 0x42daa0); }
 static unsigned char __cdecl PerfEffects(void) {
 #ifdef SMD_DEBUG_BUILD
-    DebugDisablePlayerHitbox();
+    if (!g_exSimulatingStageFrame) DebugDisablePlayerHitbox();
 #endif
     return PerfCall(2, 0x42db70);
 }
 static unsigned char __cdecl PerfObjectChecks(void) {
 #ifdef SMD_DEBUG_BUILD
-    DebugDisablePlayerHitbox();
+    if (!g_exSimulatingStageFrame) DebugDisablePlayerHitbox();
 #endif
     return PerfCall(3, 0x42db30);
 }static unsigned char __cdecl PerfAnimation(void)    { return PerfCall(4, 0x416540); }
@@ -1663,7 +1584,7 @@ static void PatchPracticePower(void) {
     n += HookCall(0x419c9e, 0x419d10, (void*)&RetryHook);
     n += HookCall(0x419cad, 0x419d10, (void*)&RetryHook);
     n += HookCall(0x419cb9, 0x419d10, (void*)&RetryHook);
-    Log("PracticePower: patched %d/4 call sites", n);
+    Log("PracticePower: patched %d/6 call sites", n);
 }
 
 typedef unsigned char (__attribute__((thiscall)) *PF_InputHold)(void *self, int id, int delay);
@@ -1677,8 +1598,10 @@ typedef unsigned char (__cdecl *PF_EventDispatch)(int frame);
 typedef void (__cdecl *PF_Free)(void *p);
 
 static char g_exRowBuf[EX_MAX_AREAS][0xe8] __attribute__((aligned(16)));
+static char g_practiceModeRow[3][0xe8] __attribute__((aligned(16)));
 static char g_exLabelRow[0xe8] __attribute__((aligned(16)));
 static int g_exRowInit[EX_MAX_AREAS];
+static int g_practiceModeInit[3];
 static void *g_exRowTex[EX_MAX_AREAS];
 static int g_exLabelInit;
 static void *g_exLabelTex;
@@ -1689,6 +1612,43 @@ static void ExRowsReset(void) {
     memset(g_exRowTex, 0, sizeof(g_exRowTex));
     g_exLabelInit = 0;
     g_exLabelTex = NULL;
+    memset(g_practiceModeInit, 0, sizeof(g_practiceModeInit));
+}
+
+static void PracticeRowsExpand(void *obj) {
+    int i;
+    double *firstY = (double*)((char*)obj + 0x100 + 0x10);
+    double *secondY = (double*)((char*)obj + 0x100 + 0xe8 + 0x10);
+    if (*secondY - *firstY >= 0x30) return;
+    /* The menu has three stage rows followed by Extra and Exit. Move each later
+       row down to make a full line available for the Stage/Boss selector. */
+    for (i = 1; i < 5; i++) {
+        double *y = (double*)((char*)obj + 0x100 + 0xe8 * i + 0x10);
+        *y += (i < 4) ? i * 0x20 : 0x60;
+    }
+}
+
+static void PracticeModeRowEnsure(void *obj, int stage) {
+    char *row = g_practiceModeRow[stage];
+    void *tex = *(void**)((char*)obj + 0x10);
+    static const int y[3] = { 0x98, 0xd8, 0x118 };
+    static const char *label[2][3] = {
+        { "< Stage >", "< MidBoss >", "< Boss >" },
+        { "< Stage >", "< Boss >", NULL }
+    };
+    if (stage == 2 && g_practiceBossChoice[stage] > 1)
+        g_practiceBossChoice[stage] = 1;
+    if (g_practiceModeInit[stage]) return;
+    g_practiceModeInit[stage] = 1;
+    memset(row, 0, 0xe8);
+    ((PF_RowCtor)(uintptr_t)0x41fdf0)(row);
+    ((PF_RowSetup)(uintptr_t)0x41ff10)(row, tex, 0xe0, y[stage], 0, 0, 0x100, 0x100, 0);
+    ((PF_RowText)(uintptr_t)0x41ff80)(row, 0x10, 0xc, 8, 9, 0xb,
+        stage == 2 ? label[1][g_practiceBossChoice[stage]] :
+                     label[0][g_practiceBossChoice[stage]]);
+    *(int*)(row + 0xac) = 0x3f4ccccd;
+    *(int*)(row + 0xb0) = 0x3f4ccccd;
+    *(int*)(row + 0xd8) = 0x505050;
 }
 
 static int ExRowAvailable(void) {
@@ -1705,7 +1665,7 @@ static void ExRowEnsure(void *obj, int area) {
     g_exRowTex[area] = tex;
     memset(row, 0, 0xe8);
     ((PF_RowCtor)(uintptr_t)0x41fdf0)(row);
-    ((PF_RowSetup)(uintptr_t)0x41ff10)(row, *(void**)((char*)obj + 0x10), 0xe0, 0xf8, 0, 0, 0x100, 0x100, 0);
+    ((PF_RowSetup)(uintptr_t)0x41ff10)(row, *(void**)((char*)obj + 0x10), 0xe0, 0x158, 0, 0, 0x100, 0x100, 0);
     if (area < EX_AREA_N)
         ((PF_RowText)(uintptr_t)0x41ff80)(row, 0x10, 0xc, 8, 9, 0xb, "< Area %d/%d >", area + 1, g_exAreaN);
     else
@@ -1722,7 +1682,7 @@ static void ExLabelEnsure(void *obj) {
     g_exLabelTex = tex;
     memset(g_exLabelRow, 0, sizeof(g_exLabelRow));
     ((PF_RowCtor)(uintptr_t)0x41fdf0)(g_exLabelRow);
-    ((PF_RowSetup)(uintptr_t)0x41ff10)(g_exLabelRow, tex, 0x6c, 0xd8, 0, 0, 0x100, 0x100, 0);
+    ((PF_RowSetup)(uintptr_t)0x41ff10)(g_exLabelRow, tex, 0x6c, 0x138, 0, 0, 0x100, 0x100, 0);
     ((PF_RowText)(uintptr_t)0x41ff80)(g_exLabelRow, 0x10, 0xc, 8, 9, 0xb,
                                      "Extra      %3d     %3d", 0,
                                      *(volatile int*)(uintptr_t)0x46c7c4);
@@ -1745,6 +1705,7 @@ static unsigned char __attribute__((fastcall)) PracticeUpdateHook(void *obj) {
 
     if (!ExRowAvailable())
         return ((PF_PracticeFn)(uintptr_t)0x420c90)(obj);
+    PracticeRowsExpand(obj);
     if (*cur < 0 || *cur >= rows) *cur = 0;
 
     if (edge(input, 4) || rawkey(input, 0xd)) {
@@ -1755,6 +1716,22 @@ static unsigned char __attribute__((fastcall)) PracticeUpdateHook(void *obj) {
             *(volatile int*)(uintptr_t)0x4dadd8 = *(int*)(uintptr_t)(0x46bc14 + 4 * *cur) - 1;
             g_exStartReq = 0;
             g_exBossSelected = 0;
+            if (g_practiceBossChoice[*cur]) {
+                g_practiceBossStart = *cur + 1;
+                g_practiceBossStage = *cur + 1;
+                g_practiceBossPending = 1;
+                g_practiceBossActive = 1;
+                g_practiceBossTarget = g_practiceBossChoice[*cur];
+                Log("PracticeBoss: Stage %d %s practice start", *cur + 1,
+                    *cur < 2 ? (g_practiceBossTarget == 1 ? "MidBoss" : "Boss") :
+                               "Boss");
+            } else {
+                g_practiceBossStart = 0;
+                g_practiceBossStage = 0;
+                g_practiceBossPending = 0;
+                g_practiceBossActive = 0;
+                g_practiceBossTarget = 0;
+            }
         } else {
             *(int*)(scene + 0x10) = 4;
             *(volatile unsigned char*)(uintptr_t)0x4dade0 = 1;
@@ -1779,17 +1756,44 @@ static unsigned char __attribute__((fastcall)) PracticeUpdateHook(void *obj) {
         *cur = (*cur + 1) % rows;
         playSe((void*)(uintptr_t)0x4ea3b8, 0, 0xff);
     }
-    if (*cur == 3) {
+    {
         if (hold(input, 2, 0xf)) {
-            g_exAreaChoice = (g_exAreaChoice + g_exAreaN + 1) % (g_exAreaN + 2);
-            if (g_exAreaChoice < g_exAreaN) g_exArea = g_exAreaChoice;
+            if (*cur < 3) {
+                int maxChoice = (*cur == 2) ? 1 : 2;
+                g_practiceBossChoice[*cur] =
+                    (g_practiceBossChoice[*cur] + maxChoice) % (maxChoice + 1);
+            }
+            else {
+                g_exAreaChoice = (g_exAreaChoice + g_exAreaN + 1) % (g_exAreaN + 2);
+                if (g_exAreaChoice < g_exAreaN) g_exArea = g_exAreaChoice;
+            }
             playSe((void*)(uintptr_t)0x4ea3b8, 0, 0xff);
         }
         if (hold(input, 3, 0xf)) {
-            g_exAreaChoice = (g_exAreaChoice + 1) % (g_exAreaN + 2);
-            if (g_exAreaChoice < g_exAreaN) g_exArea = g_exAreaChoice;
+            if (*cur < 3) {
+                int maxChoice = (*cur == 2) ? 1 : 2;
+                g_practiceBossChoice[*cur] =
+                    (g_practiceBossChoice[*cur] + 1) % (maxChoice + 1);
+            }
+            else {
+                g_exAreaChoice = (g_exAreaChoice + 1) % (g_exAreaN + 2);
+                if (g_exAreaChoice < g_exAreaN) g_exArea = g_exAreaChoice;
+            }
             playSe((void*)(uintptr_t)0x4ea3b8, 0, 0xff);
         }
+    }
+    for (i = 0; i < 3; i++) {
+        static const char *label[2][3] = {
+            { "< Stage >", "< MidBoss >", "< Boss >" },
+            { "< Stage >", "< Boss >", NULL }
+        };
+        if (i == 2 && g_practiceBossChoice[i] > 1)
+            g_practiceBossChoice[i] = 1;
+        PracticeModeRowEnsure(obj, i);
+        ((PF_RowText)(uintptr_t)0x41ff80)(g_practiceModeRow[i], 0x10, 0xc, 8, 9, 0xb,
+            i == 2 ? label[1][g_practiceBossChoice[i]] :
+                     label[0][g_practiceBossChoice[i]]);
+        *(int*)(g_practiceModeRow[i] + 0xd8) = (*cur == i) ? 0xffffff : 0x505050;
     }
     for (i = 0; i < 3; i++) *(int*)(o + 0x1d8 + 0xe8 * i) = 0x505050;
     if (*cur < 3) *(int*)(o + 0x1d8 + 0xe8 * *cur) = 0xffffff;
@@ -1808,11 +1812,13 @@ static unsigned char __attribute__((fastcall)) PracticeDrawHook(void *obj) {
     g_exLastFade = fade;
     if (!ExRowAvailable())
         return ((PF_PracticeFn)(uintptr_t)0x420de0)(obj);
-    *count = 5;
+    *count = 8;
     r = ((PF_PracticeFn)(uintptr_t)0x420de0)(obj);
     *count = saved;
     if (*(int*)((char*)obj + 0xc) * 6 > 0xff) {
         char *row;
+        int mi;
+        for (mi = 0; mi < 3; mi++) ((PF_RowDraw)(uintptr_t)0x420270)(g_practiceModeRow[mi], 0);
         ExLabelEnsure(obj);
         ExRowEnsure(obj, g_exAreaChoice);
         row = g_exRowBuf[g_exAreaChoice];
@@ -2482,6 +2488,95 @@ static void ExPracticeRestoreState(const ExPracticeSave *s) {
     *(volatile unsigned char*)(uintptr_t)0x4dae17 = s->cleared;
 }
 
+static int PracticeBossDefeat(unsigned *boss) {
+    static unsigned char fakeShot[0x830] __attribute__((aligned(16)));
+    typedef void (__cdecl *PF_HitHandler)(void *self, void *other);
+    PF_HitHandler hit;
+    if (!boss || IsBadReadPtr(boss, 0x824)) return 0;
+    *(float*)((char*)boss + 0x48) = 0.0f;
+    if (*((unsigned char*)boss + 0x109) == 0) return 1;
+    hit = (PF_HitHandler)(uintptr_t)boss[0x818 / 4];
+    if (!hit || IsBadCodePtr((FARPROC)hit)) return 0;
+    memset(fakeShot, 0, sizeof(fakeShot));
+    *(int*)(fakeShot + 0x04) = 2;
+    *(float*)(fakeShot + 0x48) = 1.0f;
+    hit(boss, fakeShot);
+    Log("PracticeBoss: forced MidBoss defeat through hit handler %p", (void*)hit);
+    return 1;
+}
+
+static int PracticeBossSeek(int from, int limit, int targetBoss, int *bossFrame) {
+    int f, firstSeen = 0;
+    int stage3KillFrame = 0;
+    unsigned *boss, *firstBoss = NULL;
+    for (f = from; f < limit; f++) {
+        if (!ExRunStageFrame(f)) {
+            Log("PracticeBoss: stage update stopped while seeking at frame %d", f);
+            break;
+        }
+        if (g_practiceBossStage == 3 && targetBoss == 2 && g_practiceBossFormBgmChanged) {
+            *bossFrame = f + 1;
+            g_practiceBossSeekingSecondForm = 0;
+            g_practiceBossFormBgmChanged = 0;
+            Log("PracticeBoss: Stage 3 Boss 2 BGM change reached at frame %d", f + 1);
+            return 1;
+        }
+        if (g_practiceBossStage == 3 && targetBoss == 2 && stage3KillFrame) {
+            if (f + 1 - stage3KillFrame > 1800) {
+                Log("PracticeBoss: Stage 3 second form BGM not reached within %d frames after defeating Boss 1; "
+                    "continuing with the natural transition at frame %d", f + 1 - stage3KillFrame, f + 1);
+                g_practiceBossSeekingSecondForm = 1;
+                g_practiceBossLiveTransition = 1;
+                g_practiceBossLiveDefeated = 0;
+                g_practiceBossLiveMissing = 0;
+                *bossFrame = f + 1;
+                return 1;
+            }
+            boss = *(unsigned**)(uintptr_t)0x4dae04;
+            if (boss && boss == firstBoss && !IsBadReadPtr(boss, 0x824))
+                PracticeBossDefeat(boss);
+        }
+        boss = *(unsigned**)(uintptr_t)0x4dae04;
+        if (boss && !IsBadReadPtr(boss, 0x824)) {
+            if (!firstSeen) {
+                firstSeen = 1;
+                firstBoss = boss;
+                if (targetBoss == 1) {
+                    *bossFrame = f + 1;
+                    Log("PracticeBoss: MidBoss object %p appeared at frame %d", (void*)boss, f + 1);
+                    return 1;
+                }
+                if (g_practiceBossStage == 3 && targetBoss == 2) {
+                    g_practiceBossFormBgmChanged = 0;
+                    g_practiceBossSeekingSecondForm = 1;
+                    g_practiceBossLiveTransition = 0;
+                    g_practiceBossLiveDefeated = 0;
+                    g_practiceBossLiveMissing = 0;
+                    g_practiceBossLiveFirstObject = boss;
+                    stage3KillFrame = f + 1;
+                    PracticeBossDefeat(boss);
+                    Log("PracticeBoss: Stage 3 Boss 1 found at frame %d; defeating it to reach the second form BGM (id 0)",
+                        f + 1);
+                    continue;
+                }
+                if (!PracticeBossDefeat(boss)) {
+                    Log("PracticeBoss: could not defeat the MidBoss during seek");
+                    break;
+                }
+            } else if (boss != firstBoss &&
+                       !(g_practiceBossStage == 3 && targetBoss == 2)) {
+                *bossFrame = f + 1;
+                Log("PracticeBoss: main Boss object %p appeared at frame %d", (void*)boss, f + 1);
+                return 1;
+            }
+        }
+        if (f && f % 5000 == 0)
+            Log("PracticeBoss: still seeking boss at frame %d", f);
+    }
+    *bossFrame = f;
+    return 0;
+}
+
 static int ExFastForwardBoss2Transition(int from) {
     int f;
     int limit = from + 12000;
@@ -2567,9 +2662,8 @@ static int ExFastForwardBossReturn(int from) {
 #define EX_TR_N 40
 #define EX_TR_FRAMES 2400
 static const int g_ExDlgTrace = 0;      /* 1: log VM opcodes after a Boss practice jump */
-/* Skip Boss 1 dialogue during boss practice and the Boss 2 transition fast-forward so the VM can advance
-   through the script without waiting for player confirmation. */
-static const int g_ExBossDlgSkip = 1;   /* 1: skip the Boss 1 intro dialogue in Boss practice */
+/* Skip all dialogue opcodes during EX boss practice so no message is shown and the VM can advance. */
+static const int g_ExBossDlgSkip = 1;
 static const int g_ExBossDlgDump = 0;   /* 1: dump the script bytes of the dialogue region to the log */
 /* Boss 1 main thread (from ExTrace): the first dialogue line is op21 at ip 649740; the script resumes
    at the op0 at ip 650448 (right before the BGM op18). op21 is 20 bytes and the VM adds the size of the
@@ -2621,21 +2715,22 @@ static int g_dlgShownLog = 0;
 static unsigned char ExTrCommon(int i, void *thr, void *args) {
     unsigned char r;
     int ip = (i == 21) ? *(int*)((char*)thr + 0x14) : -1;
-    int skipIntro = i == 21 && g_ExBossDlgSkip && g_exBossRun >= 1 &&
-                    ip >= EX_B1_DLG_LO && ip < EX_B1_DLG_END;
+    int skipIntro = i == 21 && g_ExBossDlgSkip &&
+                    ((g_exRun && g_exBossRun >= 1) || g_practiceBossActive);
     int hideBoss2Transition = i == 21 && g_ExBossDlgSkip && g_exBossRun == 2 &&
                               g_exBoss2Transition;
-    if (i == 21 && g_exBossRun >= 1 && !g_exSimulatingStageFrame && g_dlgShownLog < 80) {
+    if (i == 21 && ((g_exRun && g_exBossRun >= 1) || g_practiceBossActive) &&
+        !g_exSimulatingStageFrame && g_dlgShownLog < 80) {
         const char *action = skipIntro ? "skipped" : (hideBoss2Transition ? "hidden" : "SHOWN");
         g_dlgShownLog++;
-        Log("ExDlg: Boss %d op21 thr=%p ip=%d line=%d frame=%d -> %s", g_exBossRun, thr, ip,
+        Log("ExDlg: Boss practice stage=%d boss=%d op21 thr=%p ip=%d line=%d frame=%d -> %s",
+            g_practiceBossActive ? *(volatile int*)(uintptr_t)0x4dade4 : 4, g_exBossRun, thr, ip,
             IsBadReadPtr(args, 8) ? -1 : (int)((unsigned*)args)[1],
             *(volatile int*)(uintptr_t)0x4dadf8, action);
     }
     if (skipIntro) {
-        /* Boss 1 intro: each dialogue line is [op21 show line N][op6 loop until system var 0x1D == 0]
-           [op2 wait 1][op4 jump back]. Not showing the line leaves var 0x1D at 0, so the loop is left at
-           once, while the boss entrance ops between the lines still run. */
+        /* Skipping op21 leaves the dialogue wait flag at 0, so its confirmation loop exits while
+           the surrounding entrance and battle script continue normally. */
         if (g_dlgSkipLog < 12) {
             g_dlgSkipLog++;
             Log("ExArea: Boss 1 intro dialogue skipped (ip=%d line=%d frame=%d sim=%d)", ip,
@@ -2736,6 +2831,17 @@ static void ExReturnToPracticeMenu(const char *reason) {
     Log("ExArea: %s finished; returning to the Practice menu", reason);
     g_exRun = 0;
     g_exBossRun = 0;
+    g_practiceBossActive = 0;
+    g_practiceBossStage = 0;
+    g_practiceBossTarget = 0;
+    g_practiceBossSeekingSecondForm = 0;
+    g_practiceBossFormBgmChanged = 0;
+    g_practiceBossLiveTransition = 0;
+    g_practiceBossLiveKillAtFrame = 0;
+    g_practiceBossLiveDefeated = 0;
+    g_practiceBossLiveMissing = 0;
+    g_practiceBossLiveFirstObject = NULL;
+    g_practiceBgmLastId = -1;
     g_exStartReq = 0;
     g_exPending = 0;
     g_exSkipWait = 0;
@@ -2886,6 +2992,27 @@ static void ExBoss2Step(int frame) {
     }
 }
 
+static void PracticeBossTrackStage3BgmEvent(int frame) {
+    unsigned *n = *(unsigned**)(uintptr_t)0x4ea1d8;
+    if (!g_practiceBossActive || g_practiceBossStage != 3) return;
+    for (; n; n = (unsigned*)n[0]) {
+        unsigned *args;
+        int id;
+        if ((int)n[1] != frame || (int)n[2] != 6 || !n[3]) continue;
+        args = (unsigned*)n[3];
+        id = (int)args[3];
+        if (g_practiceBossSeekingSecondForm && g_practiceBgmLastId >= 0 &&
+            id != g_practiceBgmLastId) {
+            g_practiceBossFormBgmChanged = 1;
+            Log("PracticeBoss: Stage 3 scheduled BGM changed %d -> %d at frame %d",
+                g_practiceBgmLastId, id, frame);
+        } else if (!g_practiceBossSeekingSecondForm && id != g_practiceBgmLastId) {
+            Log("PracticeBoss: Stage 3 scheduled BGM id=%d at frame %d", id, frame);
+        }
+        g_practiceBgmLastId = id;
+    }
+}
+
 static unsigned char __cdecl EventDispatchImpl(int frame) {
     static int f9prev = 0;
     FpuEnforce("stage", frame);
@@ -2895,8 +3022,54 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         g_trOn = 0;
         Log("ExTrace: finished at frame %d", frame);
     }
-    if (g_exSimulatingStageFrame)
+    if (g_pauseLoadArmed && (GetAsyncKeyState(VK_ESCAPE) & 0x8000))
+        g_pauseAfterLoad = 1;
+    if (g_exSimulatingStageFrame) {
+        PracticeBossTrackStage3BgmEvent(frame);
         return ((PF_EventDispatch)(uintptr_t)0x430020)(frame);
+    }
+    if (g_pauseAfterLoad && *(volatile int*)(uintptr_t)0x4dade4 >= 1 &&
+        *(volatile int*)(uintptr_t)0x4dade4 <= 4) {
+        void *input = *(void**)(uintptr_t)0x46bbec;
+        void *pause = *(void**)(uintptr_t)0x4dae08;
+        if (input && pause) {
+            g_pauseAfterLoad = 0;
+            g_pauseLoadArmed = 0;
+            ((void (__attribute__((thiscall)) *)(void*))(uintptr_t)0x4191f0)(pause);
+            *(volatile unsigned char*)(uintptr_t)0x4dae16 = 1;
+            ((void (__attribute__((thiscall)) *)(void*))(uintptr_t)0x431850)(input);
+            Log("Pause: opening pause menu after stage load because Escape was held");
+        }
+    } else if (g_pauseLoadArmed && !g_exSimulatingStageFrame) {
+        g_pauseLoadArmed = 0;
+    }
+    if (g_practiceBossLiveTransition && g_practiceBossActive &&
+        g_practiceBossStage == 3 && g_practiceBossTarget == 2) {
+        unsigned *boss;
+        PracticeBossTrackStage3BgmEvent(frame);
+        boss = *(unsigned**)(uintptr_t)0x4dae04;
+        if (g_practiceBossFormBgmChanged) {
+            g_practiceBossLiveTransition = 0;
+            g_practiceBossSeekingSecondForm = 0;
+            g_practiceBossFormBgmChanged = 0;
+            Log("PracticeBoss: Stage 3 Boss 2 BGM reached during live transition at frame %d", frame);
+        } else if (boss && !IsBadReadPtr(boss, 0x824) &&
+                   boss != g_practiceBossLiveFirstObject) {
+            g_practiceBossLiveTransition = 0;
+            g_practiceBossSeekingSecondForm = 0;
+            Log("PracticeBoss: Stage 3 Boss 2 object appeared during live transition at frame %d (boss=%p)",
+                frame, (void*)boss);
+        } else if (!boss && g_practiceBossLiveDefeated) {
+            g_practiceBossLiveMissing = 1;
+        } else if (boss && !IsBadReadPtr(boss, 0x824) && g_practiceBossLiveMissing &&
+                   *((unsigned char*)boss + 0x109) != 0 &&
+                   *(float*)((char*)boss + 0x48) > 0.0f) {
+            g_practiceBossLiveTransition = 0;
+            g_practiceBossSeekingSecondForm = 0;
+            Log("PracticeBoss: Stage 3 Boss 2 reused its object during live transition at frame %d (boss=%p hp=%.3f)",
+                frame, (void*)boss, (double)*(float*)((char*)boss + 0x48));
+        }
+    }
     int f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
     if (f9 && !f9prev && *(volatile int*)(uintptr_t)0x4dade4 == 4)
         Log("ExArea: marker frame=%d", frame);
@@ -2966,6 +3139,40 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
     if (g_exPending && frame == 0 && *(volatile int*)(uintptr_t)0x4dade4 == 4) {
         g_exPending = 0;
         ExLogQueue();
+    }
+    if (g_practiceBossPending && frame == 0) {
+        int stage = *(volatile int*)(uintptr_t)0x4dade4;
+        int target = frame;
+        g_practiceBossPending = 0;
+        if (stage >= 1 && stage <= 3) {
+            ExPracticeSave sv;
+            ExPracticeSaveState(&sv);
+            g_exMuteSe = 1;
+            if (PracticeBossSeek(frame, 60000, g_practiceBossTarget, &target)) {
+                *(volatile int*)(uintptr_t)0x4dadf8 = target;
+            } else {
+                Log("PracticeBoss: boss did not appear during the seek; returning to Practice menu");
+                target = 0;
+                *(volatile int*)(uintptr_t)0x4dadf8 = 0;
+            }
+            g_exMuteSe = 0;
+            ExPracticeRestoreState(&sv);
+            if (!target) {
+                ExReturnToPracticeMenu("Boss seek failed");
+                return 1;
+            }
+            if (target > 0) {
+                ApplyPracticePower(stage, "boss seek");
+                void *pl = *(void**)(uintptr_t)0x4e9ad4;
+                if (pl) {
+                    *(int*)((char*)pl + 0x8) = 0;
+                    if (*(int*)((char*)pl + 0x2c) <= 0) *(int*)((char*)pl + 0x2c) = 5;
+                    *(int*)((char*)pl + 0x14) = 0;
+                }
+                frame = target;
+                Log("PracticeBoss: stage %d fast-forwarded to boss start frame %d", stage, target);
+            }
+        }
     }
     if (g_exSkipWait && *(volatile int*)(uintptr_t)0x4dade4 == 4) {
         int bossIndex = g_exBossRun - 1;
@@ -3100,6 +3307,15 @@ static void __cdecl BgPushHook(int layer, unsigned *argsP, unsigned tex) {
 }
 
 static void __cdecl EventInsertHook(int time, unsigned *node) {
+    if (node && *(volatile int*)(uintptr_t)0x4dade4 == 3 && g_practiceBossActive &&
+        (int)node[2] != 0 && g_practiceStage3EventLog < 600) {
+        unsigned *a = (unsigned*)node[3];
+        g_practiceStage3EventLog++;
+        Log("PracticeBoss: Stage 3 script event #%d now=%d time=%d type=%u args=%08X %08X %08X %08X %08X %08X",
+            g_practiceStage3EventLog, *(volatile int*)(uintptr_t)0x4dadf8,
+            time, node[2], a ? a[0] : 0, a ? a[1] : 0, a ? a[2] : 0,
+            a ? a[3] : 0, a ? a[4] : 0, a ? a[5] : 0);
+    }
     if (node && *(volatile int*)(uintptr_t)0x4dade4 == 4) {
         int ty = (int)node[2];
         if (ty == 6) {
@@ -3184,6 +3400,15 @@ static int __cdecl ExVmBgmHook(int id) {
     int frame;
     if (id >= 0 && id < EX_BGM_IDS) {
         frame = *(volatile int*)(uintptr_t)0x4dadf8;
+        if (g_practiceBossActive && g_practiceBossStage == 3) {
+            if (g_practiceBossSeekingSecondForm && g_practiceBgmLastId >= 0 &&
+                id != g_practiceBgmLastId) {
+                g_practiceBossFormBgmChanged = 1;
+                Log("PracticeBoss: Stage 3 form BGM changed %d -> %d at frame %d (sim=%d)",
+                    g_practiceBgmLastId, id, frame, g_exSimulatingStageFrame ? 1 : 0);
+            }
+            g_practiceBgmLastId = id;
+        }
         if (frame < g_exBgmTime[id] || g_exBgmTime[id] <= 0)
             g_exBgmTime[id] = frame;
         if (id == g_exBossBgm[0]) {
@@ -3931,6 +4156,7 @@ static void PatchKeepRunningInactive(void) {
 typedef unsigned (__stdcall *PF_XInputGetState)(unsigned id, void *state);
 typedef MMRESULT (WINAPI *PF_JoyGetCapsA)(UINT id, LPJOYCAPSA caps, UINT cb);
 typedef MMRESULT (WINAPI *PF_JoyGetPosEx)(UINT id, LPJOYINFOEX info);
+typedef HRESULT (WINAPI *PF_DirectInput8Create)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
 
 #define XI_ID_VK_A            0x1000u
 #define XI_ID_VK_B            0x2000u
@@ -3954,6 +4180,89 @@ static PF_JoyGetCapsA g_winmmJoyGetCapsA = NULL;
 static PF_JoyGetPosEx g_winmmJoyGetPosEx = NULL;
 static unsigned g_joyCapsCount = 0;
 static unsigned char g_joyPlugged[4];
+static HMODULE g_dinputModule;
+static LPDIRECTINPUT8A g_di8;
+static LPDIRECTINPUTDEVICE8A g_diDevices[16];
+static unsigned g_diCount;
+static DWORD g_diLastScan;
+
+static BOOL CALLBACK JoyEnumDirectInput(const DIDEVICEINSTANCEA *instance, void *context) {
+    HWND hwnd = (HWND)context;
+    LPDIRECTINPUTDEVICE8A device = NULL;
+    HRESULT hr;
+    if (g_diCount >= sizeof(g_diDevices) / sizeof(g_diDevices[0])) return DIENUM_STOP;
+    hr = IDirectInput8_CreateDevice(g_di8, &instance->guidInstance, &device, NULL);
+    if (FAILED(hr) || !device) return DIENUM_CONTINUE;
+    hr = IDirectInputDevice8_SetDataFormat(device, &c_dfDIJoystick2);
+    if (SUCCEEDED(hr) && hwnd)
+        hr = IDirectInputDevice8_SetCooperativeLevel(device, hwnd, DISCL_NONEXCLUSIVE | DISCL_BACKGROUND);
+    if (FAILED(hr)) {
+        IDirectInputDevice8_Release(device);
+        return DIENUM_CONTINUE;
+    }
+    IDirectInputDevice8_Acquire(device);
+    g_diDevices[g_diCount++] = device;
+    return DIENUM_CONTINUE;
+}
+
+static void JoyDirectInputScan(void) {
+    PF_DirectInput8Create create;
+    HWND hwnd;
+    DWORD now = GetTickCount();
+    if (g_di8 && now - g_diLastScan < 2000) return;
+    g_diLastScan = now;
+    if (!g_dinputModule) {
+        g_dinputModule = LoadLibraryA("dinput8.dll");
+        if (!g_dinputModule) return;
+    }
+    create = (PF_DirectInput8Create)(void*)GetProcAddress(g_dinputModule, "DirectInput8Create");
+    if (!create) return;
+    if (!g_di8 && FAILED(create(GetModuleHandleA(NULL), DIRECTINPUT_VERSION, &IID_IDirectInput8A,
+                                (void**)&g_di8, NULL))) return;
+    if (!g_di8) return;
+    while (g_diCount) {
+        g_diCount--;
+        IDirectInputDevice8_Release(g_diDevices[g_diCount]);
+        g_diDevices[g_diCount] = NULL;
+    }
+    hwnd = GetForegroundWindow();
+    if (!hwnd) hwnd = GetActiveWindow();
+    IDirectInput8_EnumDevices(g_di8, DI8DEVCLASS_GAMECTRL, JoyEnumDirectInput, hwnd, DIEDFL_ATTACHEDONLY);
+}
+
+static unsigned JoyDirectInputState(unsigned id, JOYINFOEX *ji) {
+    DIJOYSTATE2 state;
+    LPDIRECTINPUTDEVICE8A device;
+    HRESULT hr;
+    DWORD pov;
+    unsigned i, buttons = 0;
+    if (id >= g_diCount || !ji) return 0;
+    device = g_diDevices[id];
+    hr = IDirectInputDevice8_Poll(device);
+    if (FAILED(hr)) {
+        IDirectInputDevice8_Acquire(device);
+        hr = IDirectInputDevice8_Poll(device);
+    }
+    if (FAILED(hr) || FAILED(IDirectInputDevice8_GetDeviceState(device, sizeof(state), &state))) return 0;
+    memset(ji, 0, sizeof(*ji));
+    ji->dwSize = sizeof(*ji);
+    ji->dwFlags = JOY_RETURNALL;
+#define DI_AXIS(v) ((DWORD)(((long)(v) + 1000L) * 65535L / 2000L))
+    ji->dwXpos = DI_AXIS(state.lX);
+    ji->dwYpos = DI_AXIS(state.lY);
+    ji->dwZpos = DI_AXIS(state.lZ);
+    ji->dwRpos = DI_AXIS(state.lRx);
+    ji->dwUpos = DI_AXIS(state.lRy);
+    ji->dwVpos = DI_AXIS(state.lRz);
+#undef DI_AXIS
+    for (i = 0; i < 16; i++) if (state.rgbButtons[i] & 0x80) buttons |= (1u << i);
+    ji->dwButtons = buttons;
+    ji->dwButtonNumber = 0;
+    for (i = 0; i < 16; i++) if (buttons & (1u << i)) ji->dwButtonNumber++;
+    pov = state.rgdwPOV[0];
+    ji->dwPOV = pov == 0xffffffffu ? 0xffffu : pov;
+    return 1;
+}
 
 static void JoyIoInit(void) {
     HMODULE xi = NULL;
@@ -3992,33 +4301,47 @@ static unsigned JoyConnected(unsigned id) {
 }
 
 static unsigned __stdcall JoyGetCapsA(unsigned id, JOYCAPSA *jc, unsigned cb) {
+    unsigned nativeResult;
     if (!g_joyIoInited) JoyIoInit();
-    if (!g_joyIoOk || !jc || cb < sizeof(JOYCAPSA) || !JoyConnected(id))
-        return g_winmmJoyGetCapsA ? g_winmmJoyGetCapsA(id, jc, cb) : JOYERR_UNPLUGGED;
+    if (g_joyIoOk && jc && cb >= sizeof(JOYCAPSA) && JoyConnected(id)) {
+        memset(jc, 0, sizeof(*jc));
+        jc->wMid = 0x28E;
+        jc->wPid = 0x2FF;
+        strcpy(jc->szPname, "Modern Controller (XInput)");
+        jc->wXmin = jc->wYmin = jc->wZmin = jc->wRmin = jc->wUmin = jc->wVmin = 0;
+        jc->wXmax = jc->wYmax = jc->wZmax = jc->wRmax = jc->wUmax = jc->wVmax = 0xFFFF;
+        jc->wPeriodMin = jc->wPeriodMax = 10000;
+        jc->wMaxButtons = 32;
+        jc->wNumButtons = 16;
+        jc->wMaxAxes = jc->wNumAxes = 6;
+        return JOYERR_NOERROR;
+    }
+    nativeResult = g_winmmJoyGetCapsA ? g_winmmJoyGetCapsA(id, jc, cb) : JOYERR_UNPLUGGED;
+    if (nativeResult == JOYERR_NOERROR || !jc || cb < sizeof(JOYCAPSA)) return nativeResult;
+    JoyDirectInputScan();
+    if (id >= g_diCount) return nativeResult;
     memset(jc, 0, sizeof(*jc));
-    jc->wMid = 0x28E;                  /* Microsoft */
-    jc->wPid = 0x2FF;                  /* Xbox 360 wired */
-    strcpy(jc->szPname, "Modern Controller (XInput)");
-    jc->wXmin = 0;      jc->wXmax = 0xFFFF;
-    jc->wYmin = 0;      jc->wYmax = 0xFFFF;
-    jc->wZmin = 0;      jc->wZmax = 0xFFFF;
-    jc->wRmin = 0;      jc->wRmax = 0xFFFF;
-    jc->wUmin = 0;      jc->wUmax = 0xFFFF;
-    jc->wVmin = 0;      jc->wVmax = 0xFFFF;
-    jc->wPeriodMin = 10000;
-    jc->wPeriodMax = 10000;
-    jc->wCaps = 0;                     /* plain stick, no rudder/POV special bits */
-    jc->wMaxButtons = 32;
-    jc->wNumButtons = 16;
-    jc->wMaxAxes = 6;
-    jc->wNumAxes = 6;
+    jc->wMid = 0xFFFF;
+    jc->wPid = (WORD)(id + 1);
+    strcpy(jc->szPname, "DirectInput Controller");
+    jc->wXmin = jc->wYmin = jc->wZmin = jc->wRmin = jc->wUmin = jc->wVmin = 0;
+    jc->wXmax = jc->wYmax = jc->wZmax = jc->wRmax = jc->wUmax = jc->wVmax = 0xFFFF;
+    jc->wMaxButtons = jc->wNumButtons = 16;
+    jc->wMaxAxes = jc->wNumAxes = 6;
+    jc->wCaps = 0;
     return JOYERR_NOERROR;
 }
 
 static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
+    unsigned nativeResult;
     if (!g_joyIoInited) JoyIoInit();
-    if (!g_joyIoOk || !ji || ji->dwSize < sizeof(JOYINFOEX) || !JoyConnected(id))
-        return g_winmmJoyGetPosEx ? g_winmmJoyGetPosEx(id, ji) : JOYERR_UNPLUGGED;
+    if (!g_joyIoOk || !ji || ji->dwSize < sizeof(JOYINFOEX) || !JoyConnected(id)) {
+        nativeResult = g_winmmJoyGetPosEx ? g_winmmJoyGetPosEx(id, ji) : JOYERR_UNPLUGGED;
+        if (nativeResult == JOYERR_NOERROR || !ji || ji->dwSize < sizeof(JOYINFOEX)) return nativeResult;
+        JoyDirectInputScan();
+        if (!JoyDirectInputState(id, ji)) return nativeResult;
+        return JOYERR_NOERROR;
+    }
 
     /* XINPUT_STATE: dwPacketNumber(+0), gamepad +4: wButtons(+4) bLTrigger(+6)
        bRTrigger(+7) sLX(+8) sLY(+A) sRX(+C) sRY(+E) -> 16 bytes total */
@@ -5306,10 +5629,47 @@ static HRESULT STDMETHODCALLTYPE ES_GetColorKey(void *self, DWORD flags, DDCOLOR
     return DD_OK;
 }
 
+static void D7_SyncD3D9PixelsToDib(D7Surf *s) {
+    IDirect3DSurface9 *back = NULL, *readback = NULL;
+    D3DSURFACE_DESC desc;
+    D3DLOCKED_RECT lock;
+    HRESULT hr;
+    int x, y;
+    if (!s || !s->bits || (s->bpp != 16 && s->bpp != 32) || !g_d7.dev ||
+        (s != g_d7.back3d && !s->isPrimary)) return;
+    D7_BatchFlush();
+    hr = IDirect3DDevice9_GetBackBuffer(g_d7.dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &back);
+    if (FAILED(hr) || !back) return;
+    hr = IDirect3DSurface9_GetDesc(back, &desc);
+    if (SUCCEEDED(hr))
+        hr = IDirect3DDevice9_CreateOffscreenPlainSurface(g_d7.dev, desc.Width, desc.Height, desc.Format,
+                                                          D3DPOOL_SYSTEMMEM, &readback, NULL);
+    if (SUCCEEDED(hr) && readback)
+        hr = IDirect3DDevice9_GetRenderTargetData(g_d7.dev, back, readback);
+    if (SUCCEEDED(hr) && readback)
+        hr = IDirect3DSurface9_LockRect(readback, &lock, NULL, D3DLOCK_READONLY);
+    if (SUCCEEDED(hr) && readback) {
+        for (y = 0; y < s->h; y++) {
+            int sy = (int)((long long)y * desc.Height / s->h);
+            const DWORD *src = (const DWORD*)((const unsigned char*)lock.pBits + (size_t)sy * lock.Pitch);
+            unsigned char *dst = s->bits + (size_t)y * s->pitch;
+            for (x = 0; x < s->w; x++) {
+                int sx = (int)((long long)x * desc.Width / s->w);
+                D7_Wr(s, dst + (size_t)x * (s->bpp / 8), D7_FromArgb(&s->fmt, src[sx] | 0xff000000u));
+            }
+        }
+        IDirect3DSurface9_UnlockRect(readback);
+        D7_MarkDirty(s, NULL);
+    }
+    if (readback) IDirect3DSurface9_Release(readback);
+    IDirect3DSurface9_Release(back);
+}
+
 static HRESULT STDMETHODCALLTYPE ES_GetDC(void *self, HDC *out) {
     D7Surf *s = (D7Surf*)self;
     if (!out) return DDERR_INVALIDPARAMS;
     if (!s->dib) return DDERR_CANTCREATEDC;
+    D7_SyncD3D9PixelsToDib(s);
     if (!s->dc) {
         s->dc = CreateCompatibleDC(NULL);
         if (!s->dc) return DDERR_CANTCREATEDC;
