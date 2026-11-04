@@ -36,7 +36,7 @@ RefRain.exeのSHA-256: `db092baa547241a0217ca41be8538672b79094f671884f92a32c0694
 ### 五月雨
 
 - Windows 11対応
-- PracticeメニューへのExtra追加
+- Practiceメニューへの項目追加
 
 ![Practice](https://madotsukanai.github.io/raindrop2.png)
 全ステージクリア後、PracticeメニューからExtraを選択できます。Extraの行で左右キーを押すと、Area 1/4〜4/4、Boss 1/2、Boss 2/2の順に選択が切り替わり、選んだエリアまたはボス戦から練習を開始できます。
