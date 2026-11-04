@@ -1192,6 +1192,7 @@ static void FpuEnforce(const char *where, int frame) {
 
 typedef unsigned char (__attribute__((thiscall)) *PF_ReplayInputQuery)(void *self, int id,
                                                                        int delay);
+static int g_exSimulatingStageFrame = 0;
 static PF_ReplayInputQuery g_replayInputQueryOrig = NULL;
 static unsigned g_replayInputQueryLogRemaining = 0;
 
@@ -1205,6 +1206,8 @@ static unsigned char __attribute__((fastcall)) ReplayInputQueryHook(void *self, 
     (void)edx;
     FpuEnforce("input", -1);
     PauseReplayRestore();
+    /* Practice frame simulation must not consume live keyboard or controller input. */
+    if (g_exSimulatingStageFrame) return 0;
     result = g_replayInputQueryOrig(self, id, delay);
     if (playback && g_replayInputQueryLogRemaining) {
         Log("ReplayInput: frame=%d cursor=%u mask=%04X query=%d delay=%d result=%u",
@@ -1272,7 +1275,7 @@ static int g_exBoss2BgmFrame = 0;
 static int g_exBoss2TransitionFastForwarded = 0;
 static int g_exBoss1DonePending = 0;
 static int g_exBoss2ScoreReset = 0;
-static int g_exBossReturnFF = 0;      /* boss practice: the practice boss vanished; fast-forward to the clear op */
+static int g_exBossReturnAtFrame = 0;
 static int g_exBossClearSim = 0;      /* the stage clear opcode was called while simulating */
 static int g_exBoss2Logged = 0;
 static unsigned *g_exBoss1Obj = NULL;   /* the Boss 1 object being defeated (so that Boss 2 is never touched) */
@@ -1320,7 +1323,6 @@ static int g_exPending = 0;
 static int g_exSkipWait = 0;
 static int g_exShorten = 0;
 
-static int g_exSimulatingStageFrame = 0;
 static int g_exBossRunLogged = 0;
 static volatile int g_exMuteSe = 0;   /* 1 while a practice skip fast-forwards: sound effects are not played */
 static int g_exBgmMuted = 0;
@@ -1412,7 +1414,7 @@ static void ExOnGameStart(int stage) {
     g_exBoss2TransitionFastForwarded = 0;
     g_exBoss1DonePending = 0;
     g_exBoss2ScoreReset = 0;
-    g_exBossReturnFF = 0;
+    g_exBossReturnAtFrame = 0;
     g_exBossClearSim = 0;
     g_exStartReq = 0;
     /* hook the VM before the practice fast-forward so the dialogue is not shown while it runs */
@@ -2739,7 +2741,7 @@ static void ExReturnToPracticeMenu(const char *reason) {
     g_exSkipWait = 0;
     g_exBoss2Kill = 0;
     g_exBoss2Transition = 0;
-    g_exBossReturnFF = 0;
+    g_exBossReturnAtFrame = 0;
     ((void (__cdecl *)(int, int))(uintptr_t)0x4254d0)(1, 0);
 }
 
@@ -2760,11 +2762,19 @@ static unsigned char __cdecl ExStageClearOp(void *thr, void *args) {
         return 1;
     }
     if (g_exRun && g_exBossRun == 1) {
-        ExReturnToPracticeMenu("Boss 1");
+        if (!g_exBossReturnAtFrame) {
+            g_exBossReturnAtFrame = *(volatile int*)(uintptr_t)0x4dadf8 + 60;
+            Log("ExArea: Boss 1 defeated; returning to Practice in 60 frames (at %d)",
+                g_exBossReturnAtFrame);
+        }
         return 1;
     }
     if (g_exRun && g_exBossRun == 2 && g_exBoss2BgmSeen) {
-        ExReturnToPracticeMenu("Boss 2");
+        if (!g_exBossReturnAtFrame) {
+            g_exBossReturnAtFrame = *(volatile int*)(uintptr_t)0x4dadf8 + 60;
+            Log("ExArea: Boss 2 defeated; returning to Practice in 60 frames (at %d)",
+                g_exBossReturnAtFrame);
+        }
         return 1;
     }
     return g_exClearOrig(thr, args);
@@ -2914,16 +2924,17 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         g_exBoss2TransitionFastForwarded = 1;
         frame = ExFastForwardBoss2Transition(frame);
     }
-    if (g_exBossReturnFF && !g_exSimulatingStageFrame) {
-        int run = g_exBossRun;
-        g_exBossReturnFF = 0;
-        frame = ExFastForwardBossReturn(frame);
-        ExReturnToPracticeMenu(run == 1 ? "Boss 1" : "Boss 2");
+    if (g_exBossReturnAtFrame > 0 && frame >= g_exBossReturnAtFrame && !g_exSimulatingStageFrame) {
+        ExReturnToPracticeMenu(g_exBossRun == 1 ? "Boss 1" : "Boss 2");
         return 1;
     }
     if (g_exRun && g_exBossRun == 1 && g_exBoss1DonePending) {
-        ExReturnToPracticeMenu("Boss 1");
-        return 1;
+        g_exBoss1DonePending = 0;
+        if (!g_exBossReturnAtFrame) {
+            g_exBossReturnAtFrame = frame + 60;
+            Log("ExArea: Boss 1 defeat transition reached; returning to Practice in 60 frames (at %d)",
+                g_exBossReturnAtFrame);
+        }
     }
     if (g_exRun && g_exBossRun == 0 && *(volatile int*)(uintptr_t)0x4dade4 == 4 &&
         g_exArea >= 0 && g_exArea < EX_AREA_N && frame >= g_exAreaEndFrame[g_exArea]) {
@@ -2931,10 +2942,8 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         return 1;
     }
     if (g_exBossRun >= 1 && !g_exBoss2Kill && !g_exSimulatingStageFrame && g_exBossRunLogged < 400) {
-        /* Boss practice (played normally): log when the current boss object changes or dies.  A
-           "none" after a live boss means the practice boss was defeated: arm the return fast-forward
-           (ExFastForwardBossReturn).  In Boss 2 practice only after Boss 2's BGM (the Boss 1 kill
-           during the transition is handled by ExBoss2Step with g_exBoss2Kill). */
+        /* A missing boss after a live boss starts the one-second return delay. In Boss 2 practice,
+           ignore Boss 1's disappearance until Boss 2's battle BGM has started. */
         static unsigned *lastBoss = NULL;
         unsigned *b = *(unsigned**)(uintptr_t)0x4dae04;
         if (b != lastBoss) {
@@ -2945,7 +2954,11 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
             else if (lastBoss) {
                 Log("ExDlg: Boss practice: current boss object -> none (frame %d, was %p)", frame,
                     (void*)lastBoss);
-                if (g_exBossRun == 1 || g_exBoss2BgmSeen) g_exBossReturnFF = 1;
+                if ((g_exBossRun == 1 || g_exBoss2BgmSeen) && !g_exBossReturnAtFrame) {
+                    g_exBossReturnAtFrame = frame + 60;
+                    Log("ExArea: Boss %d defeated; returning to Practice in 60 frames (at %d)",
+                        g_exBossRun, g_exBossReturnAtFrame);
+                }
             }
             lastBoss = b;
         }
