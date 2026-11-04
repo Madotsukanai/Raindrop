@@ -1,4 +1,5 @@
 build/
 .opencode/
+.smd_extract/
 d3d9.dll
 ddraw.dll
