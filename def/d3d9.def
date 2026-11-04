@@ -1,0 +1,4 @@
+LIBRARY d3d9
+EXPORTS
+    ; Direct3D 9 proxy export. Internal name uses the x86 stdcall ABI.
+    Direct3DCreate9 = _Direct3DCreate9@4
