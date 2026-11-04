@@ -1,0 +1,37 @@
+# Windows build file for nmake + 32-bit MinGW-w64 GCC.
+# Run from a Visual Studio Developer Command Prompt after adding the MinGW32
+# bin directory to PATH, for example C:\msys64\mingw32\bin.
+
+!IFNDEF MINGW_CC
+MINGW_CC = i686-w64-mingw32-gcc
+!ENDIF
+
+CFLAGS = -O2 -Wall
+SMD_CFLAGS = -O2 -Wall -Wno-unused-function -Wno-unused-variable
+LDFLAGS = -shared -static-libgcc -s -Wl,--kill-at
+
+all: build\d3d9.dll build\ddraw.dll
+
+refrain: build\d3d9.dll
+
+smd: build\ddraw.dll
+
+smd-debug: build\debug\ddraw.dll
+
+build:
+	@if not exist build mkdir build
+
+build\debug: build
+	@if not exist build\debug mkdir build\debug
+
+build\d3d9.dll: RefRain.c build
+	$(MINGW_CC) -o $@ RefRain.c $(CFLAGS) $(LDFLAGS) -lwinmm
+
+build\ddraw.dll: Smd.c build
+	$(MINGW_CC) -o $@ Smd.c $(SMD_CFLAGS) $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldinput -ldxguid
+
+build\debug\ddraw.dll: Smd.c build\debug
+	$(MINGW_CC) -o $@ Smd.c $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldinput -ldxguid
+
+clean:
+	@if exist build rmdir /S /Q build

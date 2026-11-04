@@ -4185,15 +4185,55 @@ static LPDIRECTINPUT8A g_di8;
 static LPDIRECTINPUTDEVICE8A g_diDevices[16];
 static unsigned g_diCount;
 static DWORD g_diLastScan;
+static DIDATAFORMAT g_diFormat;
+static DIOBJECTDATAFORMAT g_diObjects[140];
+static int g_diFormatReady;
+
+static void JoyDirectInputFormatInit(void) {
+    static const GUID *const axisGuid[8] = {
+        &GUID_XAxis, &GUID_YAxis, &GUID_ZAxis, &GUID_RxAxis,
+        &GUID_RyAxis, &GUID_RzAxis, &GUID_Slider, &GUID_Slider
+    };
+    static const DWORD axisOffset[8] = {
+        DIJOFS_X, DIJOFS_Y, DIJOFS_Z, DIJOFS_RX,
+        DIJOFS_RY, DIJOFS_RZ, DIJOFS_SLIDER(0), DIJOFS_SLIDER(1)
+    };
+    unsigned i;
+    if (g_diFormatReady) return;
+    memset(&g_diFormat, 0, sizeof(g_diFormat));
+    for (i = 0; i < 8; i++) {
+        g_diObjects[i].pguid = (GUID*)axisGuid[i];
+        g_diObjects[i].dwOfs = axisOffset[i];
+        g_diObjects[i].dwType = DIDFT_ABSAXIS | DIDFT_MAKEINSTANCE(i);
+    }
+    for (i = 0; i < 4; i++) {
+        g_diObjects[8 + i].pguid = (GUID*)&GUID_POV;
+        g_diObjects[8 + i].dwOfs = DIJOFS_POV(i);
+        g_diObjects[8 + i].dwType = DIDFT_POV | DIDFT_MAKEINSTANCE(i);
+    }
+    for (i = 0; i < 128; i++) {
+        g_diObjects[12 + i].pguid = (GUID*)&GUID_Button;
+        g_diObjects[12 + i].dwOfs = DIJOFS_BUTTON(i);
+        g_diObjects[12 + i].dwType = DIDFT_BUTTON | DIDFT_MAKEINSTANCE(i);
+    }
+    g_diFormat.dwSize = sizeof(g_diFormat);
+    g_diFormat.dwObjSize = sizeof(DIOBJECTDATAFORMAT);
+    g_diFormat.dwFlags = DIDF_ABSAXIS;
+    g_diFormat.dwDataSize = sizeof(DIJOYSTATE2);
+    g_diFormat.dwNumObjs = sizeof(g_diObjects) / sizeof(g_diObjects[0]);
+    g_diFormat.rgodf = g_diObjects;
+    g_diFormatReady = 1;
+}
 
 static BOOL CALLBACK JoyEnumDirectInput(const DIDEVICEINSTANCEA *instance, void *context) {
     HWND hwnd = (HWND)context;
     LPDIRECTINPUTDEVICE8A device = NULL;
     HRESULT hr;
     if (g_diCount >= sizeof(g_diDevices) / sizeof(g_diDevices[0])) return DIENUM_STOP;
+    JoyDirectInputFormatInit();
     hr = IDirectInput8_CreateDevice(g_di8, &instance->guidInstance, &device, NULL);
     if (FAILED(hr) || !device) return DIENUM_CONTINUE;
-    hr = IDirectInputDevice8_SetDataFormat(device, &c_dfDIJoystick2);
+    hr = IDirectInputDevice8_SetDataFormat(device, &g_diFormat);
     if (SUCCEEDED(hr) && hwnd)
         hr = IDirectInputDevice8_SetCooperativeLevel(device, hwnd, DISCL_NONEXCLUSIVE | DISCL_BACKGROUND);
     if (FAILED(hr)) {

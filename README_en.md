@@ -23,6 +23,42 @@ Download `d3d9.dll` from [Releases](https://github.com/Madotsukanai/Raindrop/rel
 
 To open the Practice menu, move the cursor to “DIVE 2 M.R.S.” and press the key assigned to Concept Reactor.
 
+## Building on Windows
+
+The project uses 32-bit MinGW-w64 GCC. You need `i686-w64-mingw32-gcc` and the MinGW-w64 `gdi32`, `dxguid`, and `winmm` libraries. The sources use GNU attributes and GNU-style inline assembly, so they cannot be compiled directly with MSVC's `cl.exe`.
+
+Add MinGW-w64 GCC to `PATH`, then run this from the repository root:
+
+```bat
+nmake /f NMakefile
+```
+
+This creates `build\d3d9.dll` and `build\ddraw.dll`. To build the Smd debug DLL at `build\debug\ddraw.dll`, run:
+
+```bat
+nmake /f NMakefile smd-debug
+```
+
+If the compiler has a different name or location, set `MINGW_CC`:
+
+```bat
+nmake /f NMakefile MINGW_CC=C:\mingw32\bin\i686-w64-mingw32-gcc.exe
+```
+
+### MSVC toolchain
+
+Microsoft's `cl.exe` cannot parse the GNU-style inline assembly in these sources, so use `clang-cl` from an x86 Native Tools Command Prompt. Add the LLVM/Clang tools in Visual Studio Installer, then run:
+
+```bat
+nmake /f NMakefile.msvc
+```
+
+This uses the MSVC Windows SDK, `link.exe`, and libraries to produce x86 DLLs in the same output paths. Build the Smd debug DLL with:
+
+```bat
+nmake /f NMakefile.msvc smd-debug
+```
+
 ## Features
 
 - Reduced input latency
@@ -33,6 +69,7 @@ To open the Practice menu, move the cursor to “DIVE 2 M.R.S.” and press the 
 - Extra stage added to the Practice menu
 
 ![Practice](https://madotsukanai.github.io/raindrop2.png)
+After clearing all stages, select Extra in Practice and use the left and right keys to cycle through Area 1/4–4/4, Boss 1/2, and Boss 2/2. Practice starts from the selected area or boss fight.
 
 - Bug fixes
 
@@ -53,10 +90,6 @@ Forces bullet and player coordinates in replays to use 24-bit floating-point cal
 - Adjust starting power in Practice mode
 
 Stage 2 starts with power level 6, and Stage 3 starts at maximum power.
-
-- Extra stage selection in the Practice menu
-
-After clearing all stages, select Extra in Practice and use the left and right keys to cycle through Area 1/4–4/4, Boss 1/2, and Boss 2/2. Practice starts from the selected area or boss fight.
 
 ### RefRain
 

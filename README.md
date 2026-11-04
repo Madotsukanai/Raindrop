@@ -29,6 +29,42 @@ RefRain.exeのSHA-256: `db092baa547241a0217ca41be8538672b79094f671884f92a32c0694
 
 「DIVE 2 M.R.S.」にカーソルを合わせ、コンセプトリアクターに割り当てたキーを入力するとプラクティスメニューが開きます。
 
+## ビルド（Windows）
+
+このプロジェクトは32-bit MinGW-w64 GCCを使用します。`i686-w64-mingw32-gcc`と、MinGW-w64の`gdi32`、`dxguid`、`winmm`ライブラリが必要です。`RefRain.c`と`Smd.c`がGNU形式の属性およびインラインアセンブリを使うためです。
+
+MinGW-w64 GCCをPATHに追加し、リポジトリのルートで実行します。
+
+```bat
+nmake /f NMakefile
+```
+
+通常版は`build\d3d9.dll`と`build\ddraw.dll`、デバッグ版のSmdは次のコマンドで`build\debug\ddraw.dll`に作成します。
+
+```bat
+nmake /f NMakefile smd-debug
+```
+
+コンパイラ名や配置が異なる場合は`MINGW_CC`で指定できます。
+
+```bat
+nmake /f NMakefile MINGW_CC=C:\mingw32\bin\i686-w64-mingw32-gcc.exe
+```
+
+### MSVCツールチェーン
+
+Microsoftの`cl.exe`はGNU形式のインラインアセンブリを解釈できないため、Visual Studioのx86 Native Tools環境で`clang-cl`を使います。Visual Studio InstallerでLLVM/Clangツールを追加し、次を実行してください。MSVCのWindows SDK、`link.exe`およびライブラリを使ってx86 DLLを作成します。
+
+```bat
+nmake /f NMakefile.msvc
+```
+
+出力先はMinGWビルドと同じです。デバッグ版は次のコマンドで作成します。
+
+```bat
+nmake /f NMakefile.msvc smd-debug
+```
+
 ## 機能
 
 - 入力遅延の軽減
