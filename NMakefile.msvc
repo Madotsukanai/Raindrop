@@ -23,7 +23,7 @@ build:
 build\debug: build
 	@if not exist build\debug mkdir build\debug
 
-build\d3d9.dll: RefRain.c def\d3d9.def build
+build\d3d9.dll: RefRain.c d3dx9_font_compat.h def\d3d9.def build
 	$(CLANG_CL) $(TARGET) $(CFLAGS) /LD RefRain.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\d3d9.def winmm.lib
 
 build\ddraw.dll: Smd.c def\ddraw.def build

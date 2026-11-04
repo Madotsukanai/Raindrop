@@ -1,8 +1,8 @@
 #include <windows.h>
 #include <d3d9.h>
-#include <d3dx9.h>
 #include <mmsystem.h>
 #include <stdio.h>
+#include "d3dx9_font_compat.h"
 
 static volatile int g_ShowStageMenu = 0;
 static volatile int g_StageSelected = 0;

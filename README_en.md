@@ -47,7 +47,7 @@ nmake /f NMakefile MINGW_CC=C:\mingw32\bin\i686-w64-mingw32-gcc.exe
 
 ### MSVC toolchain
 
-Microsoft's `cl.exe` cannot parse the GNU-style inline assembly in these sources, so use `clang-cl` from an x86 Native Tools Command Prompt. Add the LLVM/Clang tools in Visual Studio Installer, then run:
+Microsoft's `cl.exe` cannot parse the GNU-style inline assembly in these sources, so use `clang-cl` from an x86 Native Tools Command Prompt. Add the LLVM/Clang tools in Visual Studio Installer, then run. The bundled D3DX9 compatibility declarations mean the legacy DirectX SDK is not required:
 
 ```bat
 nmake /f NMakefile.msvc

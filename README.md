@@ -53,7 +53,7 @@ nmake /f NMakefile MINGW_CC=C:\mingw32\bin\i686-w64-mingw32-gcc.exe
 
 ### MSVCツールチェーン
 
-Microsoftの`cl.exe`はGNU形式のインラインアセンブリを解釈できないため、Visual Studioのx86 Native Tools環境で`clang-cl`を使います。Visual Studio InstallerでLLVM/Clangツールを追加し、次を実行してください。MSVCのWindows SDK、`link.exe`およびライブラリを使ってx86 DLLを作成します。
+Microsoftの`cl.exe`はGNU形式のインラインアセンブリを解釈できないため、Visual Studioのx86 Native Tools環境で`clang-cl`を使います。Visual Studio InstallerでLLVM/Clangツールを追加し、次を実行してください。MSVCのWindows SDK、`link.exe`およびライブラリを使ってx86 DLLを作成します。D3DX9ヘッダーは同梱の互換定義を使うため、旧DirectX SDKは不要です。
 
 ```bat
 nmake /f NMakefile.msvc
