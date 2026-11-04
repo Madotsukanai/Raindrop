@@ -2464,7 +2464,11 @@ void __attribute__((naked)) Hook_LoadStart(void) {
 typedef IDirect3D9* (WINAPI *PFN_Direct3DCreate9)(UINT SDKVersion);
 static PFN_Direct3DCreate9 orig_Direct3DCreate9 = NULL;
 
+#if defined(_MSC_VER)
+IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion) {
+#else
 __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion) {
+#endif
     if (!orig_Direct3DCreate9) {
         char sysPath[MAX_PATH];
         UINT len = GetSystemDirectoryA(sysPath, MAX_PATH);

@@ -4229,6 +4229,8 @@ static BOOL CALLBACK JoyEnumDirectInput(const DIDEVICEINSTANCEA *instance, void 
     HWND hwnd = (HWND)context;
     LPDIRECTINPUTDEVICE8A device = NULL;
     HRESULT hr;
+    DIPROPRANGE axisRange;
+    unsigned i;
     if (g_diCount >= sizeof(g_diDevices) / sizeof(g_diDevices[0])) return DIENUM_STOP;
     JoyDirectInputFormatInit();
     hr = IDirectInput8_CreateDevice(g_di8, &instance->guidInstance, &device, NULL);
@@ -4239,6 +4241,16 @@ static BOOL CALLBACK JoyEnumDirectInput(const DIDEVICEINSTANCEA *instance, void 
     if (FAILED(hr)) {
         IDirectInputDevice8_Release(device);
         return DIENUM_CONTINUE;
+    }
+    memset(&axisRange, 0, sizeof(axisRange));
+    axisRange.diph.dwSize = sizeof(axisRange);
+    axisRange.diph.dwHeaderSize = sizeof(axisRange.diph);
+    axisRange.diph.dwHow = DIPH_BYID;
+    axisRange.lMin = -1000;
+    axisRange.lMax = 1000;
+    for (i = 0; i < 8; i++) {
+        axisRange.diph.dwObj = DIDFT_ABSAXIS | DIDFT_MAKEINSTANCE(i);
+        IDirectInputDevice8_SetProperty(device, DIPROP_RANGE, &axisRange.diph);
     }
     IDirectInputDevice8_Acquire(device);
     g_diDevices[g_diCount++] = device;
@@ -4287,7 +4299,7 @@ static unsigned JoyDirectInputState(unsigned id, JOYINFOEX *ji) {
     memset(ji, 0, sizeof(*ji));
     ji->dwSize = sizeof(*ji);
     ji->dwFlags = JOY_RETURNALL;
-#define DI_AXIS(v) ((DWORD)(((long)(v) + 1000L) * 65535L / 2000L))
+#define DI_AXIS(v) ((DWORD)((((long)(v) < -1000L ? -1000L : (long)(v) > 1000L ? 1000L : (long)(v)) + 1000L) * 65535L / 2000L))
     ji->dwXpos = DI_AXIS(state.lX);
     ji->dwYpos = DI_AXIS(state.lY);
     ji->dwZpos = DI_AXIS(state.lZ);
@@ -7057,31 +7069,37 @@ ddraw_ready:
     return hr;
 }
 
-__declspec(dllexport) HRESULT WINAPI DirectDrawCreate(GUID *g, LPDIRECTDRAW *out, IUnknown *u) {
+#if defined(_MSC_VER)
+#define SMD_DLL_EXPORT
+#else
+#define SMD_DLL_EXPORT __declspec(dllexport)
+#endif
+
+SMD_DLL_EXPORT HRESULT WINAPI DirectDrawCreate(GUID *g, LPDIRECTDRAW *out, IUnknown *u) {
     LoadReal();
     if (!p_DirectDrawCreate) return DDERR_GENERIC;
     HRESULT hr = ((PF_DDC)p_DirectDrawCreate)(g, out, u);
     Log("DirectDrawCreate -> hr=%08X", hr);
     return hr;
 }
-__declspec(dllexport) HRESULT WINAPI DirectDrawCreateClipper(DWORD flags, LPDIRECTDRAWCLIPPER *c, IUnknown *u) {
+SMD_DLL_EXPORT HRESULT WINAPI DirectDrawCreateClipper(DWORD flags, LPDIRECTDRAWCLIPPER *c, IUnknown *u) {
     LoadReal();
     if (!p_DirectDrawCreateClipper) return DDERR_GENERIC;
     HRESULT hr = ((PF_DDClip)p_DirectDrawCreateClipper)(flags, c, u);
     Log("DirectDrawCreateClipper -> hr=%08X", hr);
     return hr;
 }
-__declspec(dllexport) HRESULT WINAPI DirectDrawCreateEx(GUID *g, LPVOID *o, REFIID i, IUnknown *u) {
+SMD_DLL_EXPORT HRESULT WINAPI DirectDrawCreateEx(GUID *g, LPVOID *o, REFIID i, IUnknown *u) {
     return Hook_DirectDrawCreateEx(g, o, i, u);
 }
-__declspec(dllexport) HRESULT WINAPI DirectDrawEnumerateA(LPDDENUMCALLBACKA cb, void *ctx) {
+SMD_DLL_EXPORT HRESULT WINAPI DirectDrawEnumerateA(LPDDENUMCALLBACKA cb, void *ctx) {
     LoadReal();
     if (!p_DirectDrawEnumerateA) return DDERR_GENERIC;
     HRESULT hr = ((PF_DDEnum)p_DirectDrawEnumerateA)(cb, ctx);
     Log("DirectDrawEnumerateA -> hr=%08X", hr);
     return hr;
 }
-__declspec(dllexport) HRESULT WINAPI DirectDrawEnumerateW(LPDDENUMCALLBACKW cb, void *ctx) {
+SMD_DLL_EXPORT HRESULT WINAPI DirectDrawEnumerateW(LPDDENUMCALLBACKW cb, void *ctx) {
     typedef HRESULT (WINAPI *PF_DDEnumW)(LPDDENUMCALLBACKW, LPVOID);
     LoadReal();
     if (!p_DirectDrawEnumerateW) return DDERR_GENERIC;
@@ -7089,14 +7107,14 @@ __declspec(dllexport) HRESULT WINAPI DirectDrawEnumerateW(LPDDENUMCALLBACKW cb, 
     Log("DirectDrawEnumerateW -> hr=%08X", hr);
     return hr;
 }
-__declspec(dllexport) HRESULT WINAPI DirectDrawEnumerateExA(LPDDENUMCALLBACKEXA cb, void *ctx, DWORD flags) {
+SMD_DLL_EXPORT HRESULT WINAPI DirectDrawEnumerateExA(LPDDENUMCALLBACKEXA cb, void *ctx, DWORD flags) {
     LoadReal();
     if (!p_DirectDrawEnumerateExA) return DDERR_GENERIC;
     HRESULT hr = ((PF_DDEnumEx)p_DirectDrawEnumerateExA)(cb, ctx, flags);
     Log("DirectDrawEnumerateExA -> hr=%08X", hr);
     return hr;
 }
-__declspec(dllexport) HRESULT WINAPI DirectDrawEnumerateExW(LPDDENUMCALLBACKEXW cb, void *ctx, DWORD flags) {
+SMD_DLL_EXPORT HRESULT WINAPI DirectDrawEnumerateExW(LPDDENUMCALLBACKEXW cb, void *ctx, DWORD flags) {
     typedef HRESULT (WINAPI *PF_DDEnumExW)(LPDDENUMCALLBACKEXW, LPVOID, DWORD);
     LoadReal();
     if (!p_DirectDrawEnumerateExW) return DDERR_GENERIC;
@@ -7104,23 +7122,23 @@ __declspec(dllexport) HRESULT WINAPI DirectDrawEnumerateExW(LPDDENUMCALLBACKEXW 
     Log("DirectDrawEnumerateExW -> hr=%08X", hr);
     return hr;
 }
-__declspec(dllexport) HRESULT WINAPI DllCanUnloadNow(void) {
+SMD_DLL_EXPORT HRESULT WINAPI DllCanUnloadNow(void) {
     LoadReal();
     if (!p_DllCanUnloadNow) return S_FALSE;
     return ((PF_FPOCH)p_DllCanUnloadNow)();
 }
-__declspec(dllexport) HRESULT WINAPI DllGetClassObject(REFCLSID cls, REFIID iid, void **out) {
+SMD_DLL_EXPORT HRESULT WINAPI DllGetClassObject(REFCLSID cls, REFIID iid, void **out) {
     typedef HRESULT (WINAPI *PF_DGCO)(REFCLSID, REFIID, void**);
     LoadReal();
     if (!p_DllGetClassObject) return CLASS_E_CLASSNOTAVAILABLE;
     return ((PF_DGCO)p_DllGetClassObject)(cls, iid, out);
 }
-__declspec(dllexport) HRESULT WINAPI DllRegisterServer(void) {
+SMD_DLL_EXPORT HRESULT WINAPI DllRegisterServer(void) {
     LoadReal();
     if (!p_DllRegisterServer) return E_FAIL;
     return ((PF_FPOCH)p_DllRegisterServer)();
 }
-__declspec(dllexport) HRESULT WINAPI DllUnregisterServer(void) {
+SMD_DLL_EXPORT HRESULT WINAPI DllUnregisterServer(void) {
     LoadReal();
     if (!p_DllUnregisterServer) return E_FAIL;
     return ((PF_FPOCH)p_DllUnregisterServer)();

@@ -24,13 +24,13 @@ build\debug: build
 	@if not exist build\debug mkdir build\debug
 
 build\d3d9.dll: RefRain.c d3dx9_font_compat.h def\d3d9.def build
-	$(CLANG_CL) $(TARGET) $(CFLAGS) /LD RefRain.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\d3d9.def winmm.lib
+	$(CLANG_CL) $(TARGET) $(CFLAGS) /LD RefRain.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\d3d9.def user32.lib winmm.lib
 
 build\ddraw.dll: Smd.c def\ddraw.def build
-	$(CLANG_CL) $(TARGET) $(CFLAGS) /LD Smd.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\ddraw.def /FORCE:MULTIPLE gdi32.lib dxguid.lib
+	$(CLANG_CL) $(TARGET) $(CFLAGS) /LD Smd.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\ddraw.def /FORCE:MULTIPLE user32.lib gdi32.lib dxguid.lib
 
 build\debug\ddraw.dll: Smd.c def\ddraw.def build\debug
-	$(CLANG_CL) $(TARGET) $(CFLAGS) /DSMD_DEBUG_BUILD /LD Smd.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\ddraw.def /FORCE:MULTIPLE gdi32.lib dxguid.lib
+	$(CLANG_CL) $(TARGET) $(CFLAGS) /DSMD_DEBUG_BUILD /LD Smd.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\ddraw.def /FORCE:MULTIPLE user32.lib gdi32.lib dxguid.lib
 
 clean:
 	@if exist build rmdir /S /Q build
