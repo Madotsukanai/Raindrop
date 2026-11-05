@@ -24,14 +24,14 @@ build:
 build\debug: build
 	@if not exist build\debug mkdir build\debug
 
-build\d3d9.dll: RefRain.c build
-	$(MINGW_CC) -o $@ RefRain.c $(CFLAGS) $(LDFLAGS) -lwinmm
+build\d3d9.dll: src\RefRain.c src\d3dx9_font_compat.h build
+	$(MINGW_CC) -o $@ src\RefRain.c $(CFLAGS) $(LDFLAGS) -lwinmm
 
-build\ddraw.dll: Smd.c build
-	$(MINGW_CC) -o $@ Smd.c $(SMD_CFLAGS) $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldinput -ldxguid
+build\ddraw.dll: src\Smd.c build
+	$(MINGW_CC) -o $@ src\Smd.c $(SMD_CFLAGS) $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldinput -ldxguid
 
-build\debug\ddraw.dll: Smd.c build\debug
-	$(MINGW_CC) -o $@ Smd.c $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldinput -ldxguid
+build\debug\ddraw.dll: src\Smd.c build\debug
+	$(MINGW_CC) -o $@ src\Smd.c $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldinput -ldxguid
 
 clean:
 	@if exist build rmdir /S /Q build

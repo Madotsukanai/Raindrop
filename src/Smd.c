@@ -14,6 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 static FILE *g_log = NULL;
 static const int g_LogAll = 0;
@@ -1130,6 +1133,14 @@ static int g_exBossRun = 0;
 static int g_practiceBossStage = 0;
 static int g_practiceBossActive = 0;
 static int g_practiceBossTarget = 0;
+static int g_practiceScorePending = 0;
+static int g_practiceScoreActive = 0;
+static int g_practiceScoreStage = 0;
+static int g_practiceScoreResetFrame = -1;
+static int g_practiceBgmSeekPending = 0;
+static int g_practiceBgmSeekDeadline = 0;
+static int g_practiceBgmSeekSeconds = 0;
+static int g_practiceBgmStartedDuringSeek = 0;
 static int g_practiceBgmLastId = -1;
 static int g_practiceBossSeekingSecondForm = 0;
 static int g_practiceBossFormBgmChanged = 0;
@@ -1144,6 +1155,7 @@ static int g_exBoss2Transition = 0;   /* suppress dialogue until Boss 2's battle
 static int g_exBoss2KillFrames = 0;
 static int g_exBoss1Defeated = 0;
 static int g_exBoss2BgmSeen = 0;      /* Boss 2's battle BGM has started (VM bgm op seen outside the fast-forward) */
+static int g_exBoss2ObjectSeen = 0;
 static int g_exBoss2BgmFrame = 0;
 static int g_exBoss2TransitionFastForwarded = 0;
 static int g_exBoss1DonePending = 0;
@@ -1152,6 +1164,7 @@ static int g_exBossReturnAtFrame = 0;
 static int g_exBossClearSim = 0;      /* the stage clear opcode was called while simulating */
 static int g_exBoss2Logged = 0;
 static unsigned *g_exBoss1Obj = NULL;   /* the Boss 1 object being defeated (so that Boss 2 is never touched) */
+static unsigned *g_exLastBoss = NULL;
 
 typedef void (__stdcall *PF_GameStart)(int stage);
 
@@ -1194,7 +1207,7 @@ static const int g_exAreaBgm[EX_AREA_N] = { 2, 3, 4, 5 };
 static const int g_exAreaDefaultFrame[EX_AREA_N] = { 362, 6612, 8962, 14192 };
 static const int g_exAreaEndFrame[EX_AREA_N] = { 6612, 8962, 14192, 19074 };
 static const int g_exBossBgm[2] = { 0, 1 };
-static const int g_exBossDefaultFrame[2] = { 19074, 24017 };
+static const int g_exBossDefaultFrame[2] = { 18452, 24017 };
 static int g_exBgmTime[EX_BGM_IDS];
 static int g_exBossBgmTime[2];
 static int g_exAreaN = EX_AREA_N;
@@ -1285,16 +1298,33 @@ static void ExArm(void) {
 
 static void ExDlgInstall(void);
 static void ExClearHookInstall(void);
+static int PracticeSeekBgm(int seconds);
+
+static void PracticeResetScore(const char *reason, int stage) {
+    *(volatile int*)(uintptr_t)0x4dadf0 = 0;
+    *(volatile int*)(uintptr_t)0x4dade8 = 0;
+    Log("PracticeScore: score and displayed score set to 0 (%s, stage %d)", reason, stage);
+}
+
+static void PracticeScheduleScoreReset(void) {
+    g_practiceScoreResetFrame = *(volatile int*)(uintptr_t)0x4dadf8 + 2;
+}
 
 static void ExOnGameStart(int stage) {
     g_exRun = (stage == 4) && g_exStartReq;
     g_exBossRun = g_exRun ? g_exBossSelected : 0;
     g_exBoss2Kill = 0;
     g_exBoss2Transition = 0;
+    g_exBoss2KillFrames = 0;
     g_exBoss1Defeated = 0;
     g_exBoss2BgmSeen = 0;
+    g_exBoss2ObjectSeen = 0;
     g_exBoss2BgmFrame = 0;
     g_exBoss2TransitionFastForwarded = 0;
+    g_exBoss2Logged = 0;
+    g_exBoss1Obj = NULL;
+    g_exLastBoss = NULL;
+    g_exBossRunLogged = 0;
     g_exBoss1DonePending = 0;
     g_exBoss2ScoreReset = 0;
     g_exBossReturnAtFrame = 0;
@@ -1311,18 +1341,38 @@ static void ExOnGameStart(int stage) {
 
 static void ExOnRetry(int stage) {
     if (stage == 4) {
+        g_exBoss2Kill = 0;
+        g_exBoss2Transition = 0;
+        g_exBoss2KillFrames = 0;
+        g_exBoss1Defeated = 0;
+        g_exBoss2BgmSeen = 0;
+        g_exBoss2ObjectSeen = 0;
+        g_exBoss2BgmFrame = 0;
+        g_exBoss2TransitionFastForwarded = 0;
+        g_exBoss1DonePending = 0;
+        g_exBoss2ScoreReset = 0;
+        g_exBossReturnAtFrame = 0;
+        g_exBossClearSim = 0;
+        g_exBoss2Logged = 0;
+        g_exBoss1Obj = NULL;
+        g_exLastBoss = NULL;
+        g_exBossRunLogged = 0;
         g_exPending = 1;
         ExArm();
     }
 }
 
 static void __stdcall GameStartHook(int stage) {
+    int practiceStart = g_practiceScorePending && stage == g_practiceScoreStage;
+    g_practiceBgmSeekPending = 0;
+    g_practiceBgmStartedDuringSeek = 0;
     g_pauseAfterLoad = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
     g_pauseLoadArmed = 1;
     Log("Pause: stage %d load started (Escape held=%d)", stage, g_pauseAfterLoad);
     g_practiceBossPending = g_practiceBossStart == stage;
     if (g_practiceBossPending) {
         g_practiceBgmLastId = -1;
+        g_practiceBgmStartedDuringSeek = 0;
         g_practiceBossSeekingSecondForm = 0;
         g_practiceBossFormBgmChanged = 0;
         g_practiceBossLiveTransition = 0;
@@ -1334,6 +1384,17 @@ static void __stdcall GameStartHook(int stage) {
     }
     ((PF_GameStart)(uintptr_t)0x423880)(stage);
     ExOnGameStart(stage);
+    if (practiceStart) {
+        g_practiceScorePending = 0;
+        g_practiceScoreActive = 1;
+        PracticeResetScore("start", stage);
+        PracticeScheduleScoreReset();
+    } else {
+        g_practiceScorePending = 0;
+        g_practiceScoreActive = 0;
+        g_practiceScoreStage = 0;
+        g_practiceScoreResetFrame = -1;
+    }
     if (g_practiceBossPending) {
         ExDlgInstall();
         Log("PracticeBoss: stage %d boss start requested", stage);
@@ -1356,7 +1417,13 @@ static void __stdcall RetryHook(int stage) {
         }
         return;
     }
+    g_practiceBgmSeekPending = 0;
+    g_practiceBgmStartedDuringSeek = 0;
     ((PF_GameStart)(uintptr_t)0x419d10)(stage);
+    if (g_practiceScoreActive && stage == g_practiceScoreStage) {
+        PracticeResetScore("retry", stage);
+        PracticeScheduleScoreReset();
+    }
     if (g_practiceBossActive && stage == g_practiceBossStage) {
         g_practiceBgmLastId = -1;
         g_practiceBossSeekingSecondForm = 0;
@@ -1710,7 +1777,9 @@ static unsigned char __attribute__((fastcall)) PracticeUpdateHook(void *obj) {
 
     if (edge(input, 4) || rawkey(input, 0xd)) {
         *(int*)(scene + 0xc) = 0;
+        g_practiceScorePending = 1;
         if (*cur < 3) {
+            g_practiceScoreStage = *cur + 1;
             *(int*)(scene + 0x10) = *cur + 1;
             *(volatile unsigned char*)(uintptr_t)0x4dade0 = 1;
             *(volatile int*)(uintptr_t)0x4dadd8 = *(int*)(uintptr_t)(0x46bc14 + 4 * *cur) - 1;
@@ -1733,6 +1802,7 @@ static unsigned char __attribute__((fastcall)) PracticeUpdateHook(void *obj) {
                 g_practiceBossTarget = 0;
             }
         } else {
+            g_practiceScoreStage = 4;
             *(int*)(scene + 0x10) = 4;
             *(volatile unsigned char*)(uintptr_t)0x4dade0 = 1;
             *(volatile int*)(uintptr_t)0x4dadd8 = *(volatile int*)(uintptr_t)0x46c7c4;
@@ -1853,6 +1923,9 @@ static void ExLogQueue(void) {
                 i == 0 ? " (spawns not listed)" : "");
 }
 
+static int g_exBgmMoveDelta = 0;   /* frames between the moved BGM event's original time and the jump */
+static int g_exBgmMoveTime = 0;    /* original time of the moved BGM event */
+
 static void ExSkipTo(int target, int area) {
     unsigned **headp = (unsigned**)(uintptr_t)0x4ea1d8;
     unsigned *prev = NULL, *n = *headp;
@@ -1860,6 +1933,9 @@ static void ExSkipTo(int target, int area) {
     int dropped = 0, bgDropped = 0, spawnLogged = 0;
     unsigned layerKey[8];
     int layerLast[8], nLayers = 0, li;
+
+    g_exBgmMoveDelta = 0;
+    g_exBgmMoveTime = 0;
 
     for (n = *headp; n; n = (unsigned*)n[0]) {
         unsigned *a = (unsigned*)n[3];
@@ -1889,6 +1965,8 @@ static void ExSkipTo(int target, int area) {
         }
         if (!exact && keepBgm) {
             Log("ExArea: BGM event at t=%d kept and moved to the target frame %d", bestT, target);
+            g_exBgmMoveTime = bestT;
+            g_exBgmMoveDelta = target - bestT;
             keepBgm[1] = (unsigned)target;
         }
     }
@@ -2847,12 +2925,13 @@ static void ExReturnToPracticeMenu(const char *reason) {
     g_exSkipWait = 0;
     g_exBoss2Kill = 0;
     g_exBoss2Transition = 0;
+    g_exBoss2ObjectSeen = 0;
     g_exBossReturnAtFrame = 0;
     ((void (__cdecl *)(int, int))(uintptr_t)0x4254d0)(1, 0);
 }
 
 static unsigned char __cdecl ExStageClearOp(void *thr, void *args) {
-    int transitionClear = g_exBossRun == 2 && !g_exBoss2BgmSeen;
+    int transitionClear = g_exBossRun == 2 && !g_exBoss2ObjectSeen;
     if (g_exClearLog < 20) {
         g_exClearLog++;
         Log("ExArea: stage clear opcode called (thr=%p ip=%d frame=%d boss=%p boss2bgm=%d sim=%d) -> %s", thr,
@@ -2952,6 +3031,7 @@ static void ExBoss2Step(int frame) {
     if (g_exBoss1Defeated) {
         if (!g_exBoss1Obj || boss != g_exBoss1Obj) {
             g_exBoss2Kill = 0;
+            g_exBoss2ObjectSeen = 1;
             Log("ExArea: Boss 2 appeared (object %p, hp=%.3f) %d frame(s) after Boss 1 was defeated",
                 (void*)boss, *(float*)((char*)boss + 0x48), g_exBoss2KillFrames);
             return;
@@ -3013,6 +3093,8 @@ static void PracticeBossTrackStage3BgmEvent(int frame) {
     }
 }
 
+static unsigned char g_joyPlugged[4]; /* forward (defined with JoyBridge) */
+
 static unsigned char __cdecl EventDispatchImpl(int frame) {
     static int f9prev = 0;
     FpuEnforce("stage", frame);
@@ -3027,6 +3109,20 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
     if (g_exSimulatingStageFrame) {
         PracticeBossTrackStage3BgmEvent(frame);
         return ((PF_EventDispatch)(uintptr_t)0x430020)(frame);
+    }
+    if (g_practiceBgmSeekPending) {
+        if (PracticeSeekBgm(g_practiceBgmSeekSeconds)) {
+            g_practiceBgmSeekPending = 0;
+        } else if (frame >= g_practiceBgmSeekDeadline) {
+            g_practiceBgmSeekPending = 0;
+            Log("Practice/BGM seek to %d second(s) timed out (frame %d)", g_practiceBgmSeekSeconds, frame);
+        }
+    }
+    if (g_practiceScoreActive && g_practiceScoreResetFrame >= 0 &&
+        frame >= g_practiceScoreResetFrame &&
+        *(volatile int*)(uintptr_t)0x4dade4 == g_practiceScoreStage) {
+        PracticeResetScore("delayed start", g_practiceScoreStage);
+        g_practiceScoreResetFrame = -1;
     }
     if (g_pauseAfterLoad && *(volatile int*)(uintptr_t)0x4dade4 >= 1 &&
         *(volatile int*)(uintptr_t)0x4dade4 <= 4) {
@@ -3074,6 +3170,34 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
     if (f9 && !f9prev && *(volatile int*)(uintptr_t)0x4dade4 == 4)
         Log("ExArea: marker frame=%d", frame);
     f9prev = f9;
+#ifdef SMD_DEBUG_BUILD
+    {   /* JoyDbg: dump the game's joystick buffer and parsed direction flags */
+        static int joyDbgN = 0;
+        static int joyDbgFrame = -1;
+        if ((frame % 60) == 0 && frame != joyDbgFrame && joyDbgN < 20) {
+            void *input = *(void**)(uintptr_t)0x46bbec;
+            joyDbgFrame = frame;
+            if (input && !IsBadReadPtr(input, 0x1400)) {
+                unsigned char *ib = (unsigned char *)input;
+                joyDbgN++;
+                Log("JoyDbg: f=%d cnt=%d ids=[%d %d %d] ok=%c caps=[min?] pos[X=%u Y=%u Z=%u R=%u U=%u V=%u btn=%08X n=%d pov=%d] "
+                    "ctr[X=(%d+%d) Y=(%d+%d)] fl[108=%02X%02X%02X%02X 10c=%02X%02X%02X%02X 110=%02X]",
+                    frame, *(int *)(ib + 0x1078),
+                    *(int *)(ib + 0x107c), *(int *)(ib + 0x1080), *(int *)(ib + 0x1084),
+                    g_joyPlugged[0] ? 'Y' : 'n',
+                    *(unsigned *)(ib + 0x23f), *(unsigned *)(ib + 0x243),
+                    *(unsigned *)(ib + 0x247), *(unsigned *)(ib + 0x24b),
+                    *(unsigned *)(ib + 0x24f), *(unsigned *)(ib + 0x253),
+                    *(unsigned *)(ib + 0x257), *(unsigned *)(ib + 0x25b),
+                    *(unsigned *)(ib + 0x25f),
+                    *(int *)(ib + 0x3fb), *(int *)(ib + 0x3ff),
+                    *(int *)(ib + 0x403), *(int *)(ib + 0x407),
+                    ib[0x108], ib[0x109], ib[0x10a], ib[0x10b],
+                    ib[0x10c], ib[0x10d], ib[0x10e], ib[0x10f], ib[0x110]);
+            }
+        }
+    }
+#endif
     if (*(volatile int*)(uintptr_t)0x4dade4 == 4 && !g_exRun) {
         int ai;
         for (ai = 0; ai < EX_AREA_N; ai++)
@@ -3117,23 +3241,22 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
     if (g_exBossRun >= 1 && !g_exBoss2Kill && !g_exSimulatingStageFrame && g_exBossRunLogged < 400) {
         /* A missing boss after a live boss starts the one-second return delay. In Boss 2 practice,
            ignore Boss 1's disappearance until Boss 2's battle BGM has started. */
-        static unsigned *lastBoss = NULL;
         unsigned *b = *(unsigned**)(uintptr_t)0x4dae04;
-        if (b != lastBoss) {
+        if (b != g_exLastBoss) {
             g_exBossRunLogged++;
             if (b && !IsBadReadPtr(b, 0x824))
                 Log("ExDlg: Boss practice: current boss object -> %p type=%u hp=%.3f (frame %d)", (void*)b, b[1],
                     *(float*)((char*)b + 0x48), frame);
-            else if (lastBoss) {
+            else if (g_exLastBoss) {
                 Log("ExDlg: Boss practice: current boss object -> none (frame %d, was %p)", frame,
-                    (void*)lastBoss);
-                if ((g_exBossRun == 1 || g_exBoss2BgmSeen) && !g_exBossReturnAtFrame) {
+                    (void*)g_exLastBoss);
+                if ((g_exBossRun == 1 || (g_exBoss2BgmSeen && g_exBoss2ObjectSeen)) && !g_exBossReturnAtFrame) {
                     g_exBossReturnAtFrame = frame + 60;
                     Log("ExArea: Boss %d defeated; returning to Practice in 60 frames (at %d)",
                         g_exBossRun, g_exBossReturnAtFrame);
                 }
             }
-            lastBoss = b;
+            g_exLastBoss = b;
         }
     }
     if (g_exPending && frame == 0 && *(volatile int*)(uintptr_t)0x4dade4 == 4) {
@@ -3170,6 +3293,15 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
                     *(int*)((char*)pl + 0x14) = 0;
                 }
                 frame = target;
+                if ((stage == 1 || stage == 2) && g_practiceBossTarget == 1) {
+                    g_practiceBgmSeekSeconds = stage == 1 ? 41 : 52;
+                    g_practiceBgmSeekPending = 1;
+                    g_practiceBgmSeekDeadline = target + 600;
+                    Log("PracticeBoss: Stage %d MidBoss will seek its BGM to %d seconds",
+                        stage, g_practiceBgmSeekSeconds);
+                } else {
+                    g_practiceBgmSeekPending = 0;
+                }
                 Log("PracticeBoss: stage %d fast-forwarded to boss start frame %d", stage, target);
             }
         }
@@ -3194,7 +3326,9 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
             target = g_exBossBgmTime[bossIndex];
             if (target <= 0) target = ExFindBgmTime(bgmId);
         }
-        if (g_exBossRun == 2) {
+        if (g_exBossRun == 1) {
+            target = g_exBossDefaultFrame[0];
+        } else if (g_exBossRun == 2) {
             /* The BGM at frame 24017 happens after the Boss 1 script has already been running
                for several minutes. Simulating to that timestamp leaves its live boss and attacks
                on screen. Enter at Boss 1's intro, then use the real defeat path to advance the script. */
@@ -3266,6 +3400,17 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
             else
                 Log("ExArea: Area %d/%d jump to frame %d from frame %d (bgmId=%d, background mode %d)",
                     g_exArea + 1, g_exAreaN, target, startFrame, bgmId, areaBgMode);
+            if (!isBoss && g_exBgmMoveDelta > 0) {
+                int seekSec = g_exBgmMoveDelta / 60;
+                if (seekSec > 0) {
+                    g_practiceBgmSeekSeconds = seekSec;
+                    g_practiceBgmSeekPending = 1;
+                    g_practiceBgmSeekDeadline = target + 600;
+                    Log("ExArea: will seek the area BGM to %d second(s) after the jump "
+                        "(event t=%d, target %d, bgmId=%d)",
+                        seekSec, g_exBgmMoveTime, target, bgmId);
+                }
+            }
             frame = target;
         } else if (frame > 1500) {
             g_exSkipWait = 0;
@@ -3397,7 +3542,7 @@ static int __cdecl ExVmSpawnHook(void *a, void *b) {
 }
 
 static int __cdecl ExVmBgmHook(int id) {
-    int frame;
+    int frame = 0;
     if (id >= 0 && id < EX_BGM_IDS) {
         frame = *(volatile int*)(uintptr_t)0x4dadf8;
         if (g_practiceBossActive && g_practiceBossStage == 3) {
@@ -3442,6 +3587,13 @@ static int __cdecl ExVmBgmHook(int id) {
                 g_exSimulatingStageFrame ? 1 : 0);
     }
     if (g_exSimulatingStageFrame) {
+        if (g_practiceBossActive && g_practiceBossStage == 1 &&
+            g_practiceBossTarget == 1 && !g_practiceBgmStartedDuringSeek) {
+            g_practiceBgmStartedDuringSeek = 1;
+            Log("PracticeBoss: starting Stage 1 BGM during MidBoss fast-forward (id=%d, frame=%d)",
+                id, frame);
+            return ((PF_VmBgm)(uintptr_t)0x433740)(id);
+        }
         if (g_exBossRun == 2 && id == g_exBossBgm[1])
             return ((PF_VmBgm)(uintptr_t)0x433740)(id);
         return 0;
@@ -3455,6 +3607,7 @@ static const int g_PauseAudio = 1;
 typedef struct { IDirectSoundBuffer *buf; int paused, looping, posValid; DWORD pos, settled; } AudioBuf;
 static AudioBuf g_audio[AUDIO_MAX];
 static int g_audioN = 0;
+static int g_audioInitialized = 0;
 static IDirectSoundBuffer *g_chkBuf = NULL;
 static DWORD g_chkPos = 0;
 static DWORD g_chkTick = 0;
@@ -3635,6 +3788,95 @@ static void AudioResume(int doPlay) {
     Log("PauseAudio: %s %d buffers", doPlay ? "resumed" : "dropped (retry/title)", n);
 }
 
+static int PracticeSeekBgm(int seconds) {
+    typedef void *(__cdecl *PF_GetCurrentMusic)(void);
+    typedef unsigned char (__attribute__((thiscall)) *PF_RebufferMusic)(void *);
+    typedef void (__attribute__((thiscall)) *PF_MusicLock)(void *);
+    typedef unsigned char (__attribute__((thiscall)) *PF_SourceSeek)(void *, DWORD);
+    typedef DWORD (__attribute__((thiscall)) *PF_SourceLength)(void *);
+    void *music;
+    void *source;
+    void *format;
+    void *buffer;
+    void **vtable;
+    DWORD avgBytesPerSec;
+    DWORD samplesPerSec;
+    DWORD offset;
+    WORD blockAlign;
+    DWORD status = 0;
+    IDirectSoundBuffer *ds;
+    PF_RebufferMusic rebuffer = (PF_RebufferMusic)(uintptr_t)0x4133b0;
+    PF_MusicLock lock = (PF_MusicLock)(uintptr_t)0x40efe0;
+    PF_MusicLock unlock = (PF_MusicLock)(uintptr_t)0x40eff0;
+    PF_SourceSeek seekSource;
+    PF_SourceLength getSourceLength;
+    DWORD sourceLength;
+    int refilled;
+
+    if (seconds <= 0) return 0;
+    music = ((PF_GetCurrentMusic)(uintptr_t)0x411880)();
+    if (!music || IsBadReadPtr(music, 0x70)) return 0;
+    if (*(DWORD*)((char*)music + 0x14) != 0x453548) return 0;
+
+    source = *(void**)((char*)music + 0x38);
+    if (!source || IsBadReadPtr(source, sizeof(void*))) return 0;
+    vtable = *(void***)source;
+    if (!vtable || IsBadReadPtr(vtable + 6, sizeof(void*)) || !vtable[6] ||
+        IsBadCodePtr((FARPROC)vtable[6])) return 0;
+    format = ((void *(__attribute__((thiscall)) *)(void*))vtable[6])(source);
+    if (!format || IsBadReadPtr(format, 16)) return 0;
+    avgBytesPerSec = *(DWORD*)((char*)format + 8);
+    samplesPerSec = *(DWORD*)((char*)format + 4);
+    blockAlign = *(WORD*)((char*)format + 12);
+    if (avgBytesPerSec < 8000 || avgBytesPerSec > 2000000 ||
+        samplesPerSec < 8000 || samplesPerSec > 192000) return 0;
+
+    offset = (DWORD)((unsigned long long)samplesPerSec * (unsigned)seconds);
+    if (!vtable[2] || !vtable[3] || IsBadCodePtr((FARPROC)vtable[2]) ||
+        IsBadCodePtr((FARPROC)vtable[3])) return 0;
+    getSourceLength = (PF_SourceLength)vtable[2];
+    sourceLength = getSourceLength(source);
+    if (offset >= sourceLength / 2) {
+        Log("PracticeBoss: BGM seek sample %lu exceeds source length %lu samples",
+            (unsigned long)offset, (unsigned long)(sourceLength / 2));
+        return 0;
+    }
+    seekSource = (PF_SourceSeek)vtable[3];
+    if (!seekSource(source, offset)) {
+        Log("PracticeBoss: source rejected BGM seek to %d seconds (offset=%lu)",
+            seconds, (unsigned long)offset);
+        return 0;
+    }
+    buffer = *(void**)((char*)music + 0x18);
+    if (!buffer || IsBadReadPtr(buffer, sizeof(void*))) return 0;
+    ds = (IDirectSoundBuffer*)buffer;
+    if (FAILED(IDirectSoundBuffer_GetStatus(ds, &status))) return 0;
+
+    lock((char*)music + 0x1c);
+    IDirectSoundBuffer_Stop(ds);
+    *(DWORD*)((char*)music + 0x50) = 0;
+    *(DWORD*)((char*)music + 0x54) = 0;
+    *(DWORD*)((char*)music + 0x58) = 0;
+    refilled = rebuffer(music) != 0;
+    if (refilled) {
+        IDirectSoundBuffer_SetCurrentPosition(ds, 0);
+        IDirectSoundBuffer_Play(ds, 0, 0,
+            (status & DSBSTATUS_LOOPING) ? DSBPLAY_LOOPING : 0);
+    } else if (status & DSBSTATUS_PLAYING) {
+        IDirectSoundBuffer_Play(ds, 0, 0,
+            (status & DSBSTATUS_LOOPING) ? DSBPLAY_LOOPING : 0);
+    }
+    unlock((char*)music + 0x1c);
+    if (!refilled) {
+        Log("PracticeBoss: native audio refill failed at source offset %lu", (unsigned long)offset);
+        return 0;
+    }
+    Log("PracticeBoss: native BGM source seeked to %d seconds and ring refilled (id=%d, sample=%lu, sample_rate=%lu, byte_rate=%lu, align=%u)",
+        seconds, g_practiceBgmLastId, (unsigned long)offset,
+        (unsigned long)samplesPerSec, (unsigned long)avgBytesPerSec, (unsigned)blockAlign);
+    return 1;
+}
+
 static DWORD WINAPI PauseAudioThread(LPVOID unused) {
     int prev = 0;
     (void)unused;
@@ -3690,6 +3932,7 @@ static void PatchPauseAudio(void) {
         return;
     }
     InitializeCriticalSection(&g_audioCs);
+    g_audioInitialized = 1;
     if (!HookCall(0x411f1c, 0x450190, (void*)&DSCreateHook)) {
         Log("PauseAudio: DirectSoundCreate call not hooked, skipped");
         return;
@@ -4183,6 +4426,9 @@ static unsigned char g_joyPlugged[4];
 static HMODULE g_dinputModule;
 static LPDIRECTINPUT8A g_di8;
 static LPDIRECTINPUTDEVICE8A g_diDevices[16];
+static LONG g_diAxisMin[16][8];
+static LONG g_diAxisMax[16][8];
+static const DWORD g_diAxisInstance[8] = { 0, 0, 0, 0, 0, 0, 0, 1 };
 static unsigned g_diCount;
 static DWORD g_diLastScan;
 static DIDATAFORMAT g_diFormat;
@@ -4204,7 +4450,7 @@ static void JoyDirectInputFormatInit(void) {
     for (i = 0; i < 8; i++) {
         g_diObjects[i].pguid = (GUID*)axisGuid[i];
         g_diObjects[i].dwOfs = axisOffset[i];
-        g_diObjects[i].dwType = DIDFT_ABSAXIS | DIDFT_MAKEINSTANCE(i);
+        g_diObjects[i].dwType = DIDFT_ABSAXIS | DIDFT_MAKEINSTANCE(g_diAxisInstance[i]);
     }
     for (i = 0; i < 4; i++) {
         g_diObjects[8 + i].pguid = (GUID*)&GUID_POV;
@@ -4249,8 +4495,15 @@ static BOOL CALLBACK JoyEnumDirectInput(const DIDEVICEINSTANCEA *instance, void 
     axisRange.lMin = -1000;
     axisRange.lMax = 1000;
     for (i = 0; i < 8; i++) {
-        axisRange.diph.dwObj = DIDFT_ABSAXIS | DIDFT_MAKEINSTANCE(i);
-        IDirectInputDevice8_SetProperty(device, DIPROP_RANGE, &axisRange.diph);
+        axisRange.diph.dwObj = DIDFT_ABSAXIS | DIDFT_MAKEINSTANCE(g_diAxisInstance[i]);
+        if (FAILED(IDirectInputDevice8_SetProperty(device, DIPROP_RANGE, &axisRange.diph)) &&
+            SUCCEEDED(IDirectInputDevice8_GetProperty(device, DIPROP_RANGE, &axisRange.diph))) {
+            g_diAxisMin[g_diCount][i] = axisRange.lMin;
+            g_diAxisMax[g_diCount][i] = axisRange.lMax;
+        } else {
+            g_diAxisMin[g_diCount][i] = -1000;
+            g_diAxisMax[g_diCount][i] = 1000;
+        }
     }
     IDirectInputDevice8_Acquire(device);
     g_diDevices[g_diCount++] = device;
@@ -4299,13 +4552,16 @@ static unsigned JoyDirectInputState(unsigned id, JOYINFOEX *ji) {
     memset(ji, 0, sizeof(*ji));
     ji->dwSize = sizeof(*ji);
     ji->dwFlags = JOY_RETURNALL;
-#define DI_AXIS(v) ((DWORD)((((long)(v) < -1000L ? -1000L : (long)(v) > 1000L ? 1000L : (long)(v)) + 1000L) * 65535L / 2000L))
-    ji->dwXpos = DI_AXIS(state.lX);
-    ji->dwYpos = DI_AXIS(state.lY);
-    ji->dwZpos = DI_AXIS(state.lZ);
-    ji->dwRpos = DI_AXIS(state.lRx);
-    ji->dwUpos = DI_AXIS(state.lRy);
-    ji->dwVpos = DI_AXIS(state.lRz);
+#define DI_AXIS(axis, value) ((DWORD)(((value) <= g_diAxisMin[id][axis]) ? 0 : \
+    ((value) >= g_diAxisMax[id][axis]) ? 65535 : \
+    ((long long)((value) - g_diAxisMin[id][axis]) * 65535LL) / \
+    ((long long)g_diAxisMax[id][axis] - g_diAxisMin[id][axis])))
+    ji->dwXpos = DI_AXIS(0, state.lX);
+    ji->dwYpos = DI_AXIS(1, state.lY);
+    ji->dwZpos = DI_AXIS(2, state.lZ);
+    ji->dwRpos = DI_AXIS(3, state.lRx);
+    ji->dwUpos = DI_AXIS(4, state.lRy);
+    ji->dwVpos = DI_AXIS(5, state.lRz);
 #undef DI_AXIS
     for (i = 0; i < 16; i++) if (state.rgbButtons[i] & 0x80) buttons |= (1u << i);
     ji->dwButtons = buttons;
@@ -4313,6 +4569,14 @@ static unsigned JoyDirectInputState(unsigned id, JOYINFOEX *ji) {
     for (i = 0; i < 16; i++) if (buttons & (1u << i)) ji->dwButtonNumber++;
     pov = state.rgdwPOV[0];
     ji->dwPOV = pov == 0xffffffffu ? 0xffffu : pov;
+    if (pov != 0xffffffffu) {
+        int up = pov >= 31500 || pov <= 4500;
+        int right = pov >= 4500 && pov <= 13500;
+        int down = pov >= 13500 && pov <= 22500;
+        int left = pov >= 22500 && pov <= 31500;
+        if (up != down) ji->dwYpos = up ? 0 : 0xFFFF;
+        if (left != right) ji->dwXpos = left ? 0 : 0xFFFF;
+    }
     return 1;
 }
 
@@ -4354,6 +4618,7 @@ static unsigned JoyConnected(unsigned id) {
 
 static unsigned __stdcall JoyGetCapsA(unsigned id, JOYCAPSA *jc, unsigned cb) {
     unsigned nativeResult;
+    const WORD axisMax = 0xFFFF;
     if (!g_joyIoInited) JoyIoInit();
     if (g_joyIoOk && jc && cb >= sizeof(JOYCAPSA) && JoyConnected(id)) {
         memset(jc, 0, sizeof(*jc));
@@ -4361,7 +4626,7 @@ static unsigned __stdcall JoyGetCapsA(unsigned id, JOYCAPSA *jc, unsigned cb) {
         jc->wPid = 0x2FF;
         strcpy(jc->szPname, "Modern Controller (XInput)");
         jc->wXmin = jc->wYmin = jc->wZmin = jc->wRmin = jc->wUmin = jc->wVmin = 0;
-        jc->wXmax = jc->wYmax = jc->wZmax = jc->wRmax = jc->wUmax = jc->wVmax = 0xFFFF;
+        jc->wXmax = jc->wYmax = jc->wZmax = jc->wRmax = jc->wUmax = jc->wVmax = axisMax;
         jc->wPeriodMin = jc->wPeriodMax = 10000;
         jc->wMaxButtons = 32;
         jc->wNumButtons = 16;
@@ -4377,7 +4642,7 @@ static unsigned __stdcall JoyGetCapsA(unsigned id, JOYCAPSA *jc, unsigned cb) {
     jc->wPid = (WORD)(id + 1);
     strcpy(jc->szPname, "DirectInput Controller");
     jc->wXmin = jc->wYmin = jc->wZmin = jc->wRmin = jc->wUmin = jc->wVmin = 0;
-    jc->wXmax = jc->wYmax = jc->wZmax = jc->wRmax = jc->wUmax = jc->wVmax = 0xFFFF;
+    jc->wXmax = jc->wYmax = jc->wZmax = jc->wRmax = jc->wUmax = jc->wVmax = axisMax;
     jc->wMaxButtons = jc->wNumButtons = 16;
     jc->wMaxAxes = jc->wNumAxes = 6;
     jc->wCaps = 0;
@@ -4386,39 +4651,58 @@ static unsigned __stdcall JoyGetCapsA(unsigned id, JOYCAPSA *jc, unsigned cb) {
 
 static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
     unsigned nativeResult;
+    DWORD requestedSize, requestedFlags;
     if (!g_joyIoInited) JoyIoInit();
     if (!g_joyIoOk || !ji || ji->dwSize < sizeof(JOYINFOEX) || !JoyConnected(id)) {
         nativeResult = g_winmmJoyGetPosEx ? g_winmmJoyGetPosEx(id, ji) : JOYERR_UNPLUGGED;
-        if (nativeResult == JOYERR_NOERROR || !ji || ji->dwSize < sizeof(JOYINFOEX)) return nativeResult;
+        if (nativeResult == JOYERR_NOERROR) return nativeResult;
+        if (!ji || ji->dwSize < sizeof(JOYINFOEX)) return nativeResult;
         JoyDirectInputScan();
         if (!JoyDirectInputState(id, ji)) return nativeResult;
         return JOYERR_NOERROR;
     }
 
-    /* XINPUT_STATE: dwPacketNumber(+0), gamepad +4: wButtons(+4) bLTrigger(+6)
-       bRTrigger(+7) sLX(+8) sLY(+A) sRX(+C) sRY(+E) -> 16 bytes total */
-    unsigned char *st = (unsigned char*)(void*)(ji + 1);
-    unsigned char buf[64];
+    requestedSize = ji->dwSize;
+    requestedFlags = ji->dwFlags;
+
+    struct XInputState {
+        DWORD packetNumber;
+        WORD buttons;
+        BYTE leftTrigger;
+        BYTE rightTrigger;
+        SHORT thumbLX;
+        SHORT thumbLY;
+        SHORT thumbRX;
+        SHORT thumbRY;
+    } state;
     unsigned short btn;
     short sLX, sLY, sRX, sRY;
     unsigned char lt, rt;
     unsigned dwButtons;
 
-    memset(buf, 0, sizeof(buf));
-    if (g_xiGetState(id, buf + 4) != 0) {
+    memset(&state, 0, sizeof(state));
+    if (g_xiGetState(id, &state) != 0) {
         g_joyPlugged[id] = 0;
         return JOYERR_UNPLUGGED;
     }
-    buf[0] = 0; buf[1] = 0; buf[2] = 0; buf[3] = 0;
-    st = buf;
-    btn = (unsigned short)(unsigned)*(unsigned short*)(st + 4 + 0);
-    lt  = st[4 + 2];
-    rt  = st[4 + 3];
-    sLX = *(short*)(st + 4 + 8);
-    sLY = *(short*)(st + 4 + 0xA);
-    sRX = *(short*)(st + 4 + 0xC);
-    sRY = *(short*)(st + 4 + 0xE);
+    btn = state.buttons;
+    lt = state.leftTrigger;
+    rt = state.rightTrigger;
+    sLX = state.thumbLX;
+    sLY = state.thumbLY;
+    sRX = state.thumbRX;
+    sRY = state.thumbRY;
     g_joyPlugged[id] = 1;
+
+    /* Suppress the small idle drift allowed by XInput's stick hardware. */
+    if (sLX > -7849 && sLX < 7849) sLX = 0;
+    if (sLY > -7849 && sLY < 7849) sLY = 0;
+    if (sRX > -8689 && sRX < 8689) sRX = 0;
+    if (sRY > -8689 && sRY < 8689) sRY = 0;
+
+    memset(ji, 0, sizeof(*ji));
+    ji->dwSize = requestedSize;
+    ji->dwFlags = requestedFlags;
 
     /* XInput button -> JOY_BUTTON1..16 bit order */
     dwButtons = 0;
@@ -4439,30 +4723,76 @@ static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
     if (lt >= 0x40)                     dwButtons |= JOY_BUTTON15;
     if (rt >= 0x40)                     dwButtons |= JOY_BUTTON16;
 
-    {   /* -32768..32767 -> 0..0xFFFF; X: right = large, Y: down = large */
-        unsigned short sx = (unsigned short)(unsigned)sLX;
-        unsigned short sy = (unsigned short)(unsigned)sLY;
-        unsigned short sz = (unsigned short)(unsigned)sRX;
-        unsigned short sr = (unsigned short)(unsigned)sRY;
-
-        ji->dwXpos = (DWORD)sx + 0x8000u;
-        ji->dwYpos = (DWORD)sy + 0x8000u;
-        ji->dwZpos = (DWORD)sz + 0x8000u;
-        ji->dwRpos = (DWORD)sr + 0x8000u;
+    /* XInput Y is positive-up; WinMM Y positions increase downward. */
+    ji->dwXpos = (DWORD)((long)sLX + 32768L);
+    {
+        long y = 32768L - (long)sLY;
+        if (y < 0) y = 0;
+        if (y > 65535L) y = 65535L;
+        ji->dwYpos = (DWORD)y;
     }
+    ji->dwZpos = (DWORD)((long)sRX + 32768L);
+    ji->dwRpos = (DWORD)((long)sRY + 32768L);
     ji->dwUpos = (DWORD)(lt ? (unsigned)lt * 0x101 : 0);
     ji->dwVpos = (DWORD)(rt ? (unsigned)rt * 0x101 : 0);
+    {
+        int up = (btn & XI_ID_DPAD_UP) != 0;
+        int down = (btn & XI_ID_DPAD_DOWN) != 0;
+        int left = (btn & XI_ID_DPAD_LEFT) != 0;
+        int right = (btn & XI_ID_DPAD_RIGHT) != 0;
+        if (up != down) ji->dwYpos = up ? 0 : 0xFFFF;
+        if (left != right) ji->dwXpos = left ? 0 : 0xFFFF;
+        if (up && right) ji->dwPOV = 4500;
+        else if (right && down) ji->dwPOV = 13500;
+        else if (down && left) ji->dwPOV = 22500;
+        else if (left && up) ji->dwPOV = 31500;
+        else if (up) ji->dwPOV = 0;
+        else if (right) ji->dwPOV = 9000;
+        else if (down) ji->dwPOV = 18000;
+        else if (left) ji->dwPOV = 27000;
+        else ji->dwPOV = 0xFFFF;
+    }
     ji->dwButtons = dwButtons;
     {
         int n = 0;
         while (dwButtons) { dwButtons &= (dwButtons - 1); n++; }
         ji->dwButtonNumber = (DWORD)n;
     }
-    if (btn & XI_ID_DPAD_UP)            ji->dwPOV = 0;          /* north */
-    else if (btn & XI_ID_DPAD_RIGHT)    ji->dwPOV = 9000;
-    else if (btn & XI_ID_DPAD_DOWN)     ji->dwPOV = 18000;
-    else if (btn & XI_ID_DPAD_LEFT)     ji->dwPOV = 27000;
-    else                                ji->dwPOV = 0xFFFF;     /* centered */
+#ifdef SMD_DEBUG_BUILD
+    {   /* JoyDbg: also sample every 60th shim call (works at titles/menus,
+           the EventDispatchImpl sampler only runs in-game) */
+        static int joyDbgCalls = 0;
+        static int joyDbgN = 0;
+        joyDbgCalls++;
+        if (((joyDbgCalls % 60) == 0) && joyDbgN < 24) {
+            void *input = *(void**)(uintptr_t)0x46bbec;
+            joyDbgN++;
+            Log("JoyRaw: packet=%lu rawbtn=%04X lx=%d ly=%d rx=%d ry=%d trig=%u/%u -> pos=%u/%u btn=%08X pov=%u",
+                (unsigned long)state.packetNumber, (unsigned)state.buttons,
+                (int)sLX, (int)sLY, (int)sRX, (int)sRY, (unsigned)lt, (unsigned)rt,
+                (unsigned)ji->dwXpos, (unsigned)ji->dwYpos,
+                (unsigned)ji->dwButtons, (unsigned)ji->dwPOV);
+            Log("JoyDbg+s: shim=X(%u) Y(%u) btn=%08X pov=%d ; game=%p cnt=%d ids=[%d %d] "
+                "buf[X=%u Y=%u btn=%08X pov=%d] ctr[X=(%d+%d) Y=(%d+%d)] fl[10c=%02X%02X%02X%02X]",
+                (unsigned)ji->dwXpos, (unsigned)ji->dwYpos, (unsigned)ji->dwButtons, (int)ji->dwPOV,
+                input, input ? *(int *)((char *)input + 0x1078) : -1,
+                input ? *(int *)((char *)input + 0x107c) : -9,
+                input ? *(int *)((char *)input + 0x1080) : -9,
+                input ? *(unsigned *)((char *)input + 0x23f) : 0,
+                input ? *(unsigned *)((char *)input + 0x243) : 0,
+                input ? *(unsigned *)((char *)input + 0x257) : 0,
+                input ? *(unsigned *)((char *)input + 0x25f) : 0,
+                input ? *(int *)((char *)input + 0x3fb) : 0,
+                input ? *(int *)((char *)input + 0x3ff) : 0,
+                input ? *(int *)((char *)input + 0x403) : 0,
+                input ? *(int *)((char *)input + 0x407) : 0,
+                input ? ((unsigned char *)input)[0x10c] : 0,
+                input ? ((unsigned char *)input)[0x10d] : 0,
+                input ? ((unsigned char *)input)[0x10e] : 0,
+                input ? ((unsigned char *)input)[0x10f] : 0);
+        }
+    }
+#endif
     return JOYERR_NOERROR;
 }
 
