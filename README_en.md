@@ -25,38 +25,16 @@ To open the Practice menu, move the cursor to “DIVE 2 M.R.S.” and press the 
 
 ## Building on Windows
 
-The project uses 32-bit MinGW-w64 GCC. You need `i686-w64-mingw32-gcc` and the MinGW-w64 `gdi32`, `dxguid`, and `winmm` libraries. The sources use GNU attributes and GNU-style inline assembly, so they cannot be compiled directly with MSVC's `cl.exe`.
-
-Add MinGW-w64 GCC to `PATH`, then run this from the repository root:
+Use `clang-cl` from an x86 Native Tools Command Prompt. Add the LLVM/Clang tools in Visual Studio Installer, then run this from the repository root. `NMakefile` uses the MSVC Windows SDK, `link.exe`, and libraries to produce x86 DLLs. The bundled D3DX9 compatibility declarations mean the legacy DirectX SDK is not required:
 
 ```bat
 nmake /f NMakefile
 ```
 
-This creates `build\d3d9.dll` and `build\ddraw.dll`. To build the Smd debug DLL at `build\debug\ddraw.dll`, run:
+This creates `build\d3d9.dll` and `build\ddraw.dll`. Build the Smd debug DLL at `build\debug\ddraw.dll` with:
 
 ```bat
 nmake /f NMakefile smd-debug
-```
-
-If the compiler has a different name or location, set `MINGW_CC`:
-
-```bat
-nmake /f NMakefile MINGW_CC=C:\mingw32\bin\i686-w64-mingw32-gcc.exe
-```
-
-### MSVC toolchain
-
-Microsoft's `cl.exe` cannot parse the GNU-style inline assembly in these sources, so use `clang-cl` from an x86 Native Tools Command Prompt. Add the LLVM/Clang tools in Visual Studio Installer, then run. The bundled D3DX9 compatibility declarations mean the legacy DirectX SDK is not required:
-
-```bat
-nmake /f NMakefile.msvc
-```
-
-This uses the MSVC Windows SDK, `link.exe`, and libraries to produce x86 DLLs in the same output paths. Build the Smd debug DLL with:
-
-```bat
-nmake /f NMakefile.msvc smd-debug
 ```
 
 ## Features

@@ -14,23 +14,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "Smd_internal.h"
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
 
 static FILE *g_log = NULL;
-static const int g_LogAll = 0;
-static const int g_StripAllowModeX = 1;
-static const int g_RetryCoopLevel = 1;
-static const int g_RetryDisplayMode = 1;
+const int g_LogAll = 0;
+const int g_StripAllowModeX = 1;
+const int g_RetryCoopLevel = 1;
+const int g_RetryDisplayMode = 1;
 #ifndef SMD_LOWLATENCY
 #define SMD_LOWLATENCY 1
 #endif
 #ifndef SMD_DWMFLUSH
 #define SMD_DWMFLUSH 1
 #endif
-static const int g_LowLatency = SMD_LOWLATENCY;
-static const int g_UseDwmFlush = SMD_DWMFLUSH;
+const int g_LowLatency = SMD_LOWLATENCY;
+const int g_UseDwmFlush = SMD_DWMFLUSH;
 static const int g_StatsIntervalMs = 5000;
 static const int g_KeyLatencyStats = 0;
 static const int g_WaitTimeoutMs = 50;
@@ -38,8 +39,6 @@ static const int g_ForceColorDepth32 = 1;
 static const int g_AutoWindowFallback = 1;
 static const int g_ForceWindowMode = 0;
 static int g_fallbackInstance = 0;
-static int g_fullscreenRequested = 0;
-static int g_displayModeFailures = 0;
 
 static void ExeDirFile(const char *name, char *out) {
     GetModuleFileNameA(NULL, out, MAX_PATH);
@@ -56,7 +55,7 @@ static void LogOpen(void) {
     g_log = fopen(path, "a");
 }
 
-static void Log(const char *fmt, ...) {
+void SmdLog(const char *fmt, ...) {
     if (!g_log) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -66,20 +65,15 @@ static void Log(const char *fmt, ...) {
     vfprintf(g_log, fmt, ap);
     va_end(ap);
     fputc('\n', g_log);
-    {
-        /* flushing every line costs a write syscall per log call; flush at most every 200 ms */
-        static DWORD lastFlush = 0;
-        DWORD now = GetTickCount();
-        if (now - lastFlush >= 200) {
-            fflush(g_log);
-            lastFlush = now;
-        }
-    }
+    fflush(g_log);
 }
 #else
 static void LogOpen(void) {}
-static void Log(const char *fmt, ...) { (void)fmt; }
+void SmdLog(const char *fmt, ...) { (void)fmt; }
 #endif
+
+void SmdLogOpen(void) { LogOpen(); }
+#define Log SmdLog
 
 static void LogWindowsVersion(void) {
     typedef LONG (WINAPI *PF_RtlGetVersion)(OSVERSIONINFOW*);
@@ -111,7 +105,7 @@ static void InitFallbackInstance(void) {
     Log("WindowFallback: this is the window mode fallback instance (parent pid=%lu)", (unsigned long)ppid);
 }
 
-static void TriggerWindowFallback(const char *why) {
+void SmdTriggerWindowFallback(const char *why) {
     char exe[MAX_PATH], dir[MAX_PATH], pidbuf[32];
     char *cmd, *slash;
     const char *cl;
@@ -147,26 +141,6 @@ static void TriggerWindowFallback(const char *why) {
     Log("WindowFallback: CreateProcess failed (err=%08X)", (unsigned)GetLastError());
     SetEnvironmentVariableA("SMD_WND_FALLBACK", NULL);
     free(cmd);
-}
-
-static HRESULT TrySetDisplayMode(IDirectDraw7 *orig, DWORD wd, DWORD ht, DWORD bpp, DWORD refresh, DWORD flags) {
-    DWORD tries[3] = { 0, 0, 60 };
-    DEVMODEA dm;
-    HRESULT hr = DDERR_GENERIC;
-    int i;
-
-    memset(&dm, 0, sizeof(dm));
-    dm.dmSize = sizeof(dm);
-    if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
-        tries[1] = dm.dmDisplayFrequency;
-    for (i = 0; i < 3; i++) {
-        if (i == 1 && tries[1] == 0) continue;
-        if (tries[i] == refresh && flags == 0) continue;
-        hr = IDirectDraw7_SetDisplayMode(orig, wd, ht, bpp, tries[i], 0);
-        Log("DD7.SetDisplayMode retry refresh=%lu -> hr=%08X", (unsigned long)tries[i], (unsigned)hr);
-        if (hr >= 0) return hr;
-    }
-    return hr;
 }
 
 static void PatchColorDepth32(void) {
@@ -313,11 +287,10 @@ static DWORD WINAPI KeyThread(LPVOID unused) {
     return 0;
 }
 
-static void CensusSummaryPeriodic(void);
 
 static void FlushStats(LONGLONG now) {
     double sec = TicksToMs(now - g_winStart) / 1000.0;
-    CensusSummaryPeriodic();
+    SmdD3D9CensusSummaryPeriodic();
     Log("stats %.1fs mode=%s lowlatency=%d dwmflush=%d frames=%lld fps=%.1f timeouts=%lld",
         sec, g_lastFlip ? "flip" : "blt", g_LowLatency, (g_LowLatency && g_UseDwmFlush && g_pDwmFlush) ? 1 : 0,
         (long long)g_frames, sec > 0 ? (double)g_frames / sec : 0.0, (long long)g_timeouts);
@@ -461,7 +434,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Flip(IDirectDrawSurface7 *self, LPDIRECTDR
     return hr;
 }
 
-static void HookPrimary(IDirectDrawSurface7 *s) {
+void SmdHookPrimary(IDirectDrawSurface7 *s) {
     g_primary = s;
     if (g_origBlt) return;
     MeasureInit();
@@ -1136,12 +1109,17 @@ static int g_practiceBossTarget = 0;
 static int g_practiceScorePending = 0;
 static int g_practiceScoreActive = 0;
 static int g_practiceScoreStage = 0;
-static int g_practiceScoreResetFrame = -1;
+static volatile int g_postJumpLog = 0;  /* frames remaining to trace after a practice jump */
 static int g_practiceBgmSeekPending = 0;
 static int g_practiceBgmSeekDeadline = 0;
+static int g_practiceBgmSeekStartFrame = 0;   /* the BGM is loaded by another thread: do not touch it right after the jump */
 static int g_practiceBgmSeekSeconds = 0;
+static int g_practiceBgmFadeInFrames = 0;
+static int g_practiceBgmFadeInVolume = 0;
 static int g_practiceBgmStartedDuringSeek = 0;
+static int g_practiceBgmLoaded = 0;   /* a BGM id was actually passed to the real loader this run */
 static int g_practiceBgmLastId = -1;
+static int g_practiceBgmSimLastId = -1;
 static int g_practiceBossSeekingSecondForm = 0;
 static int g_practiceBossFormBgmChanged = 0;
 static int g_practiceBossLiveTransition = 0;
@@ -1158,6 +1136,7 @@ static int g_exBoss2BgmSeen = 0;      /* Boss 2's battle BGM has started (VM bgm
 static int g_exBoss2ObjectSeen = 0;
 static int g_exBoss2BgmFrame = 0;
 static int g_exBoss2TransitionFastForwarded = 0;
+static int g_exBoss1BgmPending = 0;
 static int g_exBoss1DonePending = 0;
 static int g_exBoss2ScoreReset = 0;
 static int g_exBossReturnAtFrame = 0;
@@ -1167,11 +1146,15 @@ static unsigned *g_exBoss1Obj = NULL;   /* the Boss 1 object being defeated (so 
 static unsigned *g_exLastBoss = NULL;
 
 typedef void (__stdcall *PF_GameStart)(int stage);
+typedef int (__cdecl *PF_VmBgm)(int id);
 
 static void ApplyPracticePower(int stage, const char *what) {
     int p;
     if (stage == 1 && g_practiceBossActive && g_practiceBossStage == stage &&
         g_practiceBossTarget == 1) {
+        p = 5;
+    } else if (stage == 1 && g_practiceBossActive && g_practiceBossStage == stage &&
+               g_practiceBossTarget == 2) {
         p = 5;
     } else if (stage == 2 || stage == 3) {
         if (*(volatile unsigned char*)(uintptr_t)0x4dade0 == 0) return;
@@ -1224,18 +1207,22 @@ static volatile int g_exMuteSe = 0;   /* 1 while a practice skip fast-forwards: 
 static int g_exBgmMuted = 0;
 static int g_exBgmSavedVol = 0;
 
-/* The BGM follows g_exMuteSe: it is silenced while a practice skip fast-forwards and the volume the
-   option screen set (0x45ab14, written by 0x4117c0) is restored afterwards. */
+/* The BGM stays muted through practice fast-forward and until a requested stream seek completes. */
 static void ExBgmMuteSync(void) {
-    if (g_exMuteSe && !g_exBgmMuted) {
+    int shouldMute = g_exMuteSe || g_practiceBgmSeekPending || g_exBoss1BgmPending;
+    if (shouldMute && !g_exBgmMuted) {
         g_exBgmSavedVol = *(volatile unsigned char*)(uintptr_t)0x45ab14;
         ((PF_SetVolume)(uintptr_t)0x4117c0)(0);
         g_exBgmMuted = 1;
         Log("ExArea: BGM muted for the fast-forward (volume %d)", g_exBgmSavedVol);
-    } else if (!g_exMuteSe && g_exBgmMuted) {
+    } else if (!shouldMute && g_exBgmMuted) {
         g_exBgmMuted = 0;
-        ((PF_SetVolume)(uintptr_t)0x4117c0)(g_exBgmSavedVol);
-        Log("ExArea: BGM volume restored to %d", g_exBgmSavedVol);
+        if (g_practiceBgmFadeInFrames > 0) {
+            Log("ExArea: BGM fade-in started from mute (target volume %d)", g_practiceBgmFadeInVolume);
+        } else {
+            ((PF_SetVolume)(uintptr_t)0x4117c0)(g_exBgmSavedVol);
+            Log("ExArea: BGM volume restored to %d", g_exBgmSavedVol);
+        }
     }
 }
 
@@ -1306,13 +1293,10 @@ static void PracticeResetScore(const char *reason, int stage) {
     Log("PracticeScore: score and displayed score set to 0 (%s, stage %d)", reason, stage);
 }
 
-static void PracticeScheduleScoreReset(void) {
-    g_practiceScoreResetFrame = *(volatile int*)(uintptr_t)0x4dadf8 + 2;
-}
-
 static void ExOnGameStart(int stage) {
     g_exRun = (stage == 4) && g_exStartReq;
     g_exBossRun = g_exRun ? g_exBossSelected : 0;
+    g_exBoss1BgmPending = g_exRun && g_exBossRun == 1;
     g_exBoss2Kill = 0;
     g_exBoss2Transition = 0;
     g_exBoss2KillFrames = 0;
@@ -1341,6 +1325,7 @@ static void ExOnGameStart(int stage) {
 
 static void ExOnRetry(int stage) {
     if (stage == 4) {
+        g_exBoss1BgmPending = g_exRun && g_exBossRun == 1;
         g_exBoss2Kill = 0;
         g_exBoss2Transition = 0;
         g_exBoss2KillFrames = 0;
@@ -1362,17 +1347,25 @@ static void ExOnRetry(int stage) {
     }
 }
 
+static int g_practiceReturn = 0;   /* the last game start was a practice run: the title opens the Practice menu */
+
 static void __stdcall GameStartHook(int stage) {
     int practiceStart = g_practiceScorePending && stage == g_practiceScoreStage;
+    g_practiceReturn = (*(volatile unsigned char*)(uintptr_t)0x4dade0 != 0);
     g_practiceBgmSeekPending = 0;
+    g_practiceBgmFadeInFrames = 0;
     g_practiceBgmStartedDuringSeek = 0;
+    g_practiceBgmLoaded = 0;
     g_pauseAfterLoad = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
     g_pauseLoadArmed = 1;
     Log("Pause: stage %d load started (Escape held=%d)", stage, g_pauseAfterLoad);
     g_practiceBossPending = g_practiceBossStart == stage;
     if (g_practiceBossPending) {
         g_practiceBgmLastId = -1;
+        g_practiceBgmSimLastId = -1;
+        g_practiceBgmSimLastId = -1;
         g_practiceBgmStartedDuringSeek = 0;
+        g_practiceBgmLoaded = 0;
         g_practiceBossSeekingSecondForm = 0;
         g_practiceBossFormBgmChanged = 0;
         g_practiceBossLiveTransition = 0;
@@ -1388,12 +1381,10 @@ static void __stdcall GameStartHook(int stage) {
         g_practiceScorePending = 0;
         g_practiceScoreActive = 1;
         PracticeResetScore("start", stage);
-        PracticeScheduleScoreReset();
     } else {
         g_practiceScorePending = 0;
         g_practiceScoreActive = 0;
         g_practiceScoreStage = 0;
-        g_practiceScoreResetFrame = -1;
     }
     if (g_practiceBossPending) {
         ExDlgInstall();
@@ -1418,14 +1409,16 @@ static void __stdcall RetryHook(int stage) {
         return;
     }
     g_practiceBgmSeekPending = 0;
+    g_practiceBgmFadeInFrames = 0;
     g_practiceBgmStartedDuringSeek = 0;
+    g_practiceBgmLoaded = 0;
     ((PF_GameStart)(uintptr_t)0x419d10)(stage);
     if (g_practiceScoreActive && stage == g_practiceScoreStage) {
         PracticeResetScore("retry", stage);
-        PracticeScheduleScoreReset();
     }
     if (g_practiceBossActive && stage == g_practiceBossStage) {
         g_practiceBgmLastId = -1;
+        g_practiceBgmSimLastId = -1;
         g_practiceBossSeekingSecondForm = 0;
         g_practiceBossFormBgmChanged = 0;
         g_practiceBossLiveTransition = 0;
@@ -1758,7 +1751,7 @@ static void ExLabelEnsure(void *obj) {
     *(int*)(g_exLabelRow + 0xd8) = 0x505050;
 }
 
-static unsigned char __attribute__((fastcall)) PracticeUpdateHook(void *obj) {
+static unsigned char __attribute__((fastcall)) PracticeUpdateCore(void *obj) {
     char *o = (char*)obj;
     int *cur = (int*)(o + 8), *fade = (int*)(o + 0xc);
     void *input = *(void**)(uintptr_t)0x46bbec;
@@ -1870,6 +1863,93 @@ static unsigned char __attribute__((fastcall)) PracticeUpdateHook(void *obj) {
     v = *fade + 4;
     *fade = v > 0x80 ? 0x80 : v;
     return 1;
+}
+
+static int g_exInputSuppress = 0;
+
+typedef unsigned char (__attribute__((thiscall)) *PF_ExInputKey)(void *self, int id);
+typedef unsigned char (__attribute__((thiscall)) *PF_ExInputHold)(void *self, int id, int delay);
+
+static int ExInputIsHeld(void *input) {
+    int i;
+    if (!input || IsBadReadPtr(input, 0x108)) return 0;
+    if (*(DWORD*)((char*)input + 4) & 0x1ff) return 1;
+    for (i = 0; i < 0x100; i++)
+        if (*((unsigned char*)input + 8 + i) & 0x80) return 1;
+    return 0;
+}
+
+static int ExInputSuppressQuery(void *input) {
+    if (!g_exInputSuppress) return 0;
+    if (!ExInputIsHeld(input)) {
+        g_exInputSuppress = 0;
+        return 0;
+    }
+    return 1;
+}
+
+static unsigned char __attribute__((fastcall)) ExInputRawKeyHook(void *self, void *edx, int id) {
+    if (ExInputSuppressQuery(self)) return 0;
+    return ((PF_ExInputKey)(uintptr_t)0x431500)(self, id);
+}
+
+static unsigned char __attribute__((fastcall)) ExInputEdgeHook(void *self, void *edx, int id) {
+    if (ExInputSuppressQuery(self)) return 0;
+    return ((PF_ExInputKey)(uintptr_t)0x431540)(self, id);
+}
+
+static unsigned char __attribute__((fastcall)) ExInputHoldHook(void *self, void *edx, int id, int delay) {
+    if (ExInputSuppressQuery(self)) return 0;
+    return ((PF_ExInputHold)(uintptr_t)0x431480)(self, id, delay);
+}
+
+static void PatchExInputSuppression(void) {
+    DWORD a;
+    int raw = 0, edge = 0, hold = 0;
+    for (a = 0x423180; a < 0x423447; a++) {
+        unsigned char *p = (unsigned char*)(uintptr_t)a;
+        DWORD target;
+        if (*p != 0xe8) continue;
+        target = a + 5 + *(DWORD*)(uintptr_t)(a + 1);
+        if (target == 0x431500) raw += HookCall(a, target, (void*)&ExInputRawKeyHook);
+        else if (target == 0x431540) edge += HookCall(a, target, (void*)&ExInputEdgeHook);
+        else if (target == 0x431480) hold += HookCall(a, target, (void*)&ExInputHoldHook);
+    }
+    Log("ExArea: title input calls filtered raw=%d edge=%d hold=%d", raw, edge, hold);
+}
+
+static unsigned char __attribute__((fastcall)) PracticeUpdateHook(void *obj) {
+    unsigned char result;
+    void *input;
+    DWORD buttons, previousButtons;
+    unsigned char keys[0x100], keyLatch[0x100];
+    int masked = 0, neutral = 1, i;
+    if (g_exInputSuppress) {
+        input = *(void**)(uintptr_t)0x46bbec;
+        if (input && !IsBadReadPtr(input, 0x230)) {
+            buttons = *(DWORD*)((char*)input + 4);
+            previousButtons = *(DWORD*)((char*)input + 0x12c);
+            memcpy(keys, (char*)input + 8, sizeof(keys));
+            memcpy(keyLatch, (char*)input + 0x130, sizeof(keyLatch));
+            neutral = (buttons & 0x1ff) == 0;
+            for (i = 0; i < 0x100; i++) if (keys[i] & 0x80) neutral = 0;
+            *(DWORD*)((char*)input + 4) = 0;
+            *(DWORD*)((char*)input + 0x12c) = 0;
+            memset((char*)input + 8, 0, sizeof(keys));
+            memset((char*)input + 0x130, 0, sizeof(keyLatch));
+            masked = 1;
+        }
+        result = PracticeUpdateCore(obj);
+        if (masked) {
+            *(DWORD*)((char*)input + 4) = buttons;
+            *(DWORD*)((char*)input + 0x12c) = previousButtons;
+            memcpy((char*)input + 8, keys, sizeof(keys));
+            memcpy((char*)input + 0x130, keyLatch, sizeof(keyLatch));
+            if (neutral) g_exInputSuppress = 0;
+        }
+        return result;
+    }
+    return PracticeUpdateCore(obj);
 }
 
 static unsigned char __attribute__((fastcall)) PracticeDrawHook(void *obj) {
@@ -2904,9 +2984,178 @@ static void ExDlgInstall(void) {
 static PF_Op g_exClearOrig = NULL;
 static int g_exClearHooked = 0;
 static int g_exClearLog = 0;
+static int g_exReturnPracticeMenuPending = 0;
+
+typedef unsigned char (__attribute__((fastcall)) *PF_TitleUpdate)(void *obj, void *edx);
+
+static unsigned char __attribute__((fastcall)) ExReturnPracticeTitleUpdate(void *obj, void *edx) {
+    unsigned char result;
+    result = ((PF_TitleUpdate)(uintptr_t)0x421040)(obj, edx);
+    if (g_exReturnPracticeMenuPending && obj) {
+        /* Open the Practice menu the way the main menu does for its Practice item (cursor 2):
+           `lea ecx,[title+0x22e90]; call 0x420b40; mov [title+8],0xc` (state 0xc = Practice menu;
+           state 0xb would start a stage).  Cancel in the Practice menu goes back to the main menu. */
+        char *title = *(char**)(uintptr_t)0x4e93c8;
+        if (title && !IsBadReadPtr(title, 0x23300)) {
+            g_exReturnPracticeMenuPending = 0;
+            if (*(volatile int*)(uintptr_t)0x46bc10 != 0) {
+                ((void (__attribute__((thiscall)) *)(void*))(uintptr_t)0x420b40)(title + 0x22e90);
+                *(int*)(title + 0x2324c) = 2;
+                *(int*)(title + 0xc) = 0;
+                *(int*)(title + 8) = 0xc;
+                Log("ExArea: opened the Practice menu after the title update");
+            } else {
+                Log("ExArea: Practice is not unlocked, staying in the main menu");
+            }
+        }
+    }
+    return result;
+}
+
+static void PatchExReturnPracticeTitleUpdate(void) {
+    static const unsigned char expected[5] = { 0xe9, 0x3c, 0xd8, 0xff, 0xff };
+    unsigned char *site = (unsigned char*)(uintptr_t)0x4237ff;
+    DWORD oldProtect, rel;
+    if (memcmp(site, expected, sizeof(expected)) != 0) {
+        Log("ExArea: title update hook signature mismatch");
+        return;
+    }
+    if (!VirtualProtect(site, sizeof(expected), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        Log("ExArea: title update hook VirtualProtect failed (%08X)", GetLastError());
+        return;
+    }
+    site[0] = 0xe9;
+    rel = (DWORD)(uintptr_t)&ExReturnPracticeTitleUpdate - (0x4237ff + 5);
+    memcpy(site + 1, &rel, 4);
+    VirtualProtect(site, sizeof(expected), oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), site, sizeof(expected));
+    Log("ExArea: title update hook installed");
+}
+
+/* Any practice run (Stage 1-3, Extra area/boss) that ends in the title scene (stage end, game over, "title" in
+   the pause menu) opens the Practice menu: the title scene init (slot 0 of the title vtable, 0x453f38 ->
+   0x4227b0, thiscall) is hooked and, when the last game start was a practice run (BYTE 0x4dade0 != 0, noted
+   by GameStartHook) or ExReturnToPracticeMenu asked for it, opens the menu right after the original init
+   (the title update hook above only runs while Extra is unlocked, so it is just a fallback). */
+static const int g_ReturnToPractice = 1;
+typedef unsigned char (__attribute__((fastcall)) *PF_TitleInit)(void *title);
+static PF_TitleInit g_origTitleInit = NULL;
+
+static int g_practiceMenuOpenWait = 0;    /* frames until the Practice menu is opened in the new title scene */
+static int g_practiceMenuOpenTries = 0;
+static int g_practiceMenuWatch = 0;       /* frames since the Practice menu was opened (blank menu watchdog) */
+
+typedef unsigned char (__attribute__((fastcall)) *PF_TitleUpd)(void *title);
+static PF_TitleUpd g_origTitleUpd = NULL;
+
+/* Opens the Practice menu the way the main menu's Practice item does (init 0x420b40, cursor 2, state 0xc).
+   Returns 0 when the menu's textures could not be created, so the caller can try again. */
+static int PracticeMenuOpen(char *t, const char *why) {
+    char *menu = t + 0x22e90;
+    if (*(volatile int*)(uintptr_t)0x46bc10 == 0) {
+        Log("ReturnToPractice: Practice menu not available, staying in the main menu");
+        return 1;
+    }
+    ((void (__attribute__((thiscall)) *)(void*))(uintptr_t)0x420b40)(menu);
+    if (!*(void**)(menu + 0x10) || !*(void**)(menu + 0x14)) {
+        Log("ReturnToPractice: Practice menu textures are missing after init (%p/%p) [%s]",
+            *(void**)(menu + 0x10), *(void**)(menu + 0x14), why);
+        return 0;
+    }
+    *(int*)(t + 0x2324c) = 2;
+    *(int*)(t + 0xc) = 0;
+    *(int*)(t + 8) = 0xc;
+    g_practiceMenuWatch = 1;
+    Log("ReturnToPractice: opened the Practice menu [%s]", why);
+    return 1;
+}
+
+/* The title scene is created in the middle of the scene switch, so the menu is not opened inside its init:
+   it is opened from the title update a few frames later, when the scene runs like after a normal menu choice. */
+static unsigned char __attribute__((fastcall)) TitleInitHook(void *title) {
+    unsigned char r = g_origTitleInit(title);
+    g_practiceMenuWatch = 0;
+    g_practiceMenuOpenWait = 0;
+    if (g_practiceReturn || g_exReturnPracticeMenuPending) {
+        char *t = (char*)title;
+        g_practiceReturn = 0;
+        g_exReturnPracticeMenuPending = 0;
+        if (g_origTitleUpd) {
+            g_practiceMenuOpenWait = 3;
+            g_practiceMenuOpenTries = 0;
+            Log("ReturnToPractice: title created after a practice run, the Practice menu opens in 3 frames");
+        } else if (!IsBadReadPtr(t, 0x23300)) {
+            PracticeMenuOpen(t, "title init");
+        }
+    }
+    return r;
+}
+
+static unsigned char __attribute__((fastcall)) TitleUpdateHook2(void *title) {
+    unsigned char r = g_origTitleUpd(title);
+    char *t = (char*)title;
+    if (g_practiceMenuOpenWait > 0) {
+        if (!IsBadReadPtr(t, 0x23300) && --g_practiceMenuOpenWait == 0) {
+            if (!PracticeMenuOpen(t, "title update")) {
+                if (++g_practiceMenuOpenTries < 60) {
+                    g_practiceMenuOpenWait = 2;
+                } else {
+                    Log("ReturnToPractice: giving up, the Practice menu could not be created");
+                }
+            }
+        }
+    } else if (g_practiceMenuWatch > 0 && !IsBadReadPtr(t, 0x23300)) {
+        if (*(int*)(t + 8) != 0xc) {
+            g_practiceMenuWatch = 0;
+        } else if (++g_practiceMenuWatch >= 90) {
+            /* The menu's fade counter rises by 4 per update up to 0x80: after 90 frames in the menu a low value
+               (or a missing texture) means it is not running, i.e. it would stay blank. */
+            int fade = *(int*)(t + 0x22e90 + 0xc);
+            char *menu = t + 0x22e90;
+            g_practiceMenuWatch = 0;
+            if (fade < 0x20 || !*(void**)(menu + 0x10) || !*(void**)(menu + 0x14)) {
+                Log("ReturnToPractice: Practice menu looks blank (fade=%d), opening it again", fade);
+                if (!PracticeMenuOpen(t, "watchdog")) g_practiceMenuOpenWait = 2;
+            }
+        }
+    }
+    return r;
+}
+
+static void PatchReturnToPractice(void) {
+    void **slot = (void**)(uintptr_t)0x453f38;
+    DWORD old;
+
+    if (!g_ReturnToPractice) return;
+    if (*slot != (void*)(uintptr_t)0x4227b0) {
+        Log("ReturnToPractice: title vtable slot is %p, skipped", *slot);
+        return;
+    }
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) {
+        Log("ReturnToPractice: VirtualProtect failed (err=%08X)", GetLastError());
+        return;
+    }
+    g_origTitleInit = (PF_TitleInit)*slot;
+    *slot = (void*)TitleInitHook;
+    VirtualProtect(slot, sizeof(void*), old, &old);
+    Log("ReturnToPractice: title init hooked");
+    {
+        void **uslot = (void**)(uintptr_t)0x453f40;
+        DWORD uold;
+        if (*uslot != (void*)(uintptr_t)0x422fa0) {
+            Log("ReturnToPractice: title update slot is %p, not hooked", *uslot);
+        } else if (VirtualProtect(uslot, sizeof(void*), PAGE_READWRITE, &uold)) {
+            g_origTitleUpd = (PF_TitleUpd)*uslot;
+            *uslot = (void*)TitleUpdateHook2;
+            VirtualProtect(uslot, sizeof(void*), uold, &uold);
+            Log("ReturnToPractice: title update hooked");
+        }
+    }
+}
 
 static void ExReturnToPracticeMenu(const char *reason) {
     Log("ExArea: %s finished; returning to the Practice menu", reason);
+    g_exBoss1BgmPending = 0;
     g_exRun = 0;
     g_exBossRun = 0;
     g_practiceBossActive = 0;
@@ -2927,6 +3176,9 @@ static void ExReturnToPracticeMenu(const char *reason) {
     g_exBoss2Transition = 0;
     g_exBoss2ObjectSeen = 0;
     g_exBossReturnAtFrame = 0;
+    ExBgmMuteSync();
+    g_exInputSuppress = 1;
+    g_exReturnPracticeMenuPending = 1;
     ((void (__cdecl *)(int, int))(uintptr_t)0x4254d0)(1, 0);
 }
 
@@ -3093,8 +3345,6 @@ static void PracticeBossTrackStage3BgmEvent(int frame) {
     }
 }
 
-static unsigned char g_joyPlugged[4]; /* forward (defined with JoyBridge) */
-
 static unsigned char __cdecl EventDispatchImpl(int frame) {
     static int f9prev = 0;
     FpuEnforce("stage", frame);
@@ -3111,18 +3361,25 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         return ((PF_EventDispatch)(uintptr_t)0x430020)(frame);
     }
     if (g_practiceBgmSeekPending) {
-        if (PracticeSeekBgm(g_practiceBgmSeekSeconds)) {
+        if (g_practiceBgmLoaded && frame >= g_practiceBgmSeekStartFrame &&
+            PracticeSeekBgm(g_practiceBgmSeekSeconds)) {
             g_practiceBgmSeekPending = 0;
+            g_practiceBgmFadeInVolume = g_exBgmSavedVol;
+            g_practiceBgmFadeInFrames = 8;
+            ExBgmMuteSync();
         } else if (frame >= g_practiceBgmSeekDeadline) {
             g_practiceBgmSeekPending = 0;
-            Log("Practice/BGM seek to %d second(s) timed out (frame %d)", g_practiceBgmSeekSeconds, frame);
+            Log("Practice/BGM seek to %d second(s) timed out (frame %d, music loaded=%d)",
+                g_practiceBgmSeekSeconds, frame, g_practiceBgmLoaded);
+            ExBgmMuteSync();
         }
     }
-    if (g_practiceScoreActive && g_practiceScoreResetFrame >= 0 &&
-        frame >= g_practiceScoreResetFrame &&
-        *(volatile int*)(uintptr_t)0x4dade4 == g_practiceScoreStage) {
-        PracticeResetScore("delayed start", g_practiceScoreStage);
-        g_practiceScoreResetFrame = -1;
+    if (g_practiceBgmFadeInFrames > 0 && !g_practiceBgmSeekPending && !g_exMuteSe) {
+        int step = 9 - g_practiceBgmFadeInFrames;
+        int volume = (g_practiceBgmFadeInVolume * step) / 8;
+        ((PF_SetVolume)(uintptr_t)0x4117c0)(volume);
+        if (--g_practiceBgmFadeInFrames == 0)
+            Log("ExArea: BGM fade-in complete at volume %d", g_practiceBgmFadeInVolume);
     }
     if (g_pauseAfterLoad && *(volatile int*)(uintptr_t)0x4dade4 >= 1 &&
         *(volatile int*)(uintptr_t)0x4dade4 <= 4) {
@@ -3184,7 +3441,7 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
                     "ctr[X=(%d+%d) Y=(%d+%d)] fl[108=%02X%02X%02X%02X 10c=%02X%02X%02X%02X 110=%02X]",
                     frame, *(int *)(ib + 0x1078),
                     *(int *)(ib + 0x107c), *(int *)(ib + 0x1080), *(int *)(ib + 0x1084),
-                    g_joyPlugged[0] ? 'Y' : 'n',
+                    SmdControllerIsConnected(0) ? 'Y' : 'n',
                     *(unsigned *)(ib + 0x23f), *(unsigned *)(ib + 0x243),
                     *(unsigned *)(ib + 0x247), *(unsigned *)(ib + 0x24b),
                     *(unsigned *)(ib + 0x24f), *(unsigned *)(ib + 0x253),
@@ -3194,6 +3451,26 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
                     *(int *)(ib + 0x403), *(int *)(ib + 0x407),
                     ib[0x108], ib[0x109], ib[0x10a], ib[0x10b],
                     ib[0x10c], ib[0x10d], ib[0x10e], ib[0x10f], ib[0x110]);
+                    {
+                        int didx = *(int *)(ib + 0x107c);
+                        int capsBase = (int)(ib + 0x3d7) + didx * 0x194;
+                        Log("JoyDbgCaps: id=%d buf caps base=%p name=%.32s wXmin=%u wXmax=%u wYmin=%u wYmax=%u wCaps=%04X wNumAxes=%u wNumButtons=%u",
+                            didx,
+                            (void*)(ib + 0x3d7 + didx * 0x194),
+                            (char*)(ib + 0x3d7 + didx * 0x194 + 4),
+                            *(unsigned *)(ib + 0x3ec + didx * 0x194),
+                            *(unsigned *)(ib + 0x3f0 + didx * 0x194),
+                            *(unsigned *)(ib + 0x3f4 + didx * 0x194),
+                            *(unsigned *)(ib + 0x3f8 + didx * 0x194),
+                            *(unsigned *)(ib + 0x400 + didx * 0x194),
+                            *(unsigned *)(ib + 0x3f6 + didx * 0x194),
+                            *(unsigned *)(ib + 0x3f8 + didx * 0x194),
+                            *(unsigned *)(ib + 0x404 + didx * 0x194),
+                            *(unsigned *)(ib + 0x408 + didx * 0x194),
+                            *(unsigned *)(ib + 0x40c + didx * 0x194),
+                            *(unsigned *)(ib + 0x410 + didx * 0x194),
+                            (unsigned)(ib[0x108]), (unsigned)(ib[0x109]), (unsigned)(ib[0x10a]), (unsigned)(ib[0x10b]));
+                    }
             }
         }
     }
@@ -3234,7 +3511,8 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         }
     }
     if (g_exRun && g_exBossRun == 0 && *(volatile int*)(uintptr_t)0x4dade4 == 4 &&
-        g_exArea >= 0 && g_exArea < EX_AREA_N && frame >= g_exAreaEndFrame[g_exArea]) {
+        g_exArea >= 0 && g_exArea < EX_AREA_N - 1 &&
+        frame >= g_exAreaEndFrame[g_exArea]) {
         ExReturnToPracticeMenu("Area");
         return 1;
     }
@@ -3294,15 +3572,26 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
                 }
                 frame = target;
                 if ((stage == 1 || stage == 2) && g_practiceBossTarget == 1) {
-                    g_practiceBgmSeekSeconds = stage == 1 ? 41 : 52;
+                    g_practiceBgmSeekSeconds = stage == 1 ? 41 : 51;
+                    g_practiceBgmFadeInFrames = 0;
                     g_practiceBgmSeekPending = 1;
-                    g_practiceBgmSeekDeadline = target + 600;
+                    g_practiceBgmSeekDeadline = target + 120;
+                    g_practiceBgmSeekStartFrame = target + 8;
                     Log("PracticeBoss: Stage %d MidBoss will seek its BGM to %d seconds",
                         stage, g_practiceBgmSeekSeconds);
                 } else {
                     g_practiceBgmSeekPending = 0;
+                    if (g_practiceBgmSimLastId >= 0) {
+                        int bgmId = g_practiceBgmSimLastId;
+                        int result;
+                        g_practiceBgmLoaded = 1;
+                        result = ((PF_VmBgm)(uintptr_t)0x433740)(bgmId);
+                        Log("PracticeBoss: restarted BGM id=%d after fast-forward (result=%d)",
+                            bgmId, result);
+                    }
                 }
                 Log("PracticeBoss: stage %d fast-forwarded to boss start frame %d", stage, target);
+                g_postJumpLog = 4;
             }
         }
     }
@@ -3406,12 +3695,14 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
                     g_practiceBgmSeekSeconds = seekSec;
                     g_practiceBgmSeekPending = 1;
                     g_practiceBgmSeekDeadline = target + 600;
+                    g_practiceBgmSeekStartFrame = target + 8;
                     Log("ExArea: will seek the area BGM to %d second(s) after the jump "
                         "(event t=%d, target %d, bgmId=%d)",
                         seekSec, g_exBgmMoveTime, target, bgmId);
                 }
             }
             frame = target;
+            g_postJumpLog = 4;
         } else if (frame > 1500) {
             g_exSkipWait = 0;
             if (isBoss) Log("ExArea: BGM event for Boss %d not seen, no skip", g_exBossRun);
@@ -3426,6 +3717,12 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
 static unsigned char __cdecl EventDispatchHook(int frame) {
     LARGE_INTEGER a, b;
     unsigned char result;
+    int tracePostJump = g_postJumpLog > 0;
+    if (tracePostJump) {
+        Log("EventDispatch: post-jump frame %d entry (sim=%d, left=%d)",
+            frame, g_exSimulatingStageFrame ? 1 : 0, g_postJumpLog);
+        g_postJumpLog--;
+    }
     QueryPerformanceCounter(&a);
     result = EventDispatchImpl(frame);
     QueryPerformanceCounter(&b);
@@ -3433,6 +3730,7 @@ static unsigned char __cdecl EventDispatchHook(int frame) {
     g_gamePerf[0].ticks += dt;
     if (dt > g_gamePerf[0].maxTicks) g_gamePerf[0].maxTicks = dt;
     g_gamePerf[0].calls++;
+    if (tracePostJump) Log("EventDispatch: frame %d returned %02x (dt=%lld ticks)", frame, result, dt);
     return result;
 }
 
@@ -3504,9 +3802,9 @@ static void PatchReplayFpu(void) {
         Log("FpuFix: stage frame hook installed");
 }
 
-typedef int (__cdecl *PF_VmBgm)(int id);
 static int g_exVmBgmLog = 1;
 static int __cdecl ExVmBgmHook(int id);
+static int __cdecl ExBgmEventHook(int id);
 static int __cdecl ExVmSpawnHook(void *a, void *b);
 
 static void PatchExAreaSelect(void) {
@@ -3519,6 +3817,9 @@ static void PatchExAreaSelect(void) {
     }
     n += HookCall(0x423791, 0x420c90, (void*)&PracticeUpdateHook);
     n += HookCall(0x42407f, 0x420de0, (void*)&PracticeDrawHook);
+    PatchExReturnPracticeTitleUpdate();
+    PatchReturnToPractice();
+    PatchExInputSuppression();
     n += HookCall(0x413c45, 0x430020, (void*)&EventDispatchHook);
     Log("ExArea: patched %d/3 call sites", n);
     Log("ExArea: event insert log: %d call site(s) hooked", PatchEventInsertLog());
@@ -3526,6 +3827,8 @@ static void PatchExAreaSelect(void) {
         Log("ExArea: background push log hooked");
     if (HookCall(0x42f0c3, 0x433740, (void*)&ExVmBgmHook))
         Log("ExArea: VM bgm op hooked");
+    if (HookCall(0x430161, 0x433740, (void*)&ExBgmEventHook))
+        Log("ExArea: queued BGM event op hooked");
     if (HookCall(0x42f475, 0x42a030, (void*)&ExVmSpawnHook))
         Log("ExArea: VM spawn op hooked");
 }
@@ -3541,64 +3844,96 @@ static int __cdecl ExVmSpawnHook(void *a, void *b) {
     return ((PF_VmSpawnReg)(uintptr_t)0x42a030)(a, b);
 }
 
-static int __cdecl ExVmBgmHook(int id) {
-    int frame = 0;
-    if (id >= 0 && id < EX_BGM_IDS) {
-        frame = *(volatile int*)(uintptr_t)0x4dadf8;
-        if (g_practiceBossActive && g_practiceBossStage == 3) {
-            if (g_practiceBossSeekingSecondForm && g_practiceBgmLastId >= 0 &&
-                id != g_practiceBgmLastId) {
-                g_practiceBossFormBgmChanged = 1;
-                Log("PracticeBoss: Stage 3 form BGM changed %d -> %d at frame %d (sim=%d)",
-                    g_practiceBgmLastId, id, frame, g_exSimulatingStageFrame ? 1 : 0);
-            }
-            g_practiceBgmLastId = id;
+static void BgmNotify(int frame, int id, const char *path) {
+    if (id < 0 || id >= EX_BGM_IDS) return;
+    if (g_practiceBossActive && g_practiceBossStage == 3) {
+        if (g_practiceBossSeekingSecondForm && g_practiceBgmLastId >= 0 &&
+            id != g_practiceBgmLastId) {
+            g_practiceBossFormBgmChanged = 1;
+            Log("PracticeBoss: Stage 3 form BGM changed %d -> %d at frame %d (sim=%d, %s)",
+                g_practiceBgmLastId, id, frame, g_exSimulatingStageFrame ? 1 : 0, path);
         }
-        if (frame < g_exBgmTime[id] || g_exBgmTime[id] <= 0)
-            g_exBgmTime[id] = frame;
-        if (id == g_exBossBgm[0]) {
-            if (g_exBossBgmTime[0] <= 0 || frame < g_exBossBgmTime[0])
-                g_exBossBgmTime[0] = frame;
-        } else if (id == g_exBossBgm[1]) {
-            if (g_exBossBgmTime[1] <= 0 || frame < g_exBossBgmTime[1])
-                g_exBossBgmTime[1] = frame;
-        }
-        if (id == g_exBossBgm[1] && g_exBossRun >= 1) {
-            if (g_exBossRun == 1) g_exBoss1DonePending = 1;
-            if (g_exBossRun == 2) {
-                g_exBoss2BgmSeen = 1;
-                g_exBoss2BgmFrame = frame;
-                if (!g_exBoss2ScoreReset) {
-                    *(volatile int*)(uintptr_t)0x4dadf0 = 0;
-                    *(volatile int*)(uintptr_t)0x4dade8 = 0;
-                    g_exBoss2ScoreReset = 1;
-                    Log("ExArea: Boss 2 started; score and displayed score reset to 0 (frame %d)", frame);
-                }
-            }
-        }
-        if (g_exBoss2Transition && id == g_exBossBgm[1] && g_exBossRun == 2) {
-            g_exBoss2Kill = 0;
-            g_exBoss2Transition = 0;
-            Log("ExArea: Boss 2 started (BGM id=%d at frame %d, %d frame(s) after the Boss 1 jump)", id,
-                frame, g_exBoss2KillFrames);
-        }
-        if (g_exVmBgmLog)
-            Log("ExArea: VM bgm id=%d frame=%d (sim=%d)", id, frame,
-                g_exSimulatingStageFrame ? 1 : 0);
+        g_practiceBgmLastId = id;
     }
+    if (frame < g_exBgmTime[id] || g_exBgmTime[id] <= 0)
+        g_exBgmTime[id] = frame;
+    if (id == g_exBossBgm[0]) {
+        if (g_exBossBgmTime[0] <= 0 || frame < g_exBossBgmTime[0])
+            g_exBossBgmTime[0] = frame;
+    } else if (id == g_exBossBgm[1]) {
+        if (g_exBossBgmTime[1] <= 0 || frame < g_exBossBgmTime[1])
+            g_exBossBgmTime[1] = frame;
+    }
+    if (id == g_exBossBgm[1] && g_exBossRun >= 1) {
+        if (g_exBossRun == 1) g_exBoss1DonePending = 1;
+        if (g_exBossRun == 2) {
+            g_exBoss2BgmSeen = 1;
+            g_exBoss2BgmFrame = frame;
+            if (!g_exBoss2ScoreReset) {
+                *(volatile int*)(uintptr_t)0x4dadf0 = 0;
+                *(volatile int*)(uintptr_t)0x4dade8 = 0;
+                g_exBoss2ScoreReset = 1;
+                Log("ExArea: Boss 2 started; score and displayed score reset to 0 (frame %d)", frame);
+            }
+        }
+    }
+    if (g_exBoss2Transition && id == g_exBossBgm[1] && g_exBossRun == 2) {
+        g_exBoss2Kill = 0;
+        g_exBoss2Transition = 0;
+        Log("ExArea: Boss 2 started (BGM id=%d at frame %d, %d frame(s) after the Boss 1 jump)", id,
+            frame, g_exBoss2KillFrames);
+    }
+    if (g_exVmBgmLog)
+        Log("ExArea: %s BGM id=%d frame=%d (sim=%d)", path, id, frame,
+            g_exSimulatingStageFrame ? 1 : 0);
+}
+
+/* Both the script VM opcode (op6 -> 0x433740) and the queued type-6 event dispatcher
+   (event at 0x430152 -> 0x433740) start the BGM.  They both need the same suppression and
+   accounting, so share it through one function. */
+static int BgmDispatch(int id, const char *path) {
+    int frame = *(volatile int*)(uintptr_t)0x4dadf8;
+    int result;
     if (g_exSimulatingStageFrame) {
-        if (g_practiceBossActive && g_practiceBossStage == 1 &&
+        BgmNotify(frame, id, path);
+        if (g_practiceBossActive && g_practiceBossStage >= 1 &&
+            g_practiceBossStage <= 3 && id >= 0 && id < EX_BGM_IDS)
+            g_practiceBgmSimLastId = id;
+        if (g_practiceBossActive &&
+            (g_practiceBossStage == 1 || g_practiceBossStage == 2) &&
             g_practiceBossTarget == 1 && !g_practiceBgmStartedDuringSeek) {
             g_practiceBgmStartedDuringSeek = 1;
-            Log("PracticeBoss: starting Stage 1 BGM during MidBoss fast-forward (id=%d, frame=%d)",
-                id, frame);
+            g_practiceBgmLoaded = 1;
+            Log("PracticeBoss: starting Stage %d BGM during MidBoss fast-forward (id=%d, frame=%d, via %s)",
+                g_practiceBossStage, id, frame, path);
             return ((PF_VmBgm)(uintptr_t)0x433740)(id);
         }
-        if (g_exBossRun == 2 && id == g_exBossBgm[1])
+        if (g_exBossRun == 2 && id == g_exBossBgm[1]) {
+            g_practiceBgmLoaded = 1;
             return ((PF_VmBgm)(uintptr_t)0x433740)(id);
+        }
         return 0;
     }
-    return ((PF_VmBgm)(uintptr_t)0x433740)(id);
+    BgmNotify(frame, id, path);
+    if (g_practiceBgmLoaded != 1) g_practiceBgmLoaded = 1;
+    result = ((PF_VmBgm)(uintptr_t)0x433740)(id);
+    if (g_exBoss1BgmPending && g_exRun && g_exBossRun == 1 &&
+        id == g_exBossBgm[0]) {
+        g_exBoss1BgmPending = 0;
+        g_practiceBgmFadeInVolume = g_exBgmSavedVol;
+        g_practiceBgmFadeInFrames = 8;
+        Log("ExArea: Boss 1 BGM started; releasing the intro BGM mute");
+        ExBgmMuteSync();
+    }
+    return result;
+}
+
+static int __cdecl ExVmBgmHook(int id) {
+    return BgmDispatch(id, "VM op");
+}
+
+static int __cdecl ExBgmEventHook(int id) {
+    return BgmDispatch(id, "event");
 }
 
 static const int g_PauseAudio = 1;
@@ -3630,6 +3965,10 @@ static int PatchVtblSlot(void **slot, void *hook, void **orig) {
     *slot = hook;
     VirtualProtect(slot, sizeof(void*), old, &old);
     return 1;
+}
+
+int SmdPatchVtblSlot(void **slot, void *hook, void **original) {
+    return PatchVtblSlot(slot, hook, original);
 }
 
 static void AudioRemove(void *buf) {
@@ -3788,11 +4127,11 @@ static void AudioResume(int doPlay) {
     Log("PauseAudio: %s %d buffers", doPlay ? "resumed" : "dropped (retry/title)", n);
 }
 
-static int PracticeSeekBgm(int seconds) {
+static int PracticeSeekBgmInner(int seconds) {
     typedef void *(__cdecl *PF_GetCurrentMusic)(void);
     typedef unsigned char (__attribute__((thiscall)) *PF_RebufferMusic)(void *);
-    typedef void (__attribute__((thiscall)) *PF_MusicLock)(void *);
     typedef unsigned char (__attribute__((thiscall)) *PF_SourceSeek)(void *, DWORD);
+    typedef long long (__attribute__((thiscall)) *PF_SourceTell)(void *);
     typedef DWORD (__attribute__((thiscall)) *PF_SourceLength)(void *);
     void *music;
     void *source;
@@ -3802,79 +4141,179 @@ static int PracticeSeekBgm(int seconds) {
     DWORD avgBytesPerSec;
     DWORD samplesPerSec;
     DWORD offset;
+    DWORD targetSeconds;
     WORD blockAlign;
     DWORD status = 0;
+    HRESULT playHr = E_FAIL;
+    HRESULT positionHr = E_FAIL;
     IDirectSoundBuffer *ds;
     PF_RebufferMusic rebuffer = (PF_RebufferMusic)(uintptr_t)0x4133b0;
-    PF_MusicLock lock = (PF_MusicLock)(uintptr_t)0x40efe0;
-    PF_MusicLock unlock = (PF_MusicLock)(uintptr_t)0x40eff0;
     PF_SourceSeek seekSource;
+    PF_SourceTell tellSource;
     PF_SourceLength getSourceLength;
     DWORD sourceLength;
     int refilled;
 
     if (seconds <= 0) return 0;
+    Log("Practice/BGM seek step 1: get current music (%d s)", seconds);
     music = ((PF_GetCurrentMusic)(uintptr_t)0x411880)();
     if (!music || IsBadReadPtr(music, 0x70)) return 0;
-    if (*(DWORD*)((char*)music + 0x14) != 0x453548) return 0;
-
+    if (*(DWORD*)((char*)music + 0x14) != 0x453548) {
+        Log("Practice/BGM seek step 2: music type is 0x%08X, not 0x453548",
+            *(DWORD*)((char*)music + 0x14));
+        return 0;
+    }
+    Log("Practice/BGM seek step 3: music=%p", music);
     source = *(void**)((char*)music + 0x38);
     if (!source || IsBadReadPtr(source, sizeof(void*))) return 0;
     vtable = *(void***)source;
     if (!vtable || IsBadReadPtr(vtable + 6, sizeof(void*)) || !vtable[6] ||
-        IsBadCodePtr((FARPROC)vtable[6])) return 0;
+        IsBadCodePtr((FARPROC)vtable[6])) {
+        Log("Practice/BGM seek step 3: bad source vtable");
+        return 0;
+    }
+    Log("Practice/BGM seek step 4: source=%p vtable=%p, calling getFormat", source, vtable);
     format = ((void *(__attribute__((thiscall)) *)(void*))vtable[6])(source);
-    if (!format || IsBadReadPtr(format, 16)) return 0;
+    if (!format || IsBadReadPtr(format, 16)) {
+        Log("Practice/BGM seek step 5: bad format");
+        return 0;
+    }
     avgBytesPerSec = *(DWORD*)((char*)format + 8);
     samplesPerSec = *(DWORD*)((char*)format + 4);
     blockAlign = *(WORD*)((char*)format + 12);
     if (avgBytesPerSec < 8000 || avgBytesPerSec > 2000000 ||
-        samplesPerSec < 8000 || samplesPerSec > 192000) return 0;
-
-    offset = (DWORD)((unsigned long long)samplesPerSec * (unsigned)seconds);
-    if (!vtable[2] || !vtable[3] || IsBadCodePtr((FARPROC)vtable[2]) ||
-        IsBadCodePtr((FARPROC)vtable[3])) return 0;
+        samplesPerSec < 8000 || samplesPerSec > 192000) {
+        Log("Practice/BGM seek step 6: format implausible (sr=%lu byterate=%lu)",
+            (unsigned long)samplesPerSec, (unsigned long)avgBytesPerSec);
+        return 0;
+    }
+    Log("Practice/BGM seek step 7: format ok (sr=%lu byterate=%lu align=%u)",
+        (unsigned long)samplesPerSec, (unsigned long)avgBytesPerSec, (unsigned)blockAlign);
+    targetSeconds = (DWORD)seconds;
+    offset = (DWORD)((unsigned long long)samplesPerSec * targetSeconds);
+    if (!vtable[2] || !vtable[3] || !vtable[4] ||
+        IsBadCodePtr((FARPROC)vtable[2]) || IsBadCodePtr((FARPROC)vtable[3]) ||
+        IsBadCodePtr((FARPROC)vtable[4])) {
+        Log("Practice/BGM seek step 8: bad source vtable members");
+        return 0;
+    }
     getSourceLength = (PF_SourceLength)vtable[2];
+    Log("Practice/BGM seek step 9: calling getSourceLength at %p", (void*)vtable[2]);
     sourceLength = getSourceLength(source);
-    if (offset >= sourceLength / 2) {
-        Log("PracticeBoss: BGM seek sample %lu exceeds source length %lu samples",
-            (unsigned long)offset, (unsigned long)(sourceLength / 2));
+    Log("Practice/BGM seek step 10: sourceLength=%lu bytes, target=%lu sample frames",
+        (unsigned long)sourceLength, (unsigned long)offset);
+    if ((unsigned long long)offset * blockAlign >= sourceLength) {
+        Log("PracticeBoss: BGM seek target %lu frames exceeds source length %lu bytes",
+            (unsigned long)offset, (unsigned long)sourceLength);
         return 0;
     }
     seekSource = (PF_SourceSeek)vtable[3];
+    tellSource = (PF_SourceTell)vtable[4];
+    Log("Practice/BGM seek step 11: calling sample-frame seek at %p with %lu frames",
+        (void*)vtable[3], (unsigned long)offset);
     if (!seekSource(source, offset)) {
-        Log("PracticeBoss: source rejected BGM seek to %d seconds (offset=%lu)",
-            seconds, (unsigned long)offset);
+        Log("PracticeBoss: decoder rejected seek to sample frame %lu", (unsigned long)offset);
         return 0;
     }
+    {
+        long long actualFrame = tellSource(source);
+        Log("Practice/BGM seek: decoder position after seek=%lld frames (requested=%lu)",
+            actualFrame, (unsigned long)offset);
+    }
+    Log("Practice/BGM seek step 12: source seeked, ds=%p",
+        (void*)(*(void**)((char*)music + 0x18)));
     buffer = *(void**)((char*)music + 0x18);
     if (!buffer || IsBadReadPtr(buffer, sizeof(void*))) return 0;
     ds = (IDirectSoundBuffer*)buffer;
     if (FAILED(IDirectSoundBuffer_GetStatus(ds, &status))) return 0;
+    Log("Practice/BGM seek step 13: ds ok, hr status=%08X looping=%d",
+        (unsigned)status, status & 0x4 ? 1 : 0);
 
-    lock((char*)music + 0x1c);
+    {
+        int di;
+        char line[400];
+        int len = 0;
+        for (di = 0x1c; di <= 0x6c && len < 360; di += 4)
+            len += snprintf(line + len, sizeof(line) - (size_t)len, " +%02X=%08X", di,
+                            (unsigned)*(DWORD*)((char*)music + di));
+        Log("Practice/BGM seek step 14: music fields%s", line);
+    }
+    Log("Practice/BGM seek step 15: Stop");
     IDirectSoundBuffer_Stop(ds);
-    *(DWORD*)((char*)music + 0x50) = 0;
+    Log("Practice/BGM seek step 16: stopped");
+    if ((status & DSBSTATUS_BUFFERLOST) && FAILED(IDirectSoundBuffer_Restore(ds))) {
+        Log("PracticeBoss: failed to restore lost DirectSound buffer before refill");
+        return 0;
+    }
+    positionHr = IDirectSoundBuffer_SetCurrentPosition(ds, 0);
+    if (FAILED(positionHr)) {
+        Log("PracticeBoss: failed to reset DirectSound cursor before refill (hr=%08X)",
+            (unsigned)positionHr);
+        return 0;
+    }
+    *(DWORD*)((char*)music + 0x4c) = 0;
     *(DWORD*)((char*)music + 0x54) = 0;
     *(DWORD*)((char*)music + 0x58) = 0;
+    Log("Practice/BGM seek step 17: calling rebuffer(0x4133b0)");
     refilled = rebuffer(music) != 0;
+    Log("Practice/BGM seek step 18: rebuffer returned %d", refilled);
     if (refilled) {
-        IDirectSoundBuffer_SetCurrentPosition(ds, 0);
-        IDirectSoundBuffer_Play(ds, 0, 0,
+        playHr = IDirectSoundBuffer_Play(ds, 0, 0,
             (status & DSBSTATUS_LOOPING) ? DSBPLAY_LOOPING : 0);
     } else if (status & DSBSTATUS_PLAYING) {
-        IDirectSoundBuffer_Play(ds, 0, 0,
+        playHr = IDirectSoundBuffer_Play(ds, 0, 0,
             (status & DSBSTATUS_LOOPING) ? DSBPLAY_LOOPING : 0);
     }
-    unlock((char*)music + 0x1c);
+    Log("Practice/BGM seek step 19: Play hr=%08X", (unsigned)playHr);
     if (!refilled) {
         Log("PracticeBoss: native audio refill failed at source offset %lu", (unsigned long)offset);
         return 0;
     }
-    Log("PracticeBoss: native BGM source seeked to %d seconds and ring refilled (id=%d, sample=%lu, sample_rate=%lu, byte_rate=%lu, align=%u)",
-        seconds, g_practiceBgmLastId, (unsigned long)offset,
+    Log("PracticeBoss: native BGM source seeked to %lu seconds and ring refilled (id=%d, frame_offset=%lu, sample_rate=%lu, byte_rate=%lu, align=%u)",
+        (unsigned long)targetSeconds, g_practiceBgmLastId, (unsigned long)offset,
         (unsigned long)samplesPerSec, (unsigned long)avgBytesPerSec, (unsigned)blockAlign);
     return 1;
+}
+
+/* Logs the faulting instruction and registers of a crash, so a crash during the BGM seek can be located. */
+static LONG CALLBACK SeekCrashVeh(PEXCEPTION_POINTERS ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION ||
+        code == EXCEPTION_INT_DIVIDE_BY_ZERO || code == EXCEPTION_PRIV_INSTRUCTION ||
+        code == EXCEPTION_STACK_OVERFLOW || code == EXCEPTION_IN_PAGE_ERROR) {
+        CONTEXT *c = ep->ContextRecord;
+        DWORD *sp = (DWORD*)(uintptr_t)c->Esp;
+        Log("Crash: exception 0x%08X at eip=%08X rw=%u addr=%08X", (unsigned)code, (unsigned)c->Eip,
+            ep->ExceptionRecord->NumberParameters >= 2 ? (unsigned)ep->ExceptionRecord->ExceptionInformation[0] : 0u,
+            ep->ExceptionRecord->NumberParameters >= 2 ? (unsigned)ep->ExceptionRecord->ExceptionInformation[1] : 0u);
+        Log("Crash: eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X ebp=%08X esp=%08X",
+            (unsigned)c->Eax, (unsigned)c->Ebx, (unsigned)c->Ecx, (unsigned)c->Edx, (unsigned)c->Esi,
+            (unsigned)c->Edi, (unsigned)c->Ebp, (unsigned)c->Esp);
+        if (!IsBadReadPtr(sp, 32))
+            Log("Crash: stack %08X %08X %08X %08X %08X %08X %08X %08X", (unsigned)sp[0], (unsigned)sp[1],
+                (unsigned)sp[2], (unsigned)sp[3], (unsigned)sp[4], (unsigned)sp[5], (unsigned)sp[6], (unsigned)sp[7]);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* The streaming thread decodes and refills the music from the same source object, so the whole seek
+   (format query, source seek, ring refill) runs under the music lock (0x40efe0 / 0x40eff0, music+0x1c). */
+static int PracticeSeekBgm(int seconds) {
+    typedef void *(__cdecl *PF_GetCurrentMusic)(void);
+    typedef void (__attribute__((thiscall)) *PF_MusicLock)(void *);
+    void *music = ((PF_GetCurrentMusic)(uintptr_t)0x411880)();
+    static int vehInstalled = 0;
+    int r;
+
+    if (!vehInstalled) {
+        vehInstalled = 1;
+        AddVectoredExceptionHandler(1, SeekCrashVeh);
+    }
+    if (seconds <= 0 || !music || IsBadReadPtr(music, 0x70)) return 0;
+    ((PF_MusicLock)(uintptr_t)0x40efe0)((char*)music + 0x1c);
+    r = PracticeSeekBgmInner(seconds);
+    ((PF_MusicLock)(uintptr_t)0x40eff0)((char*)music + 0x1c);
+    return r;
 }
 
 static DWORD WINAPI PauseAudioThread(LPVOID unused) {
@@ -4136,7 +4575,7 @@ static void BatchApplyTexture(void) {
 
 /* Draws the queued quads.  The count is cleared first so that a state change made while the draw is
    being issued (D7_BatchFlush -> here) cannot draw them twice. */
-static void BatchFlushQuads(void) {
+void SmdBatchFlushQuads(void) {
     int q = g_bquads;
     if (q > 0) {
         g_bquads = 0;
@@ -4148,7 +4587,7 @@ static void BatchFlushQuads(void) {
 }
 
 static void BatchFlush(void) {
-    BatchFlushQuads();
+    SmdBatchFlushQuads();
     BatchApplyTexture();
 }
 
@@ -4221,8 +4660,6 @@ static int BatchStubSlots(void **vt, const unsigned char *slots, int n) {
     return ok;
 }
 
-static int D7_EmuActive(void);
-
 static void BatchTryInstall(void) {
 
     static const unsigned char devSlots[] = { 5, 6, 8, 10, 11, 13, 14, 16, 18, 20, 26, 29, 30, 31, 32,
@@ -4246,7 +4683,7 @@ static void BatchTryInstall(void) {
     if (!svt || IsBadReadPtr(svt, 40 * sizeof(void*))) { g_batchFailed = 1; return; }
 
     g_devSelf = dev;
-    if (D7_EmuActive()) {
+    if (SmdD3D9EmuActive()) {
         /* In the Direct3D9 layer a render / texture-stage state change flushes the batch itself, and only
            when the value really changes, so the always-flush stubs on those two slots (20, 37) are left out:
            redundant state calls no longer split the sprite batches. */
@@ -4304,6 +4741,7 @@ typedef unsigned (__attribute__((fastcall)) *PF_FrameTimer)(int *ctx);
 
 static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
     unsigned r;
+    SmdControllerPoll();
     BatchTryInstall();
     r = ((PF_FrameTimer)(uintptr_t)0x424f20)(ctx);
     if (g_FrameWaitSleep && (r & 0xff) == 0) {
@@ -4378,3101 +4816,6 @@ static void PatchKeepRunningInactive(void) {
     Log("KeepActive: game active-state flag is held while the window is unfocused");
 }
 
-/* ------------------------------------------------------------------------
-   Modern controller support.  Rain.exe only speaks the legacy winmm joystick
-   API (joyGetDevCapsA 0x4532c8, joyGetPosEx 0x4532c4).  Windows 8+ excludes
-   XInput devices (Xbox 360/One/Series, modern pads) from that API, so they are
-   invisible to the game.  We replace those two imports with shims backed by
-   XInputGetState:
-
-   - joyGetDevCapsA(id): succeeds only for connected XInput pads, id 0..3 ->
-     XInput user 0..3, reporting 16 buttons and 6 axes in the 0..0xFFFF range
-     the game's own thresholds (0x4315c0: center +/- 0x4e20) expect.
-   - joyGetPosEx(id): polls XInput and fills JOYINFOEX.  X (right+) and Y
-     (down+) use the winmm convention, POV holds the d-pad in winmm degrees,
-     and buttons map to JOY_BUTTON1..16 bits as listed in the table below.
-
-   The game already supports such regular joystick hardware, so no further
-   patching is needed: its enumeration loop (0x431130), the frame poll
-   (0x430eab) and the config UI all keep working unchanged.
-   ------------------------------------------------------------------------ */
-typedef unsigned (__stdcall *PF_XInputGetState)(unsigned id, void *state);
-typedef MMRESULT (WINAPI *PF_JoyGetCapsA)(UINT id, LPJOYCAPSA caps, UINT cb);
-typedef MMRESULT (WINAPI *PF_JoyGetPosEx)(UINT id, LPJOYINFOEX info);
-typedef HRESULT (WINAPI *PF_DirectInput8Create)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
-
-#define XI_ID_VK_A            0x1000u
-#define XI_ID_VK_B            0x2000u
-#define XI_ID_VK_X            0x4000u
-#define XI_ID_VK_Y            0x8000u
-#define XI_ID_SHOULDER_L      0x0100u
-#define XI_ID_SHOULDER_R      0x0200u
-#define XI_ID_VK_BACK         0x0020u
-#define XI_ID_VK_START        0x0010u
-#define XI_ID_VK_STICK_L      0x0040u
-#define XI_ID_VK_STICK_R      0x0080u
-#define XI_ID_DPAD_UP         0x0001u
-#define XI_ID_DPAD_DOWN       0x0002u
-#define XI_ID_DPAD_LEFT       0x0004u
-#define XI_ID_DPAD_RIGHT      0x0008u
-
-static unsigned char g_joyIoInited = 0;
-static unsigned char g_joyIoOk = 0;
-static PF_XInputGetState g_xiGetState = NULL;
-static PF_JoyGetCapsA g_winmmJoyGetCapsA = NULL;
-static PF_JoyGetPosEx g_winmmJoyGetPosEx = NULL;
-static unsigned g_joyCapsCount = 0;
-static unsigned char g_joyPlugged[4];
-static HMODULE g_dinputModule;
-static LPDIRECTINPUT8A g_di8;
-static LPDIRECTINPUTDEVICE8A g_diDevices[16];
-static LONG g_diAxisMin[16][8];
-static LONG g_diAxisMax[16][8];
-static const DWORD g_diAxisInstance[8] = { 0, 0, 0, 0, 0, 0, 0, 1 };
-static unsigned g_diCount;
-static DWORD g_diLastScan;
-static DIDATAFORMAT g_diFormat;
-static DIOBJECTDATAFORMAT g_diObjects[140];
-static int g_diFormatReady;
-
-static void JoyDirectInputFormatInit(void) {
-    static const GUID *const axisGuid[8] = {
-        &GUID_XAxis, &GUID_YAxis, &GUID_ZAxis, &GUID_RxAxis,
-        &GUID_RyAxis, &GUID_RzAxis, &GUID_Slider, &GUID_Slider
-    };
-    static const DWORD axisOffset[8] = {
-        DIJOFS_X, DIJOFS_Y, DIJOFS_Z, DIJOFS_RX,
-        DIJOFS_RY, DIJOFS_RZ, DIJOFS_SLIDER(0), DIJOFS_SLIDER(1)
-    };
-    unsigned i;
-    if (g_diFormatReady) return;
-    memset(&g_diFormat, 0, sizeof(g_diFormat));
-    for (i = 0; i < 8; i++) {
-        g_diObjects[i].pguid = (GUID*)axisGuid[i];
-        g_diObjects[i].dwOfs = axisOffset[i];
-        g_diObjects[i].dwType = DIDFT_ABSAXIS | DIDFT_MAKEINSTANCE(g_diAxisInstance[i]);
-    }
-    for (i = 0; i < 4; i++) {
-        g_diObjects[8 + i].pguid = (GUID*)&GUID_POV;
-        g_diObjects[8 + i].dwOfs = DIJOFS_POV(i);
-        g_diObjects[8 + i].dwType = DIDFT_POV | DIDFT_MAKEINSTANCE(i);
-    }
-    for (i = 0; i < 128; i++) {
-        g_diObjects[12 + i].pguid = (GUID*)&GUID_Button;
-        g_diObjects[12 + i].dwOfs = DIJOFS_BUTTON(i);
-        g_diObjects[12 + i].dwType = DIDFT_BUTTON | DIDFT_MAKEINSTANCE(i);
-    }
-    g_diFormat.dwSize = sizeof(g_diFormat);
-    g_diFormat.dwObjSize = sizeof(DIOBJECTDATAFORMAT);
-    g_diFormat.dwFlags = DIDF_ABSAXIS;
-    g_diFormat.dwDataSize = sizeof(DIJOYSTATE2);
-    g_diFormat.dwNumObjs = sizeof(g_diObjects) / sizeof(g_diObjects[0]);
-    g_diFormat.rgodf = g_diObjects;
-    g_diFormatReady = 1;
-}
-
-static BOOL CALLBACK JoyEnumDirectInput(const DIDEVICEINSTANCEA *instance, void *context) {
-    HWND hwnd = (HWND)context;
-    LPDIRECTINPUTDEVICE8A device = NULL;
-    HRESULT hr;
-    DIPROPRANGE axisRange;
-    unsigned i;
-    if (g_diCount >= sizeof(g_diDevices) / sizeof(g_diDevices[0])) return DIENUM_STOP;
-    JoyDirectInputFormatInit();
-    hr = IDirectInput8_CreateDevice(g_di8, &instance->guidInstance, &device, NULL);
-    if (FAILED(hr) || !device) return DIENUM_CONTINUE;
-    hr = IDirectInputDevice8_SetDataFormat(device, &g_diFormat);
-    if (SUCCEEDED(hr) && hwnd)
-        hr = IDirectInputDevice8_SetCooperativeLevel(device, hwnd, DISCL_NONEXCLUSIVE | DISCL_BACKGROUND);
-    if (FAILED(hr)) {
-        IDirectInputDevice8_Release(device);
-        return DIENUM_CONTINUE;
-    }
-    memset(&axisRange, 0, sizeof(axisRange));
-    axisRange.diph.dwSize = sizeof(axisRange);
-    axisRange.diph.dwHeaderSize = sizeof(axisRange.diph);
-    axisRange.diph.dwHow = DIPH_BYID;
-    axisRange.lMin = -1000;
-    axisRange.lMax = 1000;
-    for (i = 0; i < 8; i++) {
-        axisRange.diph.dwObj = DIDFT_ABSAXIS | DIDFT_MAKEINSTANCE(g_diAxisInstance[i]);
-        if (FAILED(IDirectInputDevice8_SetProperty(device, DIPROP_RANGE, &axisRange.diph)) &&
-            SUCCEEDED(IDirectInputDevice8_GetProperty(device, DIPROP_RANGE, &axisRange.diph))) {
-            g_diAxisMin[g_diCount][i] = axisRange.lMin;
-            g_diAxisMax[g_diCount][i] = axisRange.lMax;
-        } else {
-            g_diAxisMin[g_diCount][i] = -1000;
-            g_diAxisMax[g_diCount][i] = 1000;
-        }
-    }
-    IDirectInputDevice8_Acquire(device);
-    g_diDevices[g_diCount++] = device;
-    return DIENUM_CONTINUE;
-}
-
-static void JoyDirectInputScan(void) {
-    PF_DirectInput8Create create;
-    HWND hwnd;
-    DWORD now = GetTickCount();
-    if (g_di8 && now - g_diLastScan < 2000) return;
-    g_diLastScan = now;
-    if (!g_dinputModule) {
-        g_dinputModule = LoadLibraryA("dinput8.dll");
-        if (!g_dinputModule) return;
-    }
-    create = (PF_DirectInput8Create)(void*)GetProcAddress(g_dinputModule, "DirectInput8Create");
-    if (!create) return;
-    if (!g_di8 && FAILED(create(GetModuleHandleA(NULL), DIRECTINPUT_VERSION, &IID_IDirectInput8A,
-                                (void**)&g_di8, NULL))) return;
-    if (!g_di8) return;
-    while (g_diCount) {
-        g_diCount--;
-        IDirectInputDevice8_Release(g_diDevices[g_diCount]);
-        g_diDevices[g_diCount] = NULL;
-    }
-    hwnd = GetForegroundWindow();
-    if (!hwnd) hwnd = GetActiveWindow();
-    IDirectInput8_EnumDevices(g_di8, DI8DEVCLASS_GAMECTRL, JoyEnumDirectInput, hwnd, DIEDFL_ATTACHEDONLY);
-}
-
-static unsigned JoyDirectInputState(unsigned id, JOYINFOEX *ji) {
-    DIJOYSTATE2 state;
-    LPDIRECTINPUTDEVICE8A device;
-    HRESULT hr;
-    DWORD pov;
-    unsigned i, buttons = 0;
-    if (id >= g_diCount || !ji) return 0;
-    device = g_diDevices[id];
-    hr = IDirectInputDevice8_Poll(device);
-    if (FAILED(hr)) {
-        IDirectInputDevice8_Acquire(device);
-        hr = IDirectInputDevice8_Poll(device);
-    }
-    if (FAILED(hr) || FAILED(IDirectInputDevice8_GetDeviceState(device, sizeof(state), &state))) return 0;
-    memset(ji, 0, sizeof(*ji));
-    ji->dwSize = sizeof(*ji);
-    ji->dwFlags = JOY_RETURNALL;
-#define DI_AXIS(axis, value) ((DWORD)(((value) <= g_diAxisMin[id][axis]) ? 0 : \
-    ((value) >= g_diAxisMax[id][axis]) ? 65535 : \
-    ((long long)((value) - g_diAxisMin[id][axis]) * 65535LL) / \
-    ((long long)g_diAxisMax[id][axis] - g_diAxisMin[id][axis])))
-    ji->dwXpos = DI_AXIS(0, state.lX);
-    ji->dwYpos = DI_AXIS(1, state.lY);
-    ji->dwZpos = DI_AXIS(2, state.lZ);
-    ji->dwRpos = DI_AXIS(3, state.lRx);
-    ji->dwUpos = DI_AXIS(4, state.lRy);
-    ji->dwVpos = DI_AXIS(5, state.lRz);
-#undef DI_AXIS
-    for (i = 0; i < 16; i++) if (state.rgbButtons[i] & 0x80) buttons |= (1u << i);
-    ji->dwButtons = buttons;
-    ji->dwButtonNumber = 0;
-    for (i = 0; i < 16; i++) if (buttons & (1u << i)) ji->dwButtonNumber++;
-    pov = state.rgdwPOV[0];
-    ji->dwPOV = pov == 0xffffffffu ? 0xffffu : pov;
-    if (pov != 0xffffffffu) {
-        int up = pov >= 31500 || pov <= 4500;
-        int right = pov >= 4500 && pov <= 13500;
-        int down = pov >= 13500 && pov <= 22500;
-        int left = pov >= 22500 && pov <= 31500;
-        if (up != down) ji->dwYpos = up ? 0 : 0xFFFF;
-        if (left != right) ji->dwXpos = left ? 0 : 0xFFFF;
-    }
-    return 1;
-}
-
-static void JoyIoInit(void) {
-    HMODULE xi = NULL;
-    const char *names[] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
-    int i;
-
-    g_joyIoInited = 1;
-    for (i = 0; i < 3; i++) {
-        xi = LoadLibraryA(names[i]);
-        if (xi) break;
-    }
-    if (!xi) {
-        Log("JoyBridge: XInput not found, leaving winmm untouched");
-        return;
-    }
-    g_xiGetState = (PF_XInputGetState)(void*)GetProcAddress(xi, (LPCSTR)"XInputGetState");
-    if (!g_xiGetState) {
-        Log("JoyBridge: XInputGetState missing in %s, leaving winmm untouched", names[i]);
-        g_xiGetState = NULL;
-        return;
-    }
-    g_joyIoOk = 1;
-    Log("JoyBridge: XInput ready via %s", names[i]);
-}
-
-/* id -> XInput user, refresh the connection state at most once per call */
-static unsigned JoyConnected(unsigned id) {
-    struct { unsigned reply; unsigned char pad[16]; } st;
-    unsigned r;
-
-    if (id >= 4) return 0;
-    memset(&st, 0, sizeof(st));
-    r = g_xiGetState(id, &st.pad);
-    g_joyPlugged[id] = (r == 0);
-    return (r == 0);
-}
-
-static unsigned __stdcall JoyGetCapsA(unsigned id, JOYCAPSA *jc, unsigned cb) {
-    unsigned nativeResult;
-    const WORD axisMax = 0xFFFF;
-    if (!g_joyIoInited) JoyIoInit();
-    if (g_joyIoOk && jc && cb >= sizeof(JOYCAPSA) && JoyConnected(id)) {
-        memset(jc, 0, sizeof(*jc));
-        jc->wMid = 0x28E;
-        jc->wPid = 0x2FF;
-        strcpy(jc->szPname, "Modern Controller (XInput)");
-        jc->wXmin = jc->wYmin = jc->wZmin = jc->wRmin = jc->wUmin = jc->wVmin = 0;
-        jc->wXmax = jc->wYmax = jc->wZmax = jc->wRmax = jc->wUmax = jc->wVmax = axisMax;
-        jc->wPeriodMin = jc->wPeriodMax = 10000;
-        jc->wMaxButtons = 32;
-        jc->wNumButtons = 16;
-        jc->wMaxAxes = jc->wNumAxes = 6;
-        return JOYERR_NOERROR;
-    }
-    nativeResult = g_winmmJoyGetCapsA ? g_winmmJoyGetCapsA(id, jc, cb) : JOYERR_UNPLUGGED;
-    if (nativeResult == JOYERR_NOERROR || !jc || cb < sizeof(JOYCAPSA)) return nativeResult;
-    JoyDirectInputScan();
-    if (id >= g_diCount) return nativeResult;
-    memset(jc, 0, sizeof(*jc));
-    jc->wMid = 0xFFFF;
-    jc->wPid = (WORD)(id + 1);
-    strcpy(jc->szPname, "DirectInput Controller");
-    jc->wXmin = jc->wYmin = jc->wZmin = jc->wRmin = jc->wUmin = jc->wVmin = 0;
-    jc->wXmax = jc->wYmax = jc->wZmax = jc->wRmax = jc->wUmax = jc->wVmax = axisMax;
-    jc->wMaxButtons = jc->wNumButtons = 16;
-    jc->wMaxAxes = jc->wNumAxes = 6;
-    jc->wCaps = 0;
-    return JOYERR_NOERROR;
-}
-
-static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
-    unsigned nativeResult;
-    DWORD requestedSize, requestedFlags;
-    if (!g_joyIoInited) JoyIoInit();
-    if (!g_joyIoOk || !ji || ji->dwSize < sizeof(JOYINFOEX) || !JoyConnected(id)) {
-        nativeResult = g_winmmJoyGetPosEx ? g_winmmJoyGetPosEx(id, ji) : JOYERR_UNPLUGGED;
-        if (nativeResult == JOYERR_NOERROR) return nativeResult;
-        if (!ji || ji->dwSize < sizeof(JOYINFOEX)) return nativeResult;
-        JoyDirectInputScan();
-        if (!JoyDirectInputState(id, ji)) return nativeResult;
-        return JOYERR_NOERROR;
-    }
-
-    requestedSize = ji->dwSize;
-    requestedFlags = ji->dwFlags;
-
-    struct XInputState {
-        DWORD packetNumber;
-        WORD buttons;
-        BYTE leftTrigger;
-        BYTE rightTrigger;
-        SHORT thumbLX;
-        SHORT thumbLY;
-        SHORT thumbRX;
-        SHORT thumbRY;
-    } state;
-    unsigned short btn;
-    short sLX, sLY, sRX, sRY;
-    unsigned char lt, rt;
-    unsigned dwButtons;
-
-    memset(&state, 0, sizeof(state));
-    if (g_xiGetState(id, &state) != 0) {
-        g_joyPlugged[id] = 0;
-        return JOYERR_UNPLUGGED;
-    }
-    btn = state.buttons;
-    lt = state.leftTrigger;
-    rt = state.rightTrigger;
-    sLX = state.thumbLX;
-    sLY = state.thumbLY;
-    sRX = state.thumbRX;
-    sRY = state.thumbRY;
-    g_joyPlugged[id] = 1;
-
-    /* Suppress the small idle drift allowed by XInput's stick hardware. */
-    if (sLX > -7849 && sLX < 7849) sLX = 0;
-    if (sLY > -7849 && sLY < 7849) sLY = 0;
-    if (sRX > -8689 && sRX < 8689) sRX = 0;
-    if (sRY > -8689 && sRY < 8689) sRY = 0;
-
-    memset(ji, 0, sizeof(*ji));
-    ji->dwSize = requestedSize;
-    ji->dwFlags = requestedFlags;
-
-    /* XInput button -> JOY_BUTTON1..16 bit order */
-    dwButtons = 0;
-    if (btn & XI_ID_VK_A)               dwButtons |= JOY_BUTTON1;
-    if (btn & XI_ID_VK_B)               dwButtons |= JOY_BUTTON2;
-    if (btn & XI_ID_VK_X)               dwButtons |= JOY_BUTTON3;
-    if (btn & XI_ID_VK_Y)               dwButtons |= JOY_BUTTON4;
-    if (btn & XI_ID_VK_START)           dwButtons |= JOY_BUTTON5;
-    if (btn & XI_ID_VK_BACK)            dwButtons |= JOY_BUTTON6;
-    if (btn & XI_ID_SHOULDER_L)         dwButtons |= JOY_BUTTON7;
-    if (btn & XI_ID_SHOULDER_R)         dwButtons |= JOY_BUTTON8;
-    if (btn & XI_ID_VK_STICK_L)         dwButtons |= JOY_BUTTON9;
-    if (btn & XI_ID_VK_STICK_R)         dwButtons |= JOY_BUTTON10;
-    if (btn & XI_ID_DPAD_UP)            dwButtons |= JOY_BUTTON11;
-    if (btn & XI_ID_DPAD_DOWN)          dwButtons |= JOY_BUTTON12;
-    if (btn & XI_ID_DPAD_LEFT)          dwButtons |= JOY_BUTTON13;
-    if (btn & XI_ID_DPAD_RIGHT)         dwButtons |= JOY_BUTTON14;
-    if (lt >= 0x40)                     dwButtons |= JOY_BUTTON15;
-    if (rt >= 0x40)                     dwButtons |= JOY_BUTTON16;
-
-    /* XInput Y is positive-up; WinMM Y positions increase downward. */
-    ji->dwXpos = (DWORD)((long)sLX + 32768L);
-    {
-        long y = 32768L - (long)sLY;
-        if (y < 0) y = 0;
-        if (y > 65535L) y = 65535L;
-        ji->dwYpos = (DWORD)y;
-    }
-    ji->dwZpos = (DWORD)((long)sRX + 32768L);
-    ji->dwRpos = (DWORD)((long)sRY + 32768L);
-    ji->dwUpos = (DWORD)(lt ? (unsigned)lt * 0x101 : 0);
-    ji->dwVpos = (DWORD)(rt ? (unsigned)rt * 0x101 : 0);
-    {
-        int up = (btn & XI_ID_DPAD_UP) != 0;
-        int down = (btn & XI_ID_DPAD_DOWN) != 0;
-        int left = (btn & XI_ID_DPAD_LEFT) != 0;
-        int right = (btn & XI_ID_DPAD_RIGHT) != 0;
-        if (up != down) ji->dwYpos = up ? 0 : 0xFFFF;
-        if (left != right) ji->dwXpos = left ? 0 : 0xFFFF;
-        if (up && right) ji->dwPOV = 4500;
-        else if (right && down) ji->dwPOV = 13500;
-        else if (down && left) ji->dwPOV = 22500;
-        else if (left && up) ji->dwPOV = 31500;
-        else if (up) ji->dwPOV = 0;
-        else if (right) ji->dwPOV = 9000;
-        else if (down) ji->dwPOV = 18000;
-        else if (left) ji->dwPOV = 27000;
-        else ji->dwPOV = 0xFFFF;
-    }
-    ji->dwButtons = dwButtons;
-    {
-        int n = 0;
-        while (dwButtons) { dwButtons &= (dwButtons - 1); n++; }
-        ji->dwButtonNumber = (DWORD)n;
-    }
-#ifdef SMD_DEBUG_BUILD
-    {   /* JoyDbg: also sample every 60th shim call (works at titles/menus,
-           the EventDispatchImpl sampler only runs in-game) */
-        static int joyDbgCalls = 0;
-        static int joyDbgN = 0;
-        joyDbgCalls++;
-        if (((joyDbgCalls % 60) == 0) && joyDbgN < 24) {
-            void *input = *(void**)(uintptr_t)0x46bbec;
-            joyDbgN++;
-            Log("JoyRaw: packet=%lu rawbtn=%04X lx=%d ly=%d rx=%d ry=%d trig=%u/%u -> pos=%u/%u btn=%08X pov=%u",
-                (unsigned long)state.packetNumber, (unsigned)state.buttons,
-                (int)sLX, (int)sLY, (int)sRX, (int)sRY, (unsigned)lt, (unsigned)rt,
-                (unsigned)ji->dwXpos, (unsigned)ji->dwYpos,
-                (unsigned)ji->dwButtons, (unsigned)ji->dwPOV);
-            Log("JoyDbg+s: shim=X(%u) Y(%u) btn=%08X pov=%d ; game=%p cnt=%d ids=[%d %d] "
-                "buf[X=%u Y=%u btn=%08X pov=%d] ctr[X=(%d+%d) Y=(%d+%d)] fl[10c=%02X%02X%02X%02X]",
-                (unsigned)ji->dwXpos, (unsigned)ji->dwYpos, (unsigned)ji->dwButtons, (int)ji->dwPOV,
-                input, input ? *(int *)((char *)input + 0x1078) : -1,
-                input ? *(int *)((char *)input + 0x107c) : -9,
-                input ? *(int *)((char *)input + 0x1080) : -9,
-                input ? *(unsigned *)((char *)input + 0x23f) : 0,
-                input ? *(unsigned *)((char *)input + 0x243) : 0,
-                input ? *(unsigned *)((char *)input + 0x257) : 0,
-                input ? *(unsigned *)((char *)input + 0x25f) : 0,
-                input ? *(int *)((char *)input + 0x3fb) : 0,
-                input ? *(int *)((char *)input + 0x3ff) : 0,
-                input ? *(int *)((char *)input + 0x403) : 0,
-                input ? *(int *)((char *)input + 0x407) : 0,
-                input ? ((unsigned char *)input)[0x10c] : 0,
-                input ? ((unsigned char *)input)[0x10d] : 0,
-                input ? ((unsigned char *)input)[0x10e] : 0,
-                input ? ((unsigned char *)input)[0x10f] : 0);
-        }
-    }
-#endif
-    return JOYERR_NOERROR;
-}
-
-static void PatchModernController(void) {
-    void **pPos = (void**)(uintptr_t)0x4532c4;
-    void **pCaps = (void**)(uintptr_t)0x4532c8;
-    DWORD old = 0, old2 = 0;
-
-    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
-        Log("JoyBridge: unexpected image base, skipped");
-        return;
-    }
-    if (!pPos || !pCaps || !*pPos || !*pCaps) {
-        Log("JoyBridge: winmm joystick entry points are unavailable");
-        return;
-    }
-    if (*pPos == (void *)&JoyGetPosEx && *pCaps == (void *)&JoyGetCapsA) return;
-    g_winmmJoyGetPosEx = (PF_JoyGetPosEx)*pPos;
-    g_winmmJoyGetCapsA = (PF_JoyGetCapsA)*pCaps;
-    if (!VirtualProtect(pPos, 8, PAGE_READWRITE, &old) ||
-        !VirtualProtect(pCaps, 8, PAGE_READWRITE, &old2)) {
-        Log("JoyBridge: VirtualProtect failed (err=%08X)", (unsigned)GetLastError());
-        if (old) VirtualProtect(pPos, 8, old, &old);
-        return;
-    }
-    *pPos = (void *)&JoyGetPosEx;
-    *pCaps = (void *)&JoyGetCapsA;
-    VirtualProtect(pPos, 8, old, &old);
-    VirtualProtect(pCaps, 8, old2, &old2);
-    Log("JoyBridge: dynamic XInput hotplug hooks installed; disconnected devices use winmm");
-}
-
-/* ------------------------------------------------------------------------
-   API census (diagnostic).
-   Windows 11 25H2's ddraw.dll does not expose IDirect3D7, so the game needs a
-   Direct3D7 -> Direct3D9 layer.  Before writing one, record exactly which
-   DirectDraw7 / Surface7 / Direct3D7 / Device7 methods (and which arguments)
-   the game uses.  Every vtable slot (except IUnknown) is replaced with a small
-   stub that logs the call and jumps to the original.  Run the game once on a
-   system where D3D7 works (e.g. Wine) and read "Api[...]" / "ApiSummary[...]"
-   lines in Smd_ddraw.log.
-   ------------------------------------------------------------------------ */
-#ifndef SMD_API_CENSUS
-#define SMD_API_CENSUS 0
-#endif
-static const int g_ApiCensus = SMD_API_CENSUS;
-
-enum { CEN_DD7 = 0, CEN_D3D7 = 1, CEN_DEV = 2, CEN_SURF = 3, CEN_IFACES = 4 };
-
-static const char *const g_cenIfName[CEN_IFACES] = { "dd7", "d3d7", "dev", "surf" };
-static const char *const g_cenNameDD7[30] = {
-    "QueryInterface", "AddRef", "Release", "Compact", "CreateClipper", "CreatePalette", "CreateSurface",
-    "DuplicateSurface", "EnumDisplayModes", "EnumSurfaces", "FlipToGDISurface", "GetCaps", "GetDisplayMode",
-    "GetFourCCCodes", "GetGDISurface", "GetMonitorFrequency", "GetScanLine", "GetVerticalBlankStatus",
-    "Initialize", "RestoreDisplayMode", "SetCooperativeLevel", "SetDisplayMode", "WaitForVerticalBlank",
-    "GetAvailableVidMem", "GetSurfaceFromDC", "RestoreAllSurfaces", "TestCooperativeLevel",
-    "GetDeviceIdentifier", "StartModeTest", "EvaluateMode"
-};
-static const char *const g_cenNameD3D7[8] = {
-    "QueryInterface", "AddRef", "Release", "EnumDevices", "CreateDevice", "CreateVertexBuffer",
-    "EnumZBufferFormats", "EvictManagedTextures"
-};
-static const char *const g_cenNameDev[49] = {
-    "QueryInterface", "AddRef", "Release", "GetCaps", "EnumTextureFormats", "BeginScene", "EndScene",
-    "GetDirect3D", "SetRenderTarget", "GetRenderTarget", "Clear", "SetTransform", "GetTransform",
-    "SetViewport", "MultiplyTransform", "GetViewport", "SetMaterial", "GetMaterial", "SetLight", "GetLight",
-    "SetRenderState", "GetRenderState", "BeginStateBlock", "EndStateBlock", "PreLoad", "DrawPrimitive",
-    "DrawIndexedPrimitive", "SetClipStatus", "GetClipStatus", "DrawPrimitiveStrided",
-    "DrawIndexedPrimitiveStrided", "DrawPrimitiveVB", "DrawIndexedPrimitiveVB", "ComputeSphereVisibility",
-    "GetTexture", "SetTexture", "GetTextureStageState", "SetTextureStageState", "ValidateDevice",
-    "ApplyStateBlock", "CaptureStateBlock", "DeleteStateBlock", "CreateStateBlock", "Load", "LightEnable",
-    "GetLightEnable", "SetClipPlane", "GetClipPlane", "GetInfo"
-};
-static const char *const g_cenNameSurf[49] = {
-    "QueryInterface", "AddRef", "Release", "AddAttachedSurface", "AddOverlayDirtyRect", "Blt", "BltBatch",
-    "BltFast", "DeleteAttachedSurface", "EnumAttachedSurfaces", "EnumOverlayZOrders", "Flip",
-    "GetAttachedSurface", "GetBltStatus", "GetCaps", "GetClipper", "GetColorKey", "GetDC", "GetFlipStatus",
-    "GetOverlayPosition", "GetPalette", "GetPixelFormat", "GetSurfaceDesc", "Initialize", "IsLost", "Lock",
-    "ReleaseDC", "Restore", "SetClipper", "SetColorKey", "SetOverlayPosition", "SetPalette", "Unlock",
-    "UpdateOverlay", "UpdateOverlayDisplay", "UpdateOverlayZOrder", "GetDDInterface", "PageLock",
-    "PageUnlock", "SetSurfaceDesc", "SetPrivateData", "GetPrivateData", "FreePrivateData",
-    "GetUniquenessValue", "ChangeUniquenessValue", "SetPriority", "GetPriority", "SetLOD", "GetLOD"
-};
-
-static const char *CensusName(unsigned iface, unsigned slot) {
-    switch (iface) {
-    case CEN_DD7:  return slot < 30 ? g_cenNameDD7[slot] : "?";
-    case CEN_D3D7: return slot < 8 ? g_cenNameD3D7[slot] : "?";
-    case CEN_DEV:  return slot < 49 ? g_cenNameDev[slot] : "?";
-    case CEN_SURF: return slot < 49 ? g_cenNameSurf[slot] : "?";
-    }
-    return "?";
-}
-
-#define CEN_SLOTS 64
-#define CEN_SEEN_N 8192
-typedef struct { unsigned tag, a[3]; unsigned char used; } CenSeen;
-
-static CRITICAL_SECTION g_cenCs;
-static unsigned g_cenCount[CEN_IFACES][CEN_SLOTS];
-static unsigned g_cenLogged[CEN_IFACES][CEN_SLOTS];
-static CenSeen g_cenSeen[CEN_SEEN_N];
-static unsigned g_cenSeenUsed = 0;
-static unsigned char *g_cenStubMem = NULL;
-static unsigned g_cenStubUsed = 0;
-static void **g_cenVt[16];
-static int g_cenVtN = 0;
-
-static void CensusInit(void) {
-    InitializeCriticalSection(&g_cenCs);
-}
-
-/* Called from the stubs: tag = (iface << 8) | slot, argp -> {this, arg1, arg2, ...}. */
-static void __cdecl CensusHit(unsigned tag, unsigned *argp) {
-    unsigned iface = tag >> 8, slot = tag & 0xff;
-    unsigned a1 = argp[1], a2 = argp[2], a3 = argp[3];
-    unsigned cap, h, i;
-
-    if (iface >= CEN_IFACES || slot >= CEN_SLOTS) return;
-    EnterCriticalSection(&g_cenCs);
-    g_cenCount[iface][slot]++;
-    cap = (iface == CEN_DEV && (slot == 20 || slot == 37)) ? 512 : 48;
-    if (g_cenLogged[iface][slot] < cap && g_cenSeenUsed < CEN_SEEN_N * 3 / 4) {
-        h = (tag * 2654435761u) ^ (a1 * 40503u) ^ (a2 * 2246822519u) ^ (a3 * 3266489917u);
-        for (i = h % CEN_SEEN_N; ; i = (i + 1) % CEN_SEEN_N) {
-            CenSeen *s = &g_cenSeen[i];
-            if (!s->used) {
-                s->used = 1;
-                s->tag = tag;
-                s->a[0] = a1; s->a[1] = a2; s->a[2] = a3;
-                g_cenSeenUsed++;
-                g_cenLogged[iface][slot]++;
-                Log("Api[%s] %s #%u this=%08X args=%08X %08X %08X %08X %08X", g_cenIfName[iface],
-                    CensusName(iface, slot), g_cenCount[iface][slot], argp[0], a1, a2, a3, argp[4], argp[5]);
-                break;
-            }
-            if (s->tag == tag && s->a[0] == a1 && s->a[1] == a2 && s->a[2] == a3) break;
-        }
-    }
-    LeaveCriticalSection(&g_cenCs);
-}
-
-static void CensusSummary(void) {
-    unsigned iface, slot;
-    if (!g_ApiCensus) return;
-    EnterCriticalSection(&g_cenCs);
-    for (iface = 0; iface < CEN_IFACES; iface++)
-        for (slot = 0; slot < CEN_SLOTS; slot++)
-            if (g_cenCount[iface][slot])
-                Log("ApiSummary[%s] %s calls=%u", g_cenIfName[iface], CensusName(iface, slot),
-                    g_cenCount[iface][slot]);
-    LeaveCriticalSection(&g_cenCs);
-}
-
-static void CensusSummaryPeriodic(void) {
-    static int n = 0;
-    if (g_ApiCensus && ++n % 6 == 0) CensusSummary();
-}
-
-/* pushad; pushfd; lea eax,[esp+28h]; push eax; push tag; call CensusHit;
-   add esp,8; popfd; popad; jmp [orig] */
-static void *CensusMakeStub(unsigned tag, void *orig) {
-    unsigned char *p;
-    DWORD rel, holder;
-
-    if (!g_cenStubMem) {
-        g_cenStubMem = (unsigned char*)VirtualAlloc(NULL, 16384, MEM_COMMIT | MEM_RESERVE,
-                                                     PAGE_EXECUTE_READWRITE);
-        g_cenStubUsed = 0;
-    }
-    if (!g_cenStubMem || g_cenStubUsed + 48 > 16384) return NULL;
-    p = g_cenStubMem + g_cenStubUsed;
-    g_cenStubUsed += 48;
-    p[0] = 0x60; p[1] = 0x9c;
-    p[2] = 0x8d; p[3] = 0x44; p[4] = 0x24; p[5] = 0x28;
-    p[6] = 0x50;
-    p[7] = 0x68; memcpy(p + 8, &tag, 4);
-    p[12] = 0xe8;
-    rel = (DWORD)(uintptr_t)&CensusHit - (DWORD)(uintptr_t)(p + 17);
-    memcpy(p + 13, &rel, 4);
-    p[17] = 0x83; p[18] = 0xc4; p[19] = 0x08;
-    p[20] = 0x9d; p[21] = 0x61;
-    p[22] = 0xff; p[23] = 0x25;
-    holder = (DWORD)(uintptr_t)(p + 32);
-    memcpy(p + 24, &holder, 4);
-    memcpy(p + 32, &orig, 4);
-    return p;
-}
-
-static int CensusVtblDone(void **vt) {
-    int i;
-    for (i = 0; i < g_cenVtN; i++)
-        if (g_cenVt[i] == vt) return 1;
-    if (g_cenVtN < 16) g_cenVt[g_cenVtN++] = vt;
-    return 0;
-}
-
-/* Replace slots 3..n-1 of vt (except those set in skip) with logging stubs. */
-static void CensusHookVtbl(void **vt, unsigned iface, unsigned n, unsigned long long skip) {
-    unsigned slot;
-    int ok = 0;
-
-    if (!g_ApiCensus || !vt || IsBadReadPtr(vt, n * sizeof(void*))) return;
-    if (CensusVtblDone(vt)) return;
-    for (slot = 3; slot < n; slot++) {
-        void *stub, *old = NULL;
-        if (skip & (1ULL << slot)) continue;
-        stub = CensusMakeStub((iface << 8) | slot, vt[slot]);
-        if (stub && PatchVtblSlot(&vt[slot], stub, &old)) ok++;
-    }
-    Log("Api: %s vtable %p hooked (%d slots)", g_cenIfName[iface], (void*)vt, ok);
-}
-
-static void CensusHookSurface(void *surf) {
-    if (g_ApiCensus && surf) CensusHookVtbl(*(void***)surf, CEN_SURF, 49, 0);
-}
-
-static void CensusHookDevice(void *dev) {
-    if (g_ApiCensus && dev) CensusHookVtbl(*(void***)dev, CEN_DEV, 49, 0);
-}
-
-typedef HRESULT (STDMETHODCALLTYPE *PF_CenCreateDevice)(void*, const GUID*, void*, void**);
-static PF_CenCreateDevice g_cenOrigCreateDevice = NULL;
-
-static HRESULT STDMETHODCALLTYPE CensusCreateDevice(void *self, const GUID *cls, void *surf, void **dev) {
-    HRESULT hr = g_cenOrigCreateDevice(self, cls, surf, dev);
-    Log("Api[d3d7] CreateDevice clsid=%08lX-%04X-%04X-%02X%02X surf=%p -> hr=%08X dev=%p",
-        cls ? (unsigned long)cls->Data1 : 0UL, cls ? (unsigned)cls->Data2 : 0U, cls ? (unsigned)cls->Data3 : 0U,
-        cls ? (unsigned)cls->Data4[0] : 0U, cls ? (unsigned)cls->Data4[1] : 0U, surf, (unsigned)hr,
-        (dev ? *dev : NULL));
-    if (hr >= 0 && dev && *dev) CensusHookDevice(*dev);
-    return hr;
-}
-
-static void CensusHookD3D7(void *d3d) {
-    void **vt, *old = NULL;
-
-    if (!g_ApiCensus || !d3d) return;
-    vt = *(void***)d3d;
-    if (!vt || IsBadReadPtr(vt, 8 * sizeof(void*))) return;
-    if (CensusVtblDone(vt)) return;
-    g_cenOrigCreateDevice = (PF_CenCreateDevice)vt[4];
-    PatchVtblSlot(&vt[4], (void*)&CensusCreateDevice, &old);
-    {
-        unsigned slot;
-        int ok = 0;
-        for (slot = 3; slot < 8; slot++) {
-            void *stub, *o = NULL;
-            if (slot == 4) continue;
-            stub = CensusMakeStub((CEN_D3D7 << 8) | slot, vt[slot]);
-            if (stub && PatchVtblSlot(&vt[slot], stub, &o)) ok++;
-        }
-        Log("Api: d3d7 vtable %p hooked (CreateDevice + %d slots)", (void*)vt, ok);
-    }
-}
-
-/* ==========================================================================
-   DirectDraw7 / Direct3D7 -> Direct3D9 emulation (SMD_D3D7_EMU)
-
-   Windows 11 (build 26200) ddraw.dll does not hand out IDirect3D7, so the game
-   cannot create its Direct3D7 device.  When that happens (or when the
-   environment variable SMD_FORCE_D3D7_EMU is set, for testing on Wine), this
-   layer replaces the system DirectDraw completely:
-
-     - surfaces live in system memory (DIB sections, so GetDC works)
-     - the Direct3D7 device is a Direct3D9 device on the game window
-     - textures are converted to A8R8G8B8 Direct3D9 textures on demand, the
-       DDCKEY_SRCBLT colour key becomes alpha 0
-     - Blt(primary <- back buffer) presents the Direct3D9 back buffer
-
-   Only the methods that the game was observed to call (see the "API census"
-   above) are implemented; everything else returns DDERR_UNSUPPORTED or an
-   harmless success.  The structure of the render/texture-stage state
-   translation follows the approach of DxWrapper's Dd7to9 (zlib license,
-   https://github.com/elishacloud/dxwrapper); no source from it is copied.
-   ========================================================================== */
-#ifndef SMD_D3D7_EMU
-#define SMD_D3D7_EMU 1
-#endif
-static const int g_D7Emu = SMD_D3D7_EMU;
-/* Create the Direct3D9 device as a pure device (no runtime state tracking/validation, no Get* calls): the
-   layer filters redundant state itself.  Falls back to a normal hardware device if it cannot be created. */
-static const int g_D7PureDevice = 1;
-
-static const GUID k_D7_IID_Unknown = { 0x00000000, 0x0000, 0x0000, { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
-static const GUID k_D7_IID_DD1  = { 0x6C14DB80, 0xA733, 0x11CE, { 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60 } };
-static const GUID k_D7_IID_DD2  = { 0xB3A6F3E0, 0x2B43, 0x11CF, { 0xA2, 0xDE, 0x00, 0xAA, 0x00, 0xB9, 0x33, 0x56 } };
-static const GUID k_D7_IID_DD3  = { 0x618F8AD4, 0x8B7A, 0x11D0, { 0x8F, 0xCC, 0x00, 0xC0, 0x4F, 0xD9, 0x18, 0x9D } };
-static const GUID k_D7_IID_DD4  = { 0x9C59509A, 0x39BD, 0x11D1, { 0x8C, 0x4A, 0x00, 0xC0, 0x4F, 0xD9, 0x30, 0xC5 } };
-static const GUID k_D7_IID_DD7  = { 0x15E65EC0, 0x3B9C, 0x11D2, { 0xB9, 0x2F, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B } };
-static const GUID k_D7_IID_D3D7 = { 0xF5049E77, 0x4861, 0x11D2, { 0xA4, 0x07, 0x00, 0xA0, 0xC9, 0x06, 0x29, 0xA8 } };
-static const GUID k_D7_IID_Dev7 = { 0xF5049E79, 0x4861, 0x11D2, { 0xA4, 0x07, 0x00, 0xA0, 0xC9, 0x06, 0x29, 0xA8 } };
-static const GUID k_D7_IID_Surf7 = { 0x06675A80, 0x3B9B, 0x11D2, { 0xB9, 0x2F, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B } };
-
-static int D7_Iid(const GUID *a, const GUID *b) { return memcmp(a, b, sizeof(GUID)) == 0; }
-
-typedef struct { DWORD m[4]; int sh[4], nb[4]; } D7Fmt;   /* R, G, B, A */
-
-typedef struct D7Surf {
-    void **vt;
-    LONG ref;
-    DWORD caps;
-    int w, h, bpp, pitch;
-    DDPIXELFORMAT pf;
-    D7Fmt fmt;
-    HBITMAP dib;
-    unsigned char *bits;
-    int ownBits;
-    HDC dc;
-    int hasKey;
-    DWORD keyLo;
-    int dirty;
-    int dpart;          /* dirty region is only drc (otherwise the whole surface) */
-    RECT drc;
-    int lockRO, lockFull;
-    RECT lockRc;
-    IDirect3DTexture9 *tex;
-    struct D7Surf *back, *zbuf;
-    int isPrimary;
-} D7Surf;
-
-typedef struct { void **vt; LONG ref; } D7Obj;
-
-static void *g_d7SurfVt[49];
-static void *g_d7DDVt[30];
-static void *g_d7D3DVt[8];
-static void *g_d7DevVt[49];
-static D7Obj g_d7DD  = { g_d7DDVt, 1 };
-static D7Obj g_d7D3D = { g_d7D3DVt, 1 };
-static D7Obj g_d7Dev = { g_d7DevVt, 1 };
-
-static struct {
-    int active;
-    HWND hwnd;
-    int dispW, dispH;
-    IDirect3D9 *d3d;
-    IDirect3DDevice9 *dev;
-    D3DPRESENT_PARAMETERS pp;
-    D7Surf *primary;
-    D7Surf *back3d;
-    D7Surf *curTex[8];
-    DWORD rs[256];
-    unsigned char rsSet[256];
-    DWORD tss[8][32];
-    unsigned char tssSet[8][32];
-    DWORD smp[8][16];
-    unsigned char smpSet[8][16];
-    int ckEnable;
-    unsigned warned;
-    unsigned surfLogged;
-    int inScene;
-    int fs;            /* borderless fullscreen (game asked for DDSCL_FULLSCREEN, i.e. WndMode=off) */
-    int fsCw, fsCh;    /* client size the borders were last painted for */
-    IDirect3DStateBlock9 *sb;   /* unused (kept for the device reset path) */
-    DWORD fvf;                  /* FVF currently set on the device (0 = unknown) */
-    void *devTex[8];            /* texture currently set on the device per stage */
-} g_d7 = { 0, NULL, 640, 480 };
-
-/* Device state shadows: skip SetFVF / SetTexture calls that would not change anything. */
-static void D7_SetFVF(DWORD fvf) {
-    if (!g_d7.dev || g_d7.fvf == fvf) return;
-    g_d7.fvf = fvf;
-    IDirect3DDevice9_SetFVF(g_d7.dev, fvf);
-}
-
-static void D7_SetTex(DWORD stage, IDirect3DTexture9 *t) {
-    if (!g_d7.dev || stage >= 8) return;
-    if (g_d7.devTex[stage] == (void*)t) return;
-    g_d7.devTex[stage] = (void*)t;
-    IDirect3DDevice9_SetTexture(g_d7.dev, stage, (IDirect3DBaseTexture9*)t);
-}
-
-static int D7_EmuActive(void) { return g_d7.active; }
-
-/* Draw batching (see D7_BatchFlush): consecutive sprite quads are collected here. */
-#define D7_BATCH_FVF 0x1c4
-#define D7_BATCH_MAX 1024
-static DWORD g_d7bv[D7_BATCH_MAX * 6 * 8];
-static unsigned g_d7bq = 0;
-static D7Surf *g_d7bTex = NULL;
-static IDirect3DTexture9 *D7_GetTex(D7Surf *s);
-static void D7_BatchFlush(void) {
-    IDirect3DDevice9 *dev = g_d7.dev;
-    IDirect3DTexture9 *tex = NULL;
-    unsigned quads = g_d7bq;
-    BatchFlushQuads();   /* called before every real state change: the queued sprites use the old state */
-    if (!quads) return;
-    g_d7bq = 0;
-    if (quads > D7_BATCH_MAX) quads = D7_BATCH_MAX;
-    if (!dev) {
-        g_d7bTex = NULL;
-        return;
-    }
-    if (g_d7bTex) tex = D7_GetTex(g_d7bTex);
-    D7_SetTex(0, tex);
-    D7_SetFVF(D7_BATCH_FVF);
-    IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, quads * 2,
-                                     g_d7bv, 8 * sizeof(DWORD));
-    g_d7bTex = NULL;
-}
-
-#define D7W_BACKLOCK   0x01u
-#define D7W_PRIMBLT    0x02u
-#define D7W_BACKBLT    0x04u
-
-static int D7_Warn(unsigned bit) {
-    if (g_d7.warned & bit) return 0;
-    g_d7.warned |= bit;
-    return 1;
-}
-
-/* ---- pixel format helpers ------------------------------------------- */
-static unsigned char g_d7Exp[9][256];   /* n-bit channel value -> 8-bit */
-static int g_d7ExpInit = 0;
-
-static void D7_FmtInit(D7Fmt *f, const DDPIXELFORMAT *pf) {
-    int i;
-    if (!g_d7ExpInit) {
-        int nb, v;
-        for (nb = 1; nb <= 8; nb++)
-            for (v = 0; v < (1 << nb); v++)
-                g_d7Exp[nb][v] = (unsigned char)((v * 255) / ((1 << nb) - 1));
-        g_d7ExpInit = 1;
-    }
-    memset(f, 0, sizeof(*f));
-    if (!pf) return;
-    f->m[0] = pf->dwRBitMask;
-    f->m[1] = pf->dwGBitMask;
-    f->m[2] = pf->dwBBitMask;
-    f->m[3] = (pf->dwFlags & DDPF_ALPHAPIXELS) ? pf->dwRGBAlphaBitMask : 0;
-    for (i = 0; i < 4; i++) {
-        if (f->m[i]) {
-            f->sh[i] = __builtin_ctz(f->m[i]);
-            f->nb[i] = __builtin_popcount(f->m[i] >> f->sh[i]);
-        }
-    }
-}
-
-static DWORD D7_ToArgb(const D7Fmt *f, DWORD raw) {
-    DWORD c[4];
-    int i;
-    for (i = 0; i < 4; i++) {
-        if (f->nb[i]) {
-            DWORD v = (raw & f->m[i]) >> f->sh[i];
-            c[i] = (f->nb[i] <= 8) ? (DWORD)g_d7Exp[f->nb[i]][v & 255u] : (v * 255u) / ((1u << f->nb[i]) - 1u);
-        } else {
-            c[i] = (i == 3) ? 255u : 0u;
-        }
-    }
-    return (c[3] << 24) | (c[0] << 16) | (c[1] << 8) | c[2];
-}
-
-static DWORD D7_FromArgb(const D7Fmt *f, DWORD argb) {
-    DWORD c[4], raw = 0;
-    int i;
-    c[0] = (argb >> 16) & 255; c[1] = (argb >> 8) & 255; c[2] = argb & 255; c[3] = argb >> 24;
-    for (i = 0; i < 4; i++) {
-        if (f->nb[i]) {
-            DWORD v = (c[i] * ((1u << f->nb[i]) - 1u) + 127u) / 255u;
-            raw |= (v << f->sh[i]) & f->m[i];
-        }
-    }
-    return raw;
-}
-
-static DWORD D7_Rd(const D7Surf *s, const unsigned char *p) {
-    if (s->bpp == 32) return *(const DWORD*)p;
-    if (s->bpp == 16) return *(const WORD*)p;
-    return 0;
-}
-
-static void D7_Wr(const D7Surf *s, unsigned char *p, DWORD v) {
-    if (s->bpp == 32) *(DWORD*)p = v;
-    else if (s->bpp == 16) *(WORD*)p = (WORD)v;
-}
-
-static int D7_FmtSame(const D7Surf *a, const D7Surf *b) {
-    return a->bpp == b->bpp && a->fmt.m[0] == b->fmt.m[0] && a->fmt.m[1] == b->fmt.m[1] &&
-           a->fmt.m[2] == b->fmt.m[2] && a->fmt.m[3] == b->fmt.m[3];
-}
-
-static void D7_SetPf(DDPIXELFORMAT *pf, DWORD flags, DWORD bpp, DWORD r, DWORD g, DWORD b, DWORD a) {
-    memset(pf, 0, sizeof(*pf));
-    pf->dwSize = sizeof(*pf);
-    pf->dwFlags = flags;
-    pf->dwRGBBitCount = bpp;
-    pf->dwRBitMask = r;
-    pf->dwGBitMask = g;
-    pf->dwBBitMask = b;
-    pf->dwRGBAlphaBitMask = a;
-}
-
-static const struct { DWORD flags, bpp, r, g, b, a; } k_d7Fmts[] = {
-    { DDPF_RGB | DDPF_ALPHAPIXELS, 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000 },
-    { DDPF_RGB,                    32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0 },
-    { DDPF_RGB,                    16, 0x0000F800, 0x000007E0, 0x0000001F, 0 },
-    { DDPF_RGB | DDPF_ALPHAPIXELS, 16, 0x00007C00, 0x000003E0, 0x0000001F, 0x00008000 },
-    { DDPF_RGB | DDPF_ALPHAPIXELS, 16, 0x00000F00, 0x000000F0, 0x0000000F, 0x0000F000 },
-    { DDPF_RGB,                    16, 0x00007C00, 0x000003E0, 0x0000001F, 0 }
-};
-
-/* ---- surfaces ------------------------------------------------------- */
-static D7Surf *D7_SurfNew(int w, int h, const DDPIXELFORMAT *pf, DWORD caps) {
-    D7Surf *s = (D7Surf*)calloc(1, sizeof(*s));
-    if (!s) return NULL;
-    s->vt = g_d7SurfVt;
-    s->ref = 1;
-    s->caps = caps;
-    s->w = w;
-    s->h = h;
-    if (pf) {
-        s->pf = *pf;
-        s->bpp = (pf->dwFlags & DDPF_RGB) ? (int)pf->dwRGBBitCount : 0;
-    }
-    D7_FmtInit(&s->fmt, pf);
-    if (s->bpp == 16 || s->bpp == 32) {
-        struct { BITMAPINFOHEADER hdr; DWORD m[3]; } bi;
-        void *bits = NULL;
-        memset(&bi, 0, sizeof(bi));
-        bi.hdr.biSize = sizeof(BITMAPINFOHEADER);
-        bi.hdr.biWidth = w;
-        bi.hdr.biHeight = -h;
-        bi.hdr.biPlanes = 1;
-        bi.hdr.biBitCount = (WORD)s->bpp;
-        bi.hdr.biCompression = BI_BITFIELDS;
-        bi.m[0] = pf->dwRBitMask; bi.m[1] = pf->dwGBitMask; bi.m[2] = pf->dwBBitMask;
-        s->dib = CreateDIBSection(NULL, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, NULL, 0);
-        s->bits = (unsigned char*)bits;
-        s->pitch = ((w * s->bpp + 31) / 32) * 4;
-        if (!s->bits) {
-            s->dib = NULL;
-            s->bits = (unsigned char*)calloc(1, (size_t)s->pitch * (size_t)h);
-            s->ownBits = 1;
-        }
-        if (!s->bits) { free(s); return NULL; }
-    }
-    s->dirty = 1;
-    return s;
-}
-
-static ULONG STDMETHODCALLTYPE ES_AddRef(void *self) {
-    return (ULONG)InterlockedIncrement(&((D7Surf*)self)->ref);
-}
-
-static ULONG STDMETHODCALLTYPE ES_Release(void *self) {
-    D7Surf *s = (D7Surf*)self;
-    LONG r = InterlockedDecrement(&s->ref);
-    int i;
-    if (r > 0) return (ULONG)r;
-    if (g_d7bTex == s) D7_BatchFlush();
-    if (g_d7.primary == s) g_d7.primary = NULL;
-    if (g_d7.back3d == s) g_d7.back3d = NULL;
-    for (i = 0; i < 8; i++)
-        if (g_d7.curTex[i] == s) g_d7.curTex[i] = NULL;
-    if (s->back) ES_Release(s->back);
-    if (s->zbuf) ES_Release(s->zbuf);
-    if (s->dc) DeleteDC(s->dc);
-    if (s->dib) DeleteObject(s->dib);
-    else if (s->ownBits) free(s->bits);
-    if (s->tex) IDirect3DTexture9_Release(s->tex);
-    free(s);
-    return 0;
-}
-
-/* Marks (part of) a surface as changed so that its texture is refreshed; partial marks are merged. */
-static void D7_MarkDirty(D7Surf *s, const RECT *r) {
-    RECT c;
-    if (!r) {
-        s->dirty = 1;
-        s->dpart = 0;
-        return;
-    }
-    c = *r;
-    if (c.left < 0) c.left = 0;
-    if (c.top < 0) c.top = 0;
-    if (c.right > s->w) c.right = s->w;
-    if (c.bottom > s->h) c.bottom = s->h;
-    if (c.right <= c.left || c.bottom <= c.top) return;
-    if (!s->dirty) {
-        s->dirty = 1;
-        s->dpart = 1;
-        s->drc = c;
-    } else if (s->dpart) {
-        if (c.left < s->drc.left) s->drc.left = c.left;
-        if (c.top < s->drc.top) s->drc.top = c.top;
-        if (c.right > s->drc.right) s->drc.right = c.right;
-        if (c.bottom > s->drc.bottom) s->drc.bottom = c.bottom;
-    }
-}
-
-/* 16-bit raw value -> A8R8G8B8 lookup table per pixel format (built on first use). */
-static const DWORD *D7_Lut16(const D7Fmt *f) {
-    static struct { DWORD m[4]; DWORD *t; } cache[4];
-    static int ncache = 0;
-    int i;
-    DWORD *t, v;
-
-    for (i = 0; i < ncache; i++)
-        if (cache[i].m[0] == f->m[0] && cache[i].m[1] == f->m[1] &&
-            cache[i].m[2] == f->m[2] && cache[i].m[3] == f->m[3])
-            return cache[i].t;
-    if (ncache >= 4) return NULL;
-    t = (DWORD*)malloc(65536 * sizeof(DWORD));
-    if (!t) return NULL;
-    for (v = 0; v < 65536; v++) t[v] = D7_ToArgb(f, v);
-    for (i = 0; i < 4; i++) cache[ncache].m[i] = f->m[i];
-    cache[ncache].t = t;
-    ncache++;
-    return t;
-}
-
-/* Direct3D9 texture for a surface (A8R8G8B8, colour key -> alpha 0). */
-static IDirect3DTexture9 *D7_GetTex(D7Surf *s) {
-    D3DLOCKED_RECT lr;
-    int x, y, bytes, n, partial;
-    RECT rc;
-    const DWORD *lut;
-
-    if (!g_d7.dev || !s->bits || (s->bpp != 16 && s->bpp != 32)) return NULL;
-    if (!s->tex) {
-        HRESULT hr = IDirect3DDevice9_CreateTexture(g_d7.dev, (UINT)s->w, (UINT)s->h, 1, 0,
-                                                    D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &s->tex, NULL);
-        if (FAILED(hr)) {
-            Log("D3D7 emu: CreateTexture %dx%d failed hr=%08X", s->w, s->h, (unsigned)hr);
-            s->tex = NULL;
-            return NULL;
-        }
-        s->dirty = 1;
-        s->dpart = 0;
-    }
-    if (s->dirty) {
-        bytes = s->bpp / 8;
-        partial = s->dpart;
-        rc.left = 0; rc.top = 0; rc.right = s->w; rc.bottom = s->h;
-        if (partial) rc = s->drc;
-        n = rc.right - rc.left;
-        lut = (s->bpp == 16) ? D7_Lut16(&s->fmt) : NULL;
-        if (SUCCEEDED(IDirect3DTexture9_LockRect(s->tex, 0, &lr, partial ? &rc : NULL, 0))) {
-            for (y = rc.top; y < rc.bottom; y++) {
-                const unsigned char *sp = s->bits + (size_t)y * (size_t)s->pitch + (size_t)rc.left * (size_t)bytes;
-                DWORD *dp = (DWORD*)((unsigned char*)lr.pBits + (size_t)(y - rc.top) * (size_t)lr.Pitch);
-                if (s->bpp == 32 && s->fmt.m[0] == 0x00FF0000u && s->fmt.m[1] == 0x0000FF00u &&
-                    s->fmt.m[2] == 0x000000FFu && (s->fmt.m[3] == 0 || s->fmt.m[3] == 0xFF000000u)) {
-                    if (!s->hasKey && s->fmt.m[3] == 0xFF000000u) {
-                        memcpy(dp, sp, (size_t)n * sizeof(DWORD));
-                        continue;
-                    }
-                    /* fast path: A8R8G8B8 / X8R8G8B8 */
-                    DWORD m3 = s->fmt.m[3], addA = m3 ? 0u : 0xFF000000u, keyv = s->keyLo & ~m3;
-                    const DWORD *sd = (const DWORD*)sp;
-                    for (x = 0; x < n; x++) {
-                        DWORD raw = sd[x];
-                        DWORD argb = raw | addA;
-                        if (s->hasKey && (raw & ~m3) == keyv) argb &= 0x00FFFFFFu;
-                        dp[x] = argb;
-                    }
-                    continue;
-                }
-                for (x = 0; x < n; x++) {
-                    DWORD raw = D7_Rd(s, sp + x * bytes);
-                    DWORD argb = lut ? lut[raw & 0xFFFFu] : D7_ToArgb(&s->fmt, raw);
-                    if (s->hasKey && (raw & ~s->fmt.m[3]) == (s->keyLo & ~s->fmt.m[3]))
-                        argb &= 0x00FFFFFFu;
-                    dp[x] = argb;
-                }
-            }
-            IDirect3DTexture9_UnlockRect(s->tex, 0);
-        }
-        s->dirty = 0;
-        s->dpart = 0;
-    }
-    return s->tex;
-}
-
-static void D7_Blit(D7Surf *d, const RECT *drIn, D7Surf *s, const RECT *srIn, int useKey) {
-    RECT dr, sr;
-    int sw, sh, dw, dh, x, y, sb, db, same;
-
-    if (!d->bits || !s->bits || d->bpp < 16 || s->bpp < 16) return;
-    if (drIn) dr = *drIn; else { dr.left = 0; dr.top = 0; dr.right = d->w; dr.bottom = d->h; }
-    if (srIn) sr = *srIn; else { sr.left = 0; sr.top = 0; sr.right = s->w; sr.bottom = s->h; }
-    sw = sr.right - sr.left; sh = sr.bottom - sr.top;
-    dw = dr.right - dr.left; dh = dr.bottom - dr.top;
-    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
-    sb = s->bpp / 8; db = d->bpp / 8;
-    same = D7_FmtSame(d, s);
-    for (y = 0; y < dh; y++) {
-        int dy = dr.top + y, sy = sr.top + (int)((long long)y * sh / dh);
-        unsigned char *dp;
-        const unsigned char *sp;
-        if (dy < 0 || dy >= d->h || sy < 0 || sy >= s->h) continue;
-        dp = d->bits + (size_t)dy * (size_t)d->pitch;
-        sp = s->bits + (size_t)sy * (size_t)s->pitch;
-        if (same && !useKey && sw == dw && dr.left >= 0 && dr.left + dw <= d->w &&
-            sr.left >= 0 && sr.left + sw <= s->w) {
-            memcpy(dp + dr.left * db, sp + sr.left * sb, (size_t)dw * (size_t)db);
-            continue;
-        }
-        for (x = 0; x < dw; x++) {
-            int dx = dr.left + x, sx = sr.left + (int)((long long)x * sw / dw);
-            DWORD raw;
-            if (dx < 0 || dx >= d->w || sx < 0 || sx >= s->w) continue;
-            raw = D7_Rd(s, sp + sx * sb);
-            if (useKey && s->hasKey && (raw & ~s->fmt.m[3]) == (s->keyLo & ~s->fmt.m[3])) continue;
-            if (!same) raw = D7_FromArgb(&d->fmt, D7_ToArgb(&s->fmt, raw));
-            D7_Wr(d, dp + dx * db, raw);
-        }
-    }
-    D7_MarkDirty(d, &dr);
-}
-
-static void D7_Fill(D7Surf *d, const RECT *rIn, DWORD raw) {
-    RECT r;
-    int x, y, db;
-    if (!d->bits || d->bpp < 16) return;
-    if (rIn) r = *rIn; else { r.left = 0; r.top = 0; r.right = d->w; r.bottom = d->h; }
-    if (r.left < 0) r.left = 0;
-    if (r.top < 0) r.top = 0;
-    if (r.right > d->w) r.right = d->w;
-    if (r.bottom > d->h) r.bottom = d->h;
-    db = d->bpp / 8;
-    for (y = r.top; y < r.bottom; y++) {
-        unsigned char *dp = d->bits + (size_t)y * (size_t)d->pitch;
-        for (x = r.left; x < r.right; x++) D7_Wr(d, dp + x * db, raw);
-    }
-    D7_MarkDirty(d, &r);
-}
-
-/* ---- Direct3D9 device ------------------------------------------------ */
-typedef IDirect3D9 *(WINAPI *PF_D7Create9)(UINT);
-
-static void D7_ApplyRS(DWORD st, DWORD v) {
-    if (st < 256 && g_d7.rsSet[st] && g_d7.rs[st] == v) return;
-    D7_BatchFlush();
-    if (st < 256) { g_d7.rs[st] = v; g_d7.rsSet[st] = 1; }
-    IDirect3DDevice9_SetRenderState(g_d7.dev, (D3DRENDERSTATETYPE)st, v);
-}
-
-static void D7_ApplyTss(DWORD stage, DWORD type, DWORD v) {
-    if (stage < 8 && type < 32 && g_d7.tssSet[stage][type] && g_d7.tss[stage][type] == v) return;
-    D7_BatchFlush();
-    if (stage < 8 && type < 32) { g_d7.tss[stage][type] = v; g_d7.tssSet[stage][type] = 1; }
-    IDirect3DDevice9_SetTextureStageState(g_d7.dev, stage, (D3DTEXTURESTAGESTATETYPE)type, v);
-}
-
-static void D7_ApplySamp(DWORD stage, DWORD type, DWORD v) {
-    if (stage < 8 && type < 16 && g_d7.smpSet[stage][type] && g_d7.smp[stage][type] == v) return;
-    D7_BatchFlush();
-    if (stage < 8 && type < 16) { g_d7.smp[stage][type] = v; g_d7.smpSet[stage][type] = 1; }
-    IDirect3DDevice9_SetSamplerState(g_d7.dev, stage, (D3DSAMPLERSTATETYPE)type, v);
-}
-
-static void D7_Reapply(void) {
-    DWORD i, j;
-    g_d7.fvf = 0;
-    memset(g_d7.devTex, 0, sizeof(g_d7.devTex));
-    for (i = 0; i < 256; i++) if (g_d7.rsSet[i]) IDirect3DDevice9_SetRenderState(g_d7.dev, (D3DRENDERSTATETYPE)i, g_d7.rs[i]);
-    for (i = 0; i < 8; i++) {
-        for (j = 0; j < 32; j++) if (g_d7.tssSet[i][j]) IDirect3DDevice9_SetTextureStageState(g_d7.dev, i, (D3DTEXTURESTAGESTATETYPE)j, g_d7.tss[i][j]);
-        for (j = 0; j < 16; j++) if (g_d7.smpSet[i][j]) IDirect3DDevice9_SetSamplerState(g_d7.dev, i, (D3DSAMPLERSTATETYPE)j, g_d7.smp[i][j]);
-        if (g_d7.curTex[i]) {
-            IDirect3DTexture9 *t = D7_GetTex(g_d7.curTex[i]);
-            D7_SetTex(i, t);
-        }
-    }
-}
-
-/* Turn the game window into a borderless window covering its monitor. */
-static void D7_SetupBorderless(HWND hwnd) {
-    MONITORINFO mi;
-    HMONITOR mon;
-    DWORD style;
-
-    if (!hwnd) return;
-    mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
-    memset(&mi, 0, sizeof(mi));
-    mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoA(mon, &mi)) return;
-    style = (DWORD)GetWindowLongA(hwnd, GWL_STYLE);
-    style &= ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
-    style |= WS_POPUP | WS_VISIBLE;
-    SetWindowLongA(hwnd, GWL_STYLE, (LONG)style);
-    SetWindowLongA(hwnd, GWL_EXSTYLE,
-                   (LONG)((DWORD)GetWindowLongA(hwnd, GWL_EXSTYLE) & ~(WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME)));
-    SetClassLongA(hwnd, GCL_HBRBACKGROUND, (LONG)(LONG_PTR)GetStockObject(BLACK_BRUSH));
-    SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
-                 mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
-                 SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-    g_d7.fsCw = g_d7.fsCh = 0;
-    Log("D3D7 emu: borderless fullscreen window %ldx%ld at (%ld,%ld)",
-        (long)(mi.rcMonitor.right - mi.rcMonitor.left), (long)(mi.rcMonitor.bottom - mi.rcMonitor.top),
-        (long)mi.rcMonitor.left, (long)mi.rcMonitor.top);
-}
-
-/* Bring the game window to the foreground (Windows refuses a plain SetForegroundWindow
-   from a process that is not in the foreground, so attach to the foreground thread's
-   input queue first and fall back to an Alt key tap). */
-static void D7_BringToFront(HWND hwnd) {
-    HWND fg;
-    DWORD fgThread = 0, myThread;
-    int attached = 0;
-
-    if (!hwnd || !IsWindow(hwnd)) return;
-    if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
-    fg = GetForegroundWindow();
-    if (fg == hwnd) return;
-    myThread = GetCurrentThreadId();
-    if (fg) fgThread = GetWindowThreadProcessId(fg, NULL);
-    if (fgThread && fgThread != myThread)
-        attached = AttachThreadInput(myThread, fgThread, TRUE) ? 1 : 0;
-    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    BringWindowToTop(hwnd);
-    SetForegroundWindow(hwnd);
-    SetActiveWindow(hwnd);
-    SetFocus(hwnd);
-    if (attached) AttachThreadInput(myThread, fgThread, FALSE);
-    if (GetForegroundWindow() != hwnd) {
-        keybd_event(VK_MENU, 0, 0, 0);
-        keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
-        SetForegroundWindow(hwnd);
-    }
-    Log("Foreground: window %p %s", (void*)hwnd, GetForegroundWindow() == hwnd ? "is now in the foreground" : "could not be brought to the foreground");
-}
-
-/* Switch the game window between borderless fullscreen and a normal window whose
-   client area is the virtual display size. */
-static void D7_SetWindowed(int windowed) {
-    HWND hwnd = g_d7.hwnd;
-    MONITORINFO mi;
-    RECT r;
-    DWORD style, ex;
-    int w, h, x, y;
-
-    if (!hwnd || !g_d7.dev) return;
-    if (!windowed) {
-        g_d7.fs = 1;
-        D7_SetupBorderless(hwnd);
-    } else {
-        g_d7.fs = 0;
-        style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
-        ex = ((DWORD)GetWindowLongA(hwnd, GWL_EXSTYLE) & ~(DWORD)WS_EX_TOPMOST) | WS_EX_WINDOWEDGE;
-        r.left = 0; r.top = 0; r.right = g_d7.dispW; r.bottom = g_d7.dispH;
-        AdjustWindowRectEx(&r, style, FALSE, ex);
-        w = r.right - r.left;
-        h = r.bottom - r.top;
-        memset(&mi, 0, sizeof(mi));
-        mi.cbSize = sizeof(mi);
-        if (GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
-            x = mi.rcMonitor.left + ((mi.rcMonitor.right - mi.rcMonitor.left) - w) / 2;
-            y = mi.rcMonitor.top + ((mi.rcMonitor.bottom - mi.rcMonitor.top) - h) / 2;
-        } else {
-            x = 100; y = 100;
-        }
-        SetWindowLongA(hwnd, GWL_STYLE, (LONG)style);
-        SetWindowLongA(hwnd, GWL_EXSTYLE, (LONG)ex);
-        SetWindowPos(hwnd, HWND_NOTOPMOST, x, y, w, h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-        Log("D3D7 emu: normal window %dx%d at (%d,%d)", w, h, x, y);
-    }
-    g_d7.fsCw = g_d7.fsCh = 0;
-    InvalidateRect(hwnd, NULL, TRUE);
-}
-
-/* Puts the device and the state shadows into the same, known state (all states the layer touches). */
-static void D7_SeedState(void) {
-    IDirect3DDevice9 *dev = g_d7.dev;
-    static const DWORD rsSeed[][2] = {
-        { D3DRS_ZENABLE, FALSE }, { D3DRS_ZWRITEENABLE, TRUE }, { D3DRS_LIGHTING, FALSE },
-        { D3DRS_CULLMODE, D3DCULL_CCW }, { D3DRS_ALPHABLENDENABLE, FALSE }, { D3DRS_FOGENABLE, FALSE },
-        { D3DRS_SPECULARENABLE, FALSE }, { D3DRS_STENCILENABLE, FALSE }, { D3DRS_SCISSORTESTENABLE, FALSE },
-        { D3DRS_ALPHATESTENABLE, FALSE }, { D3DRS_ALPHAFUNC, D3DCMP_ALWAYS }, { D3DRS_ALPHAREF, 0 }
-    };
-    static const DWORD tssSeed[][3] = {
-        { 0, D3DTSS_COLOROP, D3DTOP_MODULATE }, { 0, D3DTSS_COLORARG1, D3DTA_TEXTURE },
-        { 0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1 }, { 0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE },
-        { 1, D3DTSS_COLOROP, D3DTOP_DISABLE }, { 1, D3DTSS_ALPHAOP, D3DTOP_DISABLE }
-    };
-    static const DWORD smpSeed[][2] = {
-        { D3DSAMP_MINFILTER, D3DTEXF_POINT }, { D3DSAMP_MAGFILTER, D3DTEXF_POINT },
-        { D3DSAMP_MIPFILTER, D3DTEXF_NONE }, { D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP },
-        { D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP }
-    };
-    unsigned i;
-
-    if (!dev) return;
-    for (i = 0; i < sizeof(rsSeed) / sizeof(rsSeed[0]); i++) {
-        IDirect3DDevice9_SetRenderState(dev, (D3DRENDERSTATETYPE)rsSeed[i][0], rsSeed[i][1]);
-        g_d7.rs[rsSeed[i][0]] = rsSeed[i][1];
-        g_d7.rsSet[rsSeed[i][0]] = 1;
-    }
-    for (i = 0; i < sizeof(tssSeed) / sizeof(tssSeed[0]); i++) {
-        IDirect3DDevice9_SetTextureStageState(dev, tssSeed[i][0], (D3DTEXTURESTAGESTATETYPE)tssSeed[i][1], tssSeed[i][2]);
-        g_d7.tss[tssSeed[i][0]][tssSeed[i][1]] = tssSeed[i][2];
-        g_d7.tssSet[tssSeed[i][0]][tssSeed[i][1]] = 1;
-    }
-    for (i = 0; i < sizeof(smpSeed) / sizeof(smpSeed[0]); i++) {
-        IDirect3DDevice9_SetSamplerState(dev, 0, (D3DSAMPLERSTATETYPE)smpSeed[i][0], smpSeed[i][1]);
-        g_d7.smp[0][smpSeed[i][0]] = smpSeed[i][1];
-        g_d7.smpSet[0][smpSeed[i][0]] = 1;
-    }
-    g_d7.fvf = 0;
-    memset(g_d7.devTex, 0, sizeof(g_d7.devTex));
-}
-
-static int D7_InitD3D9(void) {
-    HMODULE m;
-    PF_D7Create9 create9;
-    D3DPRESENT_PARAMETERS pp;
-    HRESULT hr;
-    HWND hwnd = g_d7.hwnd ? g_d7.hwnd : GetActiveWindow();
-
-    if (g_d7.dev) return 1;
-    m = LoadLibraryA("d3d9.dll");
-    create9 = m ? (PF_D7Create9)(void*)GetProcAddress(m, "Direct3DCreate9") : NULL;
-    if (!create9) { Log("D3D7 emu: d3d9.dll / Direct3DCreate9 not available"); return 0; }
-    g_d7.d3d = create9(D3D_SDK_VERSION);
-    if (!g_d7.d3d) { Log("D3D7 emu: Direct3DCreate9 failed"); return 0; }
-    if (!hwnd) { Log("D3D7 emu: no window"); return 0; }
-    if (g_d7.fs) D7_SetupBorderless(hwnd);
-    memset(&pp, 0, sizeof(pp));
-    pp.BackBufferWidth = (UINT)g_d7.dispW;
-    pp.BackBufferHeight = (UINT)g_d7.dispH;
-    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
-    pp.BackBufferCount = 1;
-    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    pp.hDeviceWindow = hwnd;
-    pp.Windowed = TRUE;
-    pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
-    hr = D3DERR_NOTAVAILABLE;
-    if (g_D7PureDevice) {
-        hr = IDirect3D9_CreateDevice(g_d7.d3d, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
-                                     D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_PUREDEVICE | D3DCREATE_FPU_PRESERVE,
-                                     &pp, &g_d7.dev);
-        Log("D3D7 emu: CreateDevice(pure device) hr=%08X", (unsigned)hr);
-        if (FAILED(hr)) g_d7.dev = NULL;
-    }
-    if (FAILED(hr)) {
-        hr = IDirect3D9_CreateDevice(g_d7.d3d, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
-                                     D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_FPU_PRESERVE, &pp, &g_d7.dev);
-    }
-    if (FAILED(hr)) {
-        Log("D3D7 emu: CreateDevice(HW vp) hr=%08X, retrying with software vertex processing", (unsigned)hr);
-        hr = IDirect3D9_CreateDevice(g_d7.d3d, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
-                                     D3DCREATE_SOFTWARE_VERTEXPROCESSING | D3DCREATE_FPU_PRESERVE, &pp, &g_d7.dev);
-    }
-    if (FAILED(hr)) {
-        Log("D3D7 emu: Direct3D9 CreateDevice failed hr=%08X", (unsigned)hr);
-        g_d7.dev = NULL;
-        return 0;
-    }
-    g_d7.pp = pp;
-    g_d7.rs[D3DRS_ALPHAFUNC] = D3DCMP_ALWAYS;
-    g_d7.tss[0][D3DTSS_ALPHAOP] = D3DTOP_SELECTARG1;
-    g_d7.tss[0][D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
-    g_d7.tss[0][D3DTSS_ALPHAARG2] = D3DTA_CURRENT;
-    IDirect3DDevice9_SetRenderState(g_d7.dev, D3DRS_ZENABLE, FALSE);
-    IDirect3DDevice9_SetRenderState(g_d7.dev, D3DRS_LIGHTING, FALSE);
-    g_d7.sb = NULL;
-    D7_SeedState();
-    Log("D3D7 emu: Direct3D9 device created (%dx%d, hwnd=%p)", g_d7.dispW, g_d7.dispH, (void*)hwnd);
-    D7_BringToFront(hwnd);
-    return 1;
-}
-
-/* Present; in borderless fullscreen the back buffer is stretched to the client area
-   keeping its aspect ratio (black bars). */
-static HRESULT D7_PresentFS(void) {
-    RECT cr, dr;
-    int cw, ch, w, h;
-
-    if (!g_d7.fs || !g_d7.hwnd || !GetClientRect(g_d7.hwnd, &cr))
-        return IDirect3DDevice9_Present(g_d7.dev, NULL, NULL, NULL, NULL);
-    cw = cr.right - cr.left;
-    ch = cr.bottom - cr.top;
-    if (cw <= 0 || ch <= 0 || g_d7.dispW <= 0 || g_d7.dispH <= 0)
-        return IDirect3DDevice9_Present(g_d7.dev, NULL, NULL, NULL, NULL);
-    if (cw != g_d7.fsCw || ch != g_d7.fsCh) {
-        HDC dc = GetDC(g_d7.hwnd);
-        if (dc) {
-            FillRect(dc, &cr, (HBRUSH)GetStockObject(BLACK_BRUSH));
-            ReleaseDC(g_d7.hwnd, dc);
-        }
-        g_d7.fsCw = cw;
-        g_d7.fsCh = ch;
-    }
-    if ((long long)cw * g_d7.dispH <= (long long)ch * g_d7.dispW) {
-        w = cw;
-        h = (int)((long long)cw * g_d7.dispH / g_d7.dispW);
-    } else {
-        h = ch;
-        w = (int)((long long)ch * g_d7.dispW / g_d7.dispH);
-    }
-    dr.left = (cw - w) / 2;
-    dr.top = (ch - h) / 2;
-    dr.right = dr.left + w;
-    dr.bottom = dr.top + h;
-    return IDirect3DDevice9_Present(g_d7.dev, NULL, &dr, NULL, NULL);
-}
-
-static void D7_Present(void) {
-    HRESULT hr;
-    if (!g_d7.dev) return;
-    hr = D7_PresentFS();
-    if (hr == D3DERR_DEVICELOST || hr == D3DERR_DEVICENOTRESET) {
-        hr = IDirect3DDevice9_TestCooperativeLevel(g_d7.dev);
-        if (hr == D3DERR_DEVICENOTRESET) {
-            if (g_d7.sb) {
-                IDirect3DStateBlock9_Release(g_d7.sb);
-                g_d7.sb = NULL;
-            }
-            if (SUCCEEDED(IDirect3DDevice9_Reset(g_d7.dev, &g_d7.pp))) {
-                D7_Reapply();
-                Log("D3D7 emu: device reset");
-            }
-        }
-    }
-}
-
-/* ---- software surface -> Direct3D9 back buffer ------------------------
-   Used for Blt/BltFast into the 3D back buffer and for Blt(primary <- 2D
-   surface).  The source surface becomes a texture (colour key -> alpha 0,
-   see D7_GetTex) and is drawn as a pre-transformed quad.  The complete
-   device state is captured in a state block first and restored afterwards,
-   so the game's own render/texture-stage state is not disturbed. */
-typedef struct { float x, y, z, rhw; DWORD color; float u, v; } D7Quad;
-#define D7_QUAD_FVF (D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1)
-
-static int D7_BltToDev(const RECT *drIn, D7Surf *s, const RECT *srIn, int useKey) {
-    RECT dr, sr;
-    IDirect3DTexture9 *t;
-    IDirect3DDevice9 *dev = g_d7.dev;
-    D7Quad q[4];
-    float x0, y0, x1, y1, u0, v0, u1, v1;
-    int scene = g_d7.inScene;
-    int i;
-    enum { NRS = 12 };
-    static const DWORD rsId[NRS] = {
-        D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_LIGHTING, D3DRS_CULLMODE, D3DRS_ALPHABLENDENABLE,
-        D3DRS_FOGENABLE, D3DRS_SPECULARENABLE, D3DRS_STENCILENABLE, D3DRS_SCISSORTESTENABLE,
-        D3DRS_ALPHATESTENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF
-    };
-    DWORD rsVal[NRS], rsOld[NRS], tssOld[6], smpOld[5];
-    static const DWORD tssStage[6] = { 0, 0, 0, 0, 1, 1 };
-    static const DWORD tssType[6] = { D3DTSS_COLOROP, D3DTSS_COLORARG1, D3DTSS_ALPHAOP, D3DTSS_ALPHAARG1,
-                                      D3DTSS_COLOROP, D3DTSS_ALPHAOP };
-    static const DWORD tssVal[6] = { D3DTOP_SELECTARG1, D3DTA_TEXTURE, D3DTOP_SELECTARG1, D3DTA_TEXTURE,
-                                     D3DTOP_DISABLE, D3DTOP_DISABLE };
-    static const DWORD smpType[5] = { D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER,
-                                      D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV };
-    static const DWORD smpVal[5] = { D3DTEXF_POINT, D3DTEXF_POINT, D3DTEXF_NONE,
-                                     D3DTADDRESS_CLAMP, D3DTADDRESS_CLAMP };
-    D7Surf *oldCur;
-    DWORD oldFvf;
-
-    if (!dev || !s) return 0;
-    if (drIn) dr = *drIn; else { dr.left = 0; dr.top = 0; dr.right = g_d7.dispW; dr.bottom = g_d7.dispH; }
-    if (srIn) sr = *srIn; else { sr.left = 0; sr.top = 0; sr.right = s->w; sr.bottom = s->h; }
-    if (sr.right <= sr.left || sr.bottom <= sr.top || dr.right <= dr.left || dr.bottom <= dr.top) return 0;
-    if (sr.left < 0 || sr.top < 0 || sr.right > s->w || sr.bottom > s->h) return 0;
-    t = D7_GetTex(s);
-    if (!t) return 0;
-
-    /* -0.5: align texel centres with pixel centres for pre-transformed vertices */
-    x0 = (float)dr.left - 0.5f;   y0 = (float)dr.top - 0.5f;
-    x1 = (float)dr.right - 0.5f;  y1 = (float)dr.bottom - 0.5f;
-    u0 = (float)sr.left / (float)s->w;   v0 = (float)sr.top / (float)s->h;
-    u1 = (float)sr.right / (float)s->w;  v1 = (float)sr.bottom / (float)s->h;
-    for (i = 0; i < 4; i++) { q[i].z = 0.0f; q[i].rhw = 1.0f; q[i].color = 0xFFFFFFFFu; }
-    q[0].x = x0; q[0].y = y0; q[0].u = u0; q[0].v = v0;
-    q[1].x = x1; q[1].y = y0; q[1].u = u1; q[1].v = v0;
-    q[2].x = x0; q[2].y = y1; q[2].u = u0; q[2].v = v1;
-    q[3].x = x1; q[3].y = y1; q[3].u = u1; q[3].v = v1;
-
-    /* The game's own render/texture-stage state is saved from the state shadows (all the states touched
-       here are seeded by D7_SeedState) and restored afterwards; states that already have the wanted value
-       cost nothing, so no device state block is needed. */
-    D7_BatchFlush();
-    rsVal[0] = FALSE; rsVal[1] = FALSE; rsVal[2] = FALSE; rsVal[3] = D3DCULL_NONE; rsVal[4] = FALSE;
-    rsVal[5] = FALSE; rsVal[6] = FALSE; rsVal[7] = FALSE; rsVal[8] = FALSE;
-    rsVal[9] = useKey ? TRUE : FALSE; rsVal[10] = D3DCMP_GREATER; rsVal[11] = 0;
-    oldCur = g_d7.curTex[0];
-    oldFvf = g_d7.fvf;
-    if (!scene) IDirect3DDevice9_BeginScene(dev);
-
-    for (i = 0; i < NRS; i++) {
-        rsOld[i] = g_d7.rs[rsId[i]];
-        D7_ApplyRS(rsId[i], rsVal[i]);
-    }
-    for (i = 0; i < 6; i++) {
-        tssOld[i] = g_d7.tss[tssStage[i]][tssType[i]];
-        D7_ApplyTss(tssStage[i], tssType[i], tssVal[i]);
-    }
-    for (i = 0; i < 5; i++) {
-        smpOld[i] = g_d7.smp[0][smpType[i]];
-        D7_ApplySamp(0, smpType[i], smpVal[i]);
-    }
-    D7_SetTex(0, t);
-    D7_SetFVF(D7_QUAD_FVF);
-    IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLESTRIP, 2, q, sizeof(D7Quad));
-
-    for (i = 0; i < NRS; i++) D7_ApplyRS(rsId[i], rsOld[i]);
-    for (i = 0; i < 6; i++) D7_ApplyTss(tssStage[i], tssType[i], tssOld[i]);
-    for (i = 0; i < 5; i++) D7_ApplySamp(0, smpType[i], smpOld[i]);
-    D7_SetTex(0, oldCur ? D7_GetTex(oldCur) : NULL);
-    if (oldFvf) D7_SetFVF(oldFvf);
-    if (!scene) IDirect3DDevice9_EndScene(dev);
-    return 1;
-}
-
-/* ---- stub generators ------------------------------------------------- */
-#define D7FN(name, ret, ...) \
-    static HRESULT STDMETHODCALLTYPE name(void *self, ##__VA_ARGS__) { (void)self; return (ret); }
-
-/* ---- IDirectDrawSurface7 --------------------------------------------- */
-static HRESULT STDMETHODCALLTYPE ES_QueryInterface(void *self, const GUID *riid, void **out) {
-    if (!out) return E_POINTER;
-    *out = NULL;
-    if (D7_Iid(riid, &k_D7_IID_Unknown) || D7_Iid(riid, &k_D7_IID_Surf7)) {
-        ES_AddRef(self);
-        *out = self;
-        return DD_OK;
-    }
-    return E_NOINTERFACE;
-}
-
-static HRESULT STDMETHODCALLTYPE ES_AddAttachedSurface(void *self, void *att) {
-    D7Surf *s = (D7Surf*)self, *a = (D7Surf*)att;
-    if (a && (a->caps & DDSCAPS_ZBUFFER) && !s->zbuf) {
-        ES_AddRef(a);
-        s->zbuf = a;
-    }
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ES_Blt(void *self, RECT *dr, void *srcp, RECT *sr, DWORD flags, DDBLTFX *fx) {
-    D7Surf *d = (D7Surf*)self, *s = (D7Surf*)srcp;
-
-    if (d->isPrimary) {
-        if (s && (s == g_d7.back3d || (s->caps & DDSCAPS_3DDEVICE) || s == d->back)) {
-            D7_Present();
-        } else if (s && g_d7.dev) {
-            /* 2D surface -> primary: draw it onto the Direct3D9 back buffer, then present */
-            if (!D7_BltToDev(dr, s, sr, (flags & DDBLT_KEYSRC) ? 1 : 0) && D7_Warn(D7W_PRIMBLT))
-                Log("D3D7 emu: Blt to the primary surface failed (invalid rectangle or texture)");
-            D7_Present();
-        } else if (D7_Warn(D7W_PRIMBLT)) {
-            Log("D3D7 emu: Blt to the primary surface is not possible (no source or no Direct3D9 device yet)");
-        }
-        return DD_OK;
-    }
-    if (d == g_d7.back3d && g_d7.dev) {
-        if ((flags & DDBLT_COLORFILL) && fx) {
-            D3DRECT rc;
-            DWORD argb = D7_ToArgb(&d->fmt, fx->dwFillColor);
-            if (dr) { rc.x1 = dr->left; rc.y1 = dr->top; rc.x2 = dr->right; rc.y2 = dr->bottom; }
-            IDirect3DDevice9_Clear(g_d7.dev, dr ? 1 : 0, dr ? &rc : NULL, D3DCLEAR_TARGET, argb | 0xFF000000u, 1.0f, 0);
-        } else if (s && s != d && !(flags & DDBLT_DEPTHFILL)) {
-            if (!D7_BltToDev(dr, s, sr, (flags & DDBLT_KEYSRC) ? 1 : 0) && D7_Warn(D7W_BACKBLT))
-                Log("D3D7 emu: Blt into the 3D back buffer failed (flags=%08X)", (unsigned)flags);
-        }
-        return DD_OK;
-    }
-    if ((flags & DDBLT_COLORFILL) && fx) D7_Fill(d, dr, fx->dwFillColor);
-    else if (s) D7_Blit(d, dr, s, sr, (flags & DDBLT_KEYSRC) ? 1 : 0);
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ES_BltFast(void *self, DWORD x, DWORD y, void *srcp, RECT *sr, DWORD trans) {
-    D7Surf *d = (D7Surf*)self, *s = (D7Surf*)srcp;
-    RECT dr, src;
-    if (!s) return DDERR_INVALIDPARAMS;
-    if (sr) src = *sr; else { src.left = 0; src.top = 0; src.right = s->w; src.bottom = s->h; }
-    dr.left = (LONG)x; dr.top = (LONG)y;
-    dr.right = dr.left + (src.right - src.left);
-    dr.bottom = dr.top + (src.bottom - src.top);
-    if (g_d7.dev && s != d && (d == g_d7.back3d || d->isPrimary)) {
-        if (!D7_BltToDev(&dr, s, &src, (trans & DDBLTFAST_SRCCOLORKEY) ? 1 : 0) && D7_Warn(D7W_BACKBLT))
-            Log("D3D7 emu: BltFast into the 3D back buffer / primary failed");
-        if (d->isPrimary) D7_Present();
-        return DD_OK;
-    }
-    D7_Blit(d, &dr, s, &src, (trans & DDBLTFAST_SRCCOLORKEY) ? 1 : 0);
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ES_Flip(void *self, void *target, DWORD flags) {
-    if (((D7Surf*)self)->isPrimary) D7_Present();
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ES_GetAttachedSurface(void *self, DDSCAPS2 *caps, void **out) {
-    D7Surf *s = (D7Surf*)self, *r = NULL;
-    if (!caps || !out) return DDERR_INVALIDPARAMS;
-    if (caps->dwCaps & DDSCAPS_BACKBUFFER) r = s->back;
-    else if (caps->dwCaps & DDSCAPS_ZBUFFER) r = s->zbuf;
-    if (!r) { *out = NULL; return DDERR_NOTFOUND; }
-    ES_AddRef(r);
-    *out = r;
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ES_GetCaps(void *self, DDSCAPS2 *c) {
-    if (!c) return DDERR_INVALIDPARAMS;
-    memset(c, 0, sizeof(*c));
-    c->dwCaps = ((D7Surf*)self)->caps;
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ES_GetColorKey(void *self, DWORD flags, DDCOLORKEY *k) {
-    D7Surf *s = (D7Surf*)self;
-    if (!k) return DDERR_INVALIDPARAMS;
-    if (!s->hasKey) return DDERR_NOCOLORKEY;
-    k->dwColorSpaceLowValue = s->keyLo;
-    k->dwColorSpaceHighValue = s->keyLo;
-    return DD_OK;
-}
-
-static void D7_SyncD3D9PixelsToDib(D7Surf *s) {
-    IDirect3DSurface9 *back = NULL, *readback = NULL;
-    D3DSURFACE_DESC desc;
-    D3DLOCKED_RECT lock;
-    HRESULT hr;
-    int x, y;
-    if (!s || !s->bits || (s->bpp != 16 && s->bpp != 32) || !g_d7.dev ||
-        (s != g_d7.back3d && !s->isPrimary)) return;
-    D7_BatchFlush();
-    hr = IDirect3DDevice9_GetBackBuffer(g_d7.dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &back);
-    if (FAILED(hr) || !back) return;
-    hr = IDirect3DSurface9_GetDesc(back, &desc);
-    if (SUCCEEDED(hr))
-        hr = IDirect3DDevice9_CreateOffscreenPlainSurface(g_d7.dev, desc.Width, desc.Height, desc.Format,
-                                                          D3DPOOL_SYSTEMMEM, &readback, NULL);
-    if (SUCCEEDED(hr) && readback)
-        hr = IDirect3DDevice9_GetRenderTargetData(g_d7.dev, back, readback);
-    if (SUCCEEDED(hr) && readback)
-        hr = IDirect3DSurface9_LockRect(readback, &lock, NULL, D3DLOCK_READONLY);
-    if (SUCCEEDED(hr) && readback) {
-        for (y = 0; y < s->h; y++) {
-            int sy = (int)((long long)y * desc.Height / s->h);
-            const DWORD *src = (const DWORD*)((const unsigned char*)lock.pBits + (size_t)sy * lock.Pitch);
-            unsigned char *dst = s->bits + (size_t)y * s->pitch;
-            for (x = 0; x < s->w; x++) {
-                int sx = (int)((long long)x * desc.Width / s->w);
-                D7_Wr(s, dst + (size_t)x * (s->bpp / 8), D7_FromArgb(&s->fmt, src[sx] | 0xff000000u));
-            }
-        }
-        IDirect3DSurface9_UnlockRect(readback);
-        D7_MarkDirty(s, NULL);
-    }
-    if (readback) IDirect3DSurface9_Release(readback);
-    IDirect3DSurface9_Release(back);
-}
-
-static HRESULT STDMETHODCALLTYPE ES_GetDC(void *self, HDC *out) {
-    D7Surf *s = (D7Surf*)self;
-    if (!out) return DDERR_INVALIDPARAMS;
-    if (!s->dib) return DDERR_CANTCREATEDC;
-    D7_SyncD3D9PixelsToDib(s);
-    if (!s->dc) {
-        s->dc = CreateCompatibleDC(NULL);
-        if (!s->dc) return DDERR_CANTCREATEDC;
-        SelectObject(s->dc, s->dib);
-    }
-    *out = s->dc;
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ES_ReleaseDC(void *self, HDC dc) {
-    D7Surf *s = (D7Surf*)self;
-    GdiFlush();
-    D7_MarkDirty(s, NULL);
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ES_GetPixelFormat(void *self, DDPIXELFORMAT *pf) {
-    if (!pf) return DDERR_INVALIDPARAMS;
-    *pf = ((D7Surf*)self)->pf;
-    return DD_OK;
-}
-
-static void D7_FillDesc(const D7Surf *s, DDSURFACEDESC2 *d) {
-    memset(d, 0, sizeof(*d));
-    d->dwSize = sizeof(*d);
-    d->dwFlags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT;
-    d->dwWidth = (DWORD)s->w;
-    d->dwHeight = (DWORD)s->h;
-    d->ddpfPixelFormat = s->pf;
-    d->ddsCaps.dwCaps = s->caps;
-    if (s->bits) {
-        d->dwFlags |= DDSD_PITCH;
-        d->lPitch = s->pitch;
-    }
-}
-
-static HRESULT STDMETHODCALLTYPE ES_GetSurfaceDesc(void *self, DDSURFACEDESC2 *d) {
-    if (!d) return DDERR_INVALIDPARAMS;
-    D7_FillDesc((D7Surf*)self, d);
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ES_Lock(void *self, RECT *r, DDSURFACEDESC2 *d, DWORD flags, HANDLE ev) {
-    D7Surf *s = (D7Surf*)self;
-    if (!d) return DDERR_INVALIDPARAMS;
-    if (!s->bits) return DDERR_SURFACELOST;
-    if (s == g_d7.back3d && D7_Warn(D7W_BACKLOCK))
-        Log("D3D7 emu: Lock on the 3D back buffer (contents are not synchronised with Direct3D9)");
-    D7_FillDesc(s, d);
-    d->dwFlags |= DDSD_LPSURFACE;
-    d->lpSurface = s->bits;
-    s->lockRO = (flags & DDLOCK_READONLY) ? 1 : 0;
-    s->lockFull = 1;
-    if (r && r->left >= 0 && r->top >= 0 && r->left < s->w && r->top < s->h &&
-        r->right > r->left && r->bottom > r->top) {
-        s->lockRc = *r;
-        s->lockFull = 0;
-    }
-    if (r && r->left >= 0 && r->top >= 0 && r->left < s->w && r->top < s->h)
-        d->lpSurface = s->bits + (size_t)r->top * (size_t)s->pitch + (size_t)r->left * (size_t)(s->bpp / 8);
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ES_Unlock(void *self, RECT *r) {
-    D7Surf *s = (D7Surf*)self;
-    /* a read-only lock cannot have changed the pixels; otherwise only the locked rectangle is refreshed */
-    if (!s->lockRO) D7_MarkDirty(s, s->lockFull ? NULL : &s->lockRc);
-    s->lockRO = 0;
-    s->lockFull = 1;
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ES_SetColorKey(void *self, DWORD flags, DDCOLORKEY *k) {
-    D7Surf *s = (D7Surf*)self;
-    if (flags & DDCKEY_SRCBLT) {
-        if (k) {
-            if (!s->hasKey || s->keyLo != k->dwColorSpaceLowValue) {
-                s->hasKey = 1;
-                s->keyLo = k->dwColorSpaceLowValue;
-                D7_MarkDirty(s, NULL);
-            }
-        } else if (s->hasKey) {
-            s->hasKey = 0;
-            D7_MarkDirty(s, NULL);
-        }
-    }
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ES_GetDDInterface(void *self, void **out) {
-    if (!out) return DDERR_INVALIDPARAMS;
-    g_d7DD.ref++;
-    *out = &g_d7DD;
-    return DD_OK;
-}
-
-D7FN(ES_AddOverlayDirtyRect, DDERR_UNSUPPORTED, DWORD a)
-D7FN(ES_BltBatch, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
-D7FN(ES_DeleteAttachedSurface, DD_OK, DWORD a, DWORD b)
-D7FN(ES_EnumAttachedSurfaces, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(ES_EnumOverlayZOrders, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
-D7FN(ES_GetBltStatus, DD_OK, DWORD a)
-D7FN(ES_GetClipper, DDERR_NOCLIPPERATTACHED, DWORD a)
-D7FN(ES_GetFlipStatus, DD_OK, DWORD a)
-D7FN(ES_GetOverlayPosition, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(ES_GetPalette, DDERR_NOPALETTEATTACHED, DWORD a)
-D7FN(ES_Initialize, DDERR_ALREADYINITIALIZED, DWORD a, DWORD b)
-D7FN(ES_IsLost, DD_OK)
-D7FN(ES_Restore, DD_OK)
-D7FN(ES_SetClipper, DD_OK, DWORD a)
-D7FN(ES_SetOverlayPosition, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(ES_SetPalette, DD_OK, DWORD a)
-D7FN(ES_UpdateOverlay, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e)
-D7FN(ES_UpdateOverlayDisplay, DDERR_UNSUPPORTED, DWORD a)
-D7FN(ES_UpdateOverlayZOrder, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(ES_PageLock, DD_OK, DWORD a)
-D7FN(ES_PageUnlock, DD_OK, DWORD a)
-D7FN(ES_SetSurfaceDesc, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(ES_SetPrivateData, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c, DWORD d)
-D7FN(ES_GetPrivateData, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
-D7FN(ES_FreePrivateData, DDERR_UNSUPPORTED, DWORD a)
-D7FN(ES_GetUniquenessValue, DDERR_UNSUPPORTED, DWORD a)
-D7FN(ES_ChangeUniquenessValue, DDERR_UNSUPPORTED)
-D7FN(ES_SetPriority, DDERR_UNSUPPORTED, DWORD a)
-D7FN(ES_GetPriority, DDERR_UNSUPPORTED, DWORD a)
-D7FN(ES_SetLOD, DDERR_UNSUPPORTED, DWORD a)
-D7FN(ES_GetLOD, DDERR_UNSUPPORTED, DWORD a)
-
-static void *g_d7SurfVt[49] = {
-    (void*)ES_QueryInterface, (void*)ES_AddRef, (void*)ES_Release, (void*)ES_AddAttachedSurface,
-    (void*)ES_AddOverlayDirtyRect, (void*)ES_Blt, (void*)ES_BltBatch, (void*)ES_BltFast,
-    (void*)ES_DeleteAttachedSurface, (void*)ES_EnumAttachedSurfaces, (void*)ES_EnumOverlayZOrders,
-    (void*)ES_Flip, (void*)ES_GetAttachedSurface, (void*)ES_GetBltStatus, (void*)ES_GetCaps,
-    (void*)ES_GetClipper, (void*)ES_GetColorKey, (void*)ES_GetDC, (void*)ES_GetFlipStatus,
-    (void*)ES_GetOverlayPosition, (void*)ES_GetPalette, (void*)ES_GetPixelFormat,
-    (void*)ES_GetSurfaceDesc, (void*)ES_Initialize, (void*)ES_IsLost, (void*)ES_Lock,
-    (void*)ES_ReleaseDC, (void*)ES_Restore, (void*)ES_SetClipper, (void*)ES_SetColorKey,
-    (void*)ES_SetOverlayPosition, (void*)ES_SetPalette, (void*)ES_Unlock, (void*)ES_UpdateOverlay,
-    (void*)ES_UpdateOverlayDisplay, (void*)ES_UpdateOverlayZOrder, (void*)ES_GetDDInterface,
-    (void*)ES_PageLock, (void*)ES_PageUnlock, (void*)ES_SetSurfaceDesc, (void*)ES_SetPrivateData,
-    (void*)ES_GetPrivateData, (void*)ES_FreePrivateData, (void*)ES_GetUniquenessValue,
-    (void*)ES_ChangeUniquenessValue, (void*)ES_SetPriority, (void*)ES_GetPriority,
-    (void*)ES_SetLOD, (void*)ES_GetLOD
-};
-
-/* ---- IDirect3DDevice7 ------------------------------------------------ */
-static HRESULT STDMETHODCALLTYPE EV_QueryInterface(void *self, const GUID *riid, void **out) {
-    if (!out) return E_POINTER;
-    *out = NULL;
-    if (D7_Iid(riid, &k_D7_IID_Unknown) || D7_Iid(riid, &k_D7_IID_Dev7)) {
-        g_d7Dev.ref++;
-        *out = &g_d7Dev;
-        return DD_OK;
-    }
-    return E_NOINTERFACE;
-}
-static ULONG STDMETHODCALLTYPE EV_AddRef(void *self) { return (ULONG)++g_d7Dev.ref; }
-static ULONG STDMETHODCALLTYPE EV_Release(void *self) { return (ULONG)(g_d7Dev.ref > 1 ? --g_d7Dev.ref : 1); }
-
-typedef HRESULT (WINAPI *PF_D7EnumPF)(DDPIXELFORMAT*, void*);
-
-static HRESULT STDMETHODCALLTYPE EV_EnumTextureFormats(void *self, PF_D7EnumPF cb, void *ctx) {
-    unsigned i;
-    if (!cb) return DDERR_INVALIDPARAMS;
-    for (i = 0; i < sizeof(k_d7Fmts) / sizeof(k_d7Fmts[0]); i++) {
-        DDPIXELFORMAT pf;
-        D7_SetPf(&pf, k_d7Fmts[i].flags, k_d7Fmts[i].bpp, k_d7Fmts[i].r, k_d7Fmts[i].g, k_d7Fmts[i].b, k_d7Fmts[i].a);
-        if (cb(&pf, ctx) == DDENUMRET_CANCEL) break;
-    }
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE EV_BeginScene(void *self) {
-    if (g_d7.dev && SUCCEEDED(IDirect3DDevice9_BeginScene(g_d7.dev))) g_d7.inScene = 1;
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE EV_EndScene(void *self) {
-    if (g_d7.dev) { IDirect3DDevice9_EndScene(g_d7.dev); g_d7.inScene = 0; }
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE EV_GetDirect3D(void *self, void **out) {
-    if (!out) return DDERR_INVALIDPARAMS;
-    g_d7D3D.ref++;
-    *out = &g_d7D3D;
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE EV_Clear(void *self, DWORD count, void *rects, DWORD flags, DWORD color, float z, DWORD stencil) {
-    if (g_d7.dev && (flags & D3DCLEAR_TARGET))
-        IDirect3DDevice9_Clear(g_d7.dev, count, (const D3DRECT*)rects, D3DCLEAR_TARGET, color, z, stencil);
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE EV_SetViewport(void *self, void *vp) {
-    if (g_d7.dev && vp) IDirect3DDevice9_SetViewport(g_d7.dev, (const D3DVIEWPORT9*)vp);
-    return DD_OK;
-}
-
-static DWORD D7_MapFilter(DWORD v) {
-    return (v == 2 || v == 4 || v == 5 || v == 6) ? D3DTEXF_LINEAR : D3DTEXF_POINT;
-}
-
-static int D7_RsPass(DWORD st) {
-    return st == 7 || st == 8 || st == 9 || (st >= 14 && st <= 16) || (st >= 19 && st <= 20) ||
-           (st >= 22 && st <= 29) || (st >= 34 && st <= 38) || (st >= 52 && st <= 60) ||
-           (st >= 128 && st <= 143);
-}
-
-static HRESULT STDMETHODCALLTYPE EV_SetRenderState(void *self, DWORD st, DWORD v) {
-    static unsigned char logged[256];
-    if (!g_d7.dev) return DD_OK;
-    switch (st) {
-    case 17: D7_ApplySamp(0, D3DSAMP_MAGFILTER, D7_MapFilter(v)); break;
-    case 18: D7_ApplySamp(0, D3DSAMP_MINFILTER, D7_MapFilter(v)); break;
-    case 21: break;
-    case 41:
-        if (g_d7.ckEnable != (v != 0)) BatchFlushQuads();
-        g_d7.ckEnable = (v != 0);
-        break;
-    default:
-        if (D7_RsPass(st)) D7_ApplyRS(st, v);
-        else if (st < 256 && !logged[st]) { logged[st] = 1; Log("D3D7 emu: render state %lu ignored (value %lu)", (unsigned long)st, (unsigned long)v); }
-        break;
-    }
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE EV_GetRenderState(void *self, DWORD st, DWORD *v) {
-    if (!v) return DDERR_INVALIDPARAMS;
-    *v = (st == 41) ? (DWORD)g_d7.ckEnable : (st < 256 ? g_d7.rs[st] : 0);
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE EV_SetTexture(void *self, DWORD stage, void *tex) {
-    D7Surf *s = (D7Surf*)tex;
-    IDirect3DTexture9 *t = NULL;
-    if (!g_d7.dev || stage >= 8) return DD_OK;
-    g_d7.curTex[stage] = s;
-    if (s) t = D7_GetTex(s);
-    D7_SetTex(stage, t);
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE EV_SetTextureStageState(void *self, DWORD stage, DWORD type, DWORD v) {
-    if (!g_d7.dev || stage >= 8) return DD_OK;
-    switch (type) {
-    case 12: D7_ApplySamp(stage, D3DSAMP_ADDRESSU, v); D7_ApplySamp(stage, D3DSAMP_ADDRESSV, v); break;
-    case 13: D7_ApplySamp(stage, D3DSAMP_ADDRESSU, v); break;
-    case 14: D7_ApplySamp(stage, D3DSAMP_ADDRESSV, v); break;
-    case 15: D7_ApplySamp(stage, D3DSAMP_BORDERCOLOR, v); break;
-    case 16: D7_ApplySamp(stage, D3DSAMP_MAGFILTER, v == 5 ? D3DTEXF_ANISOTROPIC : D7_MapFilter(v)); break;
-    case 17: D7_ApplySamp(stage, D3DSAMP_MINFILTER, v == 3 ? D3DTEXF_ANISOTROPIC : D7_MapFilter(v)); break;
-    case 18: D7_ApplySamp(stage, D3DSAMP_MIPFILTER, v > 0 ? v - 1 : 0); break;
-    case 19: D7_ApplySamp(stage, D3DSAMP_MIPMAPLODBIAS, v); break;
-    case 20: D7_ApplySamp(stage, D3DSAMP_MAXMIPLEVEL, v); break;
-    case 21: D7_ApplySamp(stage, D3DSAMP_MAXANISOTROPY, v); break;
-    default:
-        if (type >= 1 && type < 32) D7_ApplyTss(stage, type, v);
-        break;
-    }
-    return DD_OK;
-}
-
-static UINT D7_FvfStride(DWORD fvf) {
-    UINT st;
-    switch (fvf & 0xE) {
-    case 0x4: st = 16; break;
-    case 0x2: st = 12; break;
-    default: return 0;
-    }
-    if (fvf & 0x10) st += 12;
-    if (fvf & 0x20) st += 4;
-    if (fvf & 0x40) st += 4;
-    if (fvf & 0x80) st += 4;
-    st += ((fvf >> 8) & 0xF) * 8;
-    return st;
-}
-
-/* DDCKEY_SRCBLT emulation: texels equal to the key have alpha 0 (see D7_GetTex);
-   while COLORKEYENABLE is on, reject them with an alpha test on the texture alpha. */
-static void D7_CkBegin(void) {
-    D7_ApplyRS(D3DRS_ALPHATESTENABLE, TRUE);
-    D7_ApplyRS(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
-    D7_ApplyRS(D3DRS_ALPHAREF, 0);
-    D7_ApplyTss(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
-    D7_ApplyTss(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-    D7_ApplyTss(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
-}
-
-static void D7_CkEnd(void) {
-    D7_ApplyRS(D3DRS_ALPHATESTENABLE, g_d7.rsSet[D3DRS_ALPHATESTENABLE] ? 0 : 0);
-}
-
-static HRESULT STDMETHODCALLTYPE EV_DrawPrimitive(void *self, DWORD type, DWORD fvf, void *verts, DWORD count, DWORD flags) {
-    UINT stride, prims;
-    D7Surf *t0;
-    int ck;
-
-    if (!g_d7.dev || !verts || !count) return DD_OK;
-    stride = D7_FvfStride(fvf);
-    switch (type) {
-    case 1: prims = count; break;
-    case 2: prims = count / 2; break;
-    case 3: prims = count > 1 ? count - 1 : 0; break;
-    case 4: prims = count / 3; break;
-    case 5:
-    case 6: prims = count > 2 ? count - 2 : 0; break;
-    default: prims = 0; break;
-    }
-    if (!stride || !prims) return DD_OK;
-    t0 = g_d7.curTex[0];
-    if (t0 && t0->dirty) D7_GetTex(t0);
-    ck = g_d7.ckEnable && t0 && t0->hasKey;
-    if (ck) {
-        DWORD at = g_d7.rsSet[D3DRS_ALPHATESTENABLE] ? g_d7.rs[D3DRS_ALPHATESTENABLE] : 0;
-        DWORD af = g_d7.rsSet[D3DRS_ALPHAFUNC] ? g_d7.rs[D3DRS_ALPHAFUNC] : D3DCMP_ALWAYS;
-        DWORD ar = g_d7.rsSet[D3DRS_ALPHAREF] ? g_d7.rs[D3DRS_ALPHAREF] : 0;
-        DWORD op = g_d7.tssSet[0][D3DTSS_ALPHAOP] ? g_d7.tss[0][D3DTSS_ALPHAOP] : D3DTOP_SELECTARG1;
-        DWORD a1 = g_d7.tssSet[0][D3DTSS_ALPHAARG1] ? g_d7.tss[0][D3DTSS_ALPHAARG1] : D3DTA_TEXTURE;
-        DWORD a2 = g_d7.tssSet[0][D3DTSS_ALPHAARG2] ? g_d7.tss[0][D3DTSS_ALPHAARG2] : D3DTA_CURRENT;
-        D7_CkBegin();
-        D7_SetFVF(fvf);
-        IDirect3DDevice9_DrawPrimitiveUP(g_d7.dev, (D3DPRIMITIVETYPE)type, prims, verts, stride);
-        D7_ApplyRS(D3DRS_ALPHATESTENABLE, at);
-        D7_ApplyRS(D3DRS_ALPHAFUNC, af);
-        D7_ApplyRS(D3DRS_ALPHAREF, ar);
-        D7_ApplyTss(0, D3DTSS_ALPHAOP, op);
-        D7_ApplyTss(0, D3DTSS_ALPHAARG1, a1);
-        D7_ApplyTss(0, D3DTSS_ALPHAARG2, a2);
-        return DD_OK;
-    }
-    D7_SetFVF(fvf);
-    IDirect3DDevice9_DrawPrimitiveUP(g_d7.dev, (D3DPRIMITIVETYPE)type, prims, verts, stride);
-    return DD_OK;
-}
-
-D7FN(EV_GetCaps, DDERR_UNSUPPORTED, DWORD a)
-D7FN(EV_SetRenderTarget, DD_OK, DWORD a, DWORD b)
-D7FN(EV_GetRenderTarget, DDERR_UNSUPPORTED, DWORD a)
-D7FN(EV_SetTransform, DD_OK, DWORD a, DWORD b)
-D7FN(EV_GetTransform, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(EV_MultiplyTransform, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(EV_GetViewport, DDERR_UNSUPPORTED, DWORD a)
-D7FN(EV_SetMaterial, DD_OK, DWORD a)
-D7FN(EV_GetMaterial, DDERR_UNSUPPORTED, DWORD a)
-D7FN(EV_SetLight, DD_OK, DWORD a, DWORD b)
-D7FN(EV_GetLight, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(EV_BeginStateBlock, DDERR_UNSUPPORTED)
-D7FN(EV_EndStateBlock, DDERR_UNSUPPORTED, DWORD a)
-D7FN(EV_PreLoad, DD_OK, DWORD a)
-D7FN(EV_DrawIndexedPrimitive, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g)
-D7FN(EV_SetClipStatus, DDERR_UNSUPPORTED, DWORD a)
-D7FN(EV_GetClipStatus, DDERR_UNSUPPORTED, DWORD a)
-D7FN(EV_DrawPrimitiveStrided, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e)
-D7FN(EV_DrawIndexedPrimitiveStrided, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g)
-D7FN(EV_DrawPrimitiveVB, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e)
-D7FN(EV_DrawIndexedPrimitiveVB, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g)
-D7FN(EV_ComputeSphereVisibility, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c, DWORD d)
-D7FN(EV_GetTexture, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(EV_GetTextureStageState, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
-D7FN(EV_ValidateDevice, DD_OK, DWORD a)
-D7FN(EV_ApplyStateBlock, DDERR_UNSUPPORTED, DWORD a)
-D7FN(EV_CaptureStateBlock, DDERR_UNSUPPORTED, DWORD a)
-D7FN(EV_DeleteStateBlock, DDERR_UNSUPPORTED, DWORD a)
-D7FN(EV_CreateStateBlock, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(EV_Load, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e)
-D7FN(EV_LightEnable, DD_OK, DWORD a, DWORD b)
-D7FN(EV_GetLightEnable, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(EV_SetClipPlane, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(EV_GetClipPlane, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(EV_GetInfo, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
-
-static void *g_d7DevVt[49] = {
-    (void*)EV_QueryInterface, (void*)EV_AddRef, (void*)EV_Release, (void*)EV_GetCaps,
-    (void*)EV_EnumTextureFormats, (void*)EV_BeginScene, (void*)EV_EndScene, (void*)EV_GetDirect3D,
-    (void*)EV_SetRenderTarget, (void*)EV_GetRenderTarget, (void*)EV_Clear, (void*)EV_SetTransform,
-    (void*)EV_GetTransform, (void*)EV_SetViewport, (void*)EV_MultiplyTransform, (void*)EV_GetViewport,
-    (void*)EV_SetMaterial, (void*)EV_GetMaterial, (void*)EV_SetLight, (void*)EV_GetLight,
-    (void*)EV_SetRenderState, (void*)EV_GetRenderState, (void*)EV_BeginStateBlock,
-    (void*)EV_EndStateBlock, (void*)EV_PreLoad, (void*)EV_DrawPrimitive,
-    (void*)EV_DrawIndexedPrimitive, (void*)EV_SetClipStatus, (void*)EV_GetClipStatus,
-    (void*)EV_DrawPrimitiveStrided, (void*)EV_DrawIndexedPrimitiveStrided, (void*)EV_DrawPrimitiveVB,
-    (void*)EV_DrawIndexedPrimitiveVB, (void*)EV_ComputeSphereVisibility, (void*)EV_GetTexture,
-    (void*)EV_SetTexture, (void*)EV_GetTextureStageState, (void*)EV_SetTextureStageState,
-    (void*)EV_ValidateDevice, (void*)EV_ApplyStateBlock, (void*)EV_CaptureStateBlock,
-    (void*)EV_DeleteStateBlock, (void*)EV_CreateStateBlock, (void*)EV_Load, (void*)EV_LightEnable,
-    (void*)EV_GetLightEnable, (void*)EV_SetClipPlane, (void*)EV_GetClipPlane, (void*)EV_GetInfo
-};
-
-/* ---- IDirect3D7 ------------------------------------------------------ */
-static HRESULT STDMETHODCALLTYPE E3_QueryInterface(void *self, const GUID *riid, void **out) {
-    if (!out) return E_POINTER;
-    *out = NULL;
-    if (D7_Iid(riid, &k_D7_IID_Unknown) || D7_Iid(riid, &k_D7_IID_D3D7)) {
-        g_d7D3D.ref++;
-        *out = &g_d7D3D;
-        return DD_OK;
-    }
-    if (D7_Iid(riid, &k_D7_IID_DD7)) {
-        g_d7DD.ref++;
-        *out = &g_d7DD;
-        return DD_OK;
-    }
-    return E_NOINTERFACE;
-}
-static ULONG STDMETHODCALLTYPE E3_AddRef(void *self) { return (ULONG)++g_d7D3D.ref; }
-static ULONG STDMETHODCALLTYPE E3_Release(void *self) { return (ULONG)(g_d7D3D.ref > 1 ? --g_d7D3D.ref : 1); }
-
-static HRESULT STDMETHODCALLTYPE E3_CreateDevice(void *self, const GUID *cls, void *surf, void **dev) {
-    if (!dev || !surf) return DDERR_INVALIDPARAMS;
-    g_d7.back3d = (D7Surf*)surf;
-    if (!D7_InitD3D9()) return DDERR_GENERIC;
-    g_d7Dev.ref++;
-    *dev = &g_d7Dev;
-    Log("D3D7 emu: IDirect3D7::CreateDevice ok (back buffer surface %p)", surf);
-    return DD_OK;
-}
-
-D7FN(E3_EnumDevices, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(E3_CreateVertexBuffer, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
-D7FN(E3_EnumZBufferFormats, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
-D7FN(E3_EvictManagedTextures, DD_OK)
-
-static void *g_d7D3DVt[8] = {
-    (void*)E3_QueryInterface, (void*)E3_AddRef, (void*)E3_Release, (void*)E3_EnumDevices,
-    (void*)E3_CreateDevice, (void*)E3_CreateVertexBuffer, (void*)E3_EnumZBufferFormats,
-    (void*)E3_EvictManagedTextures
-};
-
-/* ---- IDirectDraw7 ---------------------------------------------------- */
-static HRESULT STDMETHODCALLTYPE ED_QueryInterface(void *self, const GUID *riid, void **out) {
-    if (!out) return E_POINTER;
-    *out = NULL;
-    if (D7_Iid(riid, &k_D7_IID_Unknown) || D7_Iid(riid, &k_D7_IID_DD7) || D7_Iid(riid, &k_D7_IID_DD1) ||
-        D7_Iid(riid, &k_D7_IID_DD2) || D7_Iid(riid, &k_D7_IID_DD3) || D7_Iid(riid, &k_D7_IID_DD4)) {
-        g_d7DD.ref++;
-        *out = &g_d7DD;
-        return DD_OK;
-    }
-    if (D7_Iid(riid, &k_D7_IID_D3D7)) {
-        g_d7D3D.ref++;
-        *out = &g_d7D3D;
-        return DD_OK;
-    }
-    return E_NOINTERFACE;
-}
-static ULONG STDMETHODCALLTYPE ED_AddRef(void *self) { return (ULONG)++g_d7DD.ref; }
-static ULONG STDMETHODCALLTYPE ED_Release(void *self) { return (ULONG)(g_d7DD.ref > 1 ? --g_d7DD.ref : 1); }
-
-static HRESULT STDMETHODCALLTYPE ED_CreateSurface(void *self, DDSURFACEDESC2 *d, void **out, void *unk) {
-    DWORD caps;
-    int w, h;
-    DDPIXELFORMAT pf;
-    D7Surf *s;
-
-    if (!d || !out) return DDERR_INVALIDPARAMS;
-    *out = NULL;
-    caps = (d->dwFlags & DDSD_CAPS) ? d->ddsCaps.dwCaps : 0;
-    w = (d->dwFlags & DDSD_WIDTH) ? (int)d->dwWidth : 0;
-    h = (d->dwFlags & DDSD_HEIGHT) ? (int)d->dwHeight : 0;
-    D7_SetPf(&pf, DDPF_RGB, 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0);
-
-    if (caps & DDSCAPS_PRIMARYSURFACE) {
-        w = g_d7.dispW;
-        h = g_d7.dispH;
-        s = D7_SurfNew(w, h, &pf, caps);
-        if (!s) return DDERR_OUTOFMEMORY;
-        s->isPrimary = 1;
-        if ((d->dwFlags & DDSD_BACKBUFFERCOUNT) && d->dwBackBufferCount > 0) {
-            s->back = D7_SurfNew(w, h, &pf, DDSCAPS_BACKBUFFER | DDSCAPS_3DDEVICE | DDSCAPS_VIDEOMEMORY);
-            if (!s->back) { ES_Release(s); return DDERR_OUTOFMEMORY; }
-        }
-        g_d7.primary = s;
-    } else if ((d->dwFlags & DDSD_PIXELFORMAT) && (d->ddpfPixelFormat.dwFlags & DDPF_ZBUFFER)) {
-        if (w <= 0 || h <= 0) return DDERR_INVALIDPARAMS;
-        s = D7_SurfNew(w, h, &d->ddpfPixelFormat, caps | DDSCAPS_ZBUFFER);
-        if (!s) return DDERR_OUTOFMEMORY;
-    } else {
-        if (w <= 0 || h <= 0) return DDERR_INVALIDPARAMS;
-        if ((d->dwFlags & DDSD_PIXELFORMAT) && (d->ddpfPixelFormat.dwFlags & DDPF_RGB))
-            pf = d->ddpfPixelFormat;
-        if (pf.dwRGBBitCount != 16 && pf.dwRGBBitCount != 32) {
-            Log("D3D7 emu: unsupported pixel format (%lu bpp) for a %dx%d surface",
-                (unsigned long)pf.dwRGBBitCount, w, h);
-            return DDERR_INVALIDPIXELFORMAT;
-        }
-        s = D7_SurfNew(w, h, &pf, caps);
-        if (!s) return DDERR_OUTOFMEMORY;
-    }
-    if (g_d7.surfLogged < 40) {
-        g_d7.surfLogged++;
-        Log("D3D7 emu: CreateSurface %dx%d caps=%08X flags=%08X bpp=%d masks=%08X/%08X/%08X/%08X -> %p",
-            w, h, (unsigned)caps, (unsigned)d->dwFlags, s->bpp, (unsigned)s->fmt.m[0],
-            (unsigned)s->fmt.m[1], (unsigned)s->fmt.m[2], (unsigned)s->fmt.m[3], (void*)s);
-    }
-    *out = s;
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ED_GetDisplayMode(void *self, DDSURFACEDESC2 *d) {
-    if (!d) return DDERR_INVALIDPARAMS;
-    memset(d, 0, sizeof(*d));
-    d->dwSize = sizeof(*d);
-    d->dwFlags = DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT | DDSD_PITCH;
-    d->dwWidth = (DWORD)g_d7.dispW;
-    d->dwHeight = (DWORD)g_d7.dispH;
-    d->lPitch = g_d7.dispW * 4;
-    D7_SetPf(&d->ddpfPixelFormat, DDPF_RGB, 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0);
-    return DD_OK;
-}
-
-/* ==========================================================================
-   Alt+Enter: toggle WndMode in config.txt and, with the Direct3D9 layer, switch
-   between borderless fullscreen and a normal window on the fly.  While Alt+Enter
-   is held (until Enter is released) the Enter key is hidden from the game: the
-   key-state APIs the game imports from user32 are hooked through its IAT.
-   ========================================================================== */
-static volatile LONG g_enterMask = 0;
-typedef SHORT (WINAPI *PF_KeyStateFn)(int);
-typedef BOOL (WINAPI *PF_KbStateFn)(PBYTE);
-static PF_KeyStateFn g_origGetAsyncKeyState = NULL;
-static PF_KeyStateFn g_origGetKeyState = NULL;
-static PF_KbStateFn g_origGetKeyboardState = NULL;
-
-static char *WndModeReadFile(const char *path, size_t *outN) {
-    FILE *f = fopen(path, "rb");
-    long sz;
-    char *buf;
-    size_t n;
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || sz > 1048576) { fclose(f); return NULL; }
-    buf = (char*)malloc((size_t)sz);
-    if (!buf) { fclose(f); return NULL; }
-    n = fread(buf, 1, (size_t)sz, f);
-    fclose(f);
-    *outN = n;
-    return buf;
-}
-
-/* Find the value of the "WndMode=" line (a line that starts with it; comment lines never do). */
-static int WndModeFind(const char *buf, size_t n, size_t *vs, size_t *ve) {
-    size_t i = 0;
-    while (i < n) {
-        size_t ls = i, le = i;
-        while (le < n && buf[le] != '\n' && buf[le] != '\r') le++;
-        if (le - ls >= 8 && _strnicmp(buf + ls, "WndMode=", 8) == 0) {
-            size_t a = ls + 8, b = le;
-            while (a < b && (buf[a] == ' ' || buf[a] == '\t')) a++;
-            while (b > a && (buf[b - 1] == ' ' || buf[b - 1] == '\t')) b--;
-            *vs = a;
-            *ve = b;
-            return 1;
-        }
-        i = le;
-        while (i < n && (buf[i] == '\n' || buf[i] == '\r')) i++;
-    }
-    return 0;
-}
-
-/* 1 = WndMode=on (window), 0 = off (fullscreen), -1 = not found */
-static int ReadWndModeConfig(void) {
-    char path[MAX_PATH];
-    size_t n = 0, vs = 0, ve = 0;
-    char *buf;
-    int r = -1;
-    ExeDirFile("config.txt", path);
-    buf = WndModeReadFile(path, &n);
-    if (!buf) return -1;
-    if (WndModeFind(buf, n, &vs, &ve))
-        r = (ve - vs == 2 && _strnicmp(buf + vs, "on", 2) == 0) ? 1 : 0;
-    free(buf);
-    return r;
-}
-
-static int WriteWndModeConfig(int windowed) {
-    char path[MAX_PATH], tmp[MAX_PATH];
-    size_t n = 0, vs = 0, ve = 0;
-    const char *val = windowed ? "on" : "off";
-    char *buf;
-    FILE *f;
-    int ok = 0;
-
-    ExeDirFile("config.txt", path);
-    buf = WndModeReadFile(path, &n);
-    if (!buf) { Log("WndMode: cannot read %s", path); return 0; }
-    if (!WndModeFind(buf, n, &vs, &ve)) {
-        Log("WndMode: no WndMode= line in config.txt");
-        free(buf);
-        return 0;
-    }
-    strcpy(tmp, path);
-    strcat(tmp, ".tmp");
-    f = fopen(tmp, "wb");
-    if (f) {
-        ok = fwrite(buf, 1, vs, f) == vs &&
-             fwrite(val, 1, strlen(val), f) == strlen(val) &&
-             fwrite(buf + ve, 1, n - ve, f) == n - ve;
-        if (fclose(f) != 0) ok = 0;
-        if (ok) ok = MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING) ? 1 : 0;
-        if (!ok) DeleteFileA(tmp);
-    }
-    free(buf);
-    Log("WndMode: config.txt WndMode=%s %s", val, ok ? "written" : "FAILED to write");
-    return ok;
-}
-
-static void ToggleWndMode(void) {
-    int live = (g_d7.active && g_d7.dev) ? 1 : 0;
-    int cur, wantWindowed;
-
-    if (live) cur = g_d7.fs ? 0 : 1;
-    else {
-        cur = ReadWndModeConfig();
-        if (cur < 0) cur = 0;
-    }
-    wantWindowed = !cur;
-    WriteWndModeConfig(wantWindowed);
-    if (live) D7_SetWindowed(wantWindowed);
-    Log("WndMode: Alt+Enter -> WndMode=%s%s", wantWindowed ? "on" : "off",
-        live ? " (applied now)" : " (takes effect on the next launch)");
-}
-
-static int EnterMasked(void) {
-    if (!(GetAsyncKeyState(VK_RETURN) & 0x8000)) {
-        g_enterMask = 0;
-        return 0;
-    }
-    if (g_enterMask) return 1;
-    if (GetAsyncKeyState(VK_MENU) & 0x8000) {
-        g_enterMask = 1;
-        return 1;
-    }
-    return 0;
-}
-
-static SHORT WINAPI Hook_GetAsyncKeyState(int vk) {
-    SHORT r = g_origGetAsyncKeyState(vk);
-    if (vk == VK_RETURN && EnterMasked()) r = 0;
-    return r;
-}
-
-static SHORT WINAPI Hook_GetKeyState(int vk) {
-    SHORT r = g_origGetKeyState(vk);
-    if (vk == VK_RETURN && EnterMasked()) r = 0;
-    return r;
-}
-
-static BOOL WINAPI Hook_GetKeyboardState(PBYTE keys) {
-    BOOL r = g_origGetKeyboardState(keys);
-    if (r && keys && EnterMasked()) keys[VK_RETURN] = 0;
-    return r;
-}
-
-/* Replace the import thunk of `func` (any DLL) in the main executable. */
-static int HookIat(const char *func, void *hook, void **orig) {
-    BYTE *base = (BYTE*)GetModuleHandleA(NULL);
-    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER*)base;
-    IMAGE_NT_HEADERS *nt;
-    IMAGE_DATA_DIRECTORY *dd;
-    IMAGE_IMPORT_DESCRIPTOR *imp;
-    int n = 0;
-
-    if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
-    nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
-    dd = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!dd->VirtualAddress) return 0;
-    for (imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + dd->VirtualAddress); imp->Name; imp++) {
-        IMAGE_THUNK_DATA *oft = (IMAGE_THUNK_DATA*)(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
-        IMAGE_THUNK_DATA *ft = (IMAGE_THUNK_DATA*)(base + imp->FirstThunk);
-        for (; oft->u1.AddressOfData; oft++, ft++) {
-            IMAGE_IMPORT_BY_NAME *ibn;
-            DWORD old;
-            if (IMAGE_SNAP_BY_ORDINAL(oft->u1.Ordinal)) continue;
-            ibn = (IMAGE_IMPORT_BY_NAME*)(base + oft->u1.AddressOfData);
-            if (strcmp((const char*)ibn->Name, func) != 0) continue;
-            if (!VirtualProtect(&ft->u1.Function, sizeof(ft->u1.Function), PAGE_READWRITE, &old)) continue;
-            if (orig && !*orig) *orig = (void*)(uintptr_t)ft->u1.Function;
-            ft->u1.Function = (DWORD)(uintptr_t)hook;
-            VirtualProtect(&ft->u1.Function, sizeof(ft->u1.Function), old, &old);
-            n++;
-        }
-    }
-    return n;
-}
-
-static void PatchEnterMask(void) {
-    int a = HookIat("GetAsyncKeyState", (void*)&Hook_GetAsyncKeyState, (void**)&g_origGetAsyncKeyState);
-    int b = HookIat("GetKeyState", (void*)&Hook_GetKeyState, (void**)&g_origGetKeyState);
-    int c = HookIat("GetKeyboardState", (void*)&Hook_GetKeyboardState, (void**)&g_origGetKeyboardState);
-    Log("EnterMask: IAT hooks GetAsyncKeyState=%d GetKeyState=%d GetKeyboardState=%d%s", a, b, c,
-        (a + b + c) ? "" : " (the game does not import them; Enter cannot be masked)");
-}
-
-static WNDPROC g_origWndProc = NULL;
-static HWND g_hotkeyHwnd = NULL;
-
-static LRESULT CALLBACK SmdWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == WM_SYSKEYDOWN && w == VK_RETURN) {
-        if (!(l & 0x40000000)) {   /* ignore auto-repeat */
-            g_enterMask = 1;
-            ToggleWndMode();
-        }
-        return 0;
-    }
-    if ((m == WM_SYSKEYUP && w == VK_RETURN) || (m == WM_SYSCHAR && w == '\r'))
-        return 0;
-    return CallWindowProcA(g_origWndProc, h, m, w, l);
-}
-
-/* Subclass the game window to catch Alt+Enter (also stops the system beep). */
-static void HotkeyAttach(HWND hwnd) {
-    LONG_PTR prev;
-    if (!hwnd || hwnd == g_hotkeyHwnd || !IsWindow(hwnd)) return;
-    prev = (LONG_PTR)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)(LONG_PTR)SmdWndProc);
-    if (!prev) {
-        Log("WndMode: could not subclass the game window (err=%08X)", (unsigned)GetLastError());
-        return;
-    }
-    g_origWndProc = (WNDPROC)prev;
-    g_hotkeyHwnd = hwnd;
-    Log("WndMode: Alt+Enter hotkey attached to hwnd=%p", (void*)hwnd);
-}
-
-static HRESULT STDMETHODCALLTYPE ED_SetCooperativeLevel(void *self, HWND hwnd, DWORD flags) {
-    if (hwnd) g_d7.hwnd = hwnd;
-    HotkeyAttach(hwnd);
-    g_d7.fs = (flags & DDSCL_FULLSCREEN) ? 1 : 0;
-    if (g_d7.fs) D7_SetupBorderless(hwnd);
-    Log("D3D7 emu: SetCooperativeLevel hwnd=%p flags=%X (%s)", (void*)hwnd, (unsigned)flags,
-        g_d7.fs ? "borderless fullscreen" : "window mode");
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ED_SetDisplayMode(void *self, DWORD w, DWORD h, DWORD bpp, DWORD refresh, DWORD flags) {
-    g_d7.dispW = (int)w;
-    g_d7.dispH = (int)h;
-    Log("D3D7 emu: SetDisplayMode %lux%lux%lu (virtual, desktop mode unchanged)", (unsigned long)w, (unsigned long)h, (unsigned long)bpp);
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ED_GetDeviceIdentifier(void *self, DDDEVICEIDENTIFIER2 *p, DWORD flags) {
-    if (!p) return DDERR_INVALIDPARAMS;
-    memset(p, 0, sizeof(*p));
-    strcpy(p->szDriver, "d3d9.dll");
-    strcpy(p->szDescription, "Direct3D9 (Smd D3D7 emulation)");
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ED_GetAvailableVidMem(void *self, DDSCAPS2 *c, DWORD *total, DWORD *freev) {
-    if (total) *total = 256u * 1024u * 1024u;
-    if (freev) *freev = 256u * 1024u * 1024u;
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ED_GetMonitorFrequency(void *self, DWORD *f) {
-    if (f) *f = 60;
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ED_GetFourCCCodes(void *self, DWORD *n, DWORD *codes) {
-    if (n) *n = 0;
-    return DD_OK;
-}
-
-static HRESULT STDMETHODCALLTYPE ED_GetVerticalBlankStatus(void *self, BOOL *b) {
-    if (b) *b = FALSE;
-    return DD_OK;
-}
-
-D7FN(ED_Compact, DD_OK)
-D7FN(ED_CreateClipper, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
-D7FN(ED_CreatePalette, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c, DWORD d)
-D7FN(ED_DuplicateSurface, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-typedef HRESULT (WINAPI *PF_D7EnumModes)(DDSURFACEDESC2*, void*);
-
-/* Report a fixed set of 16/32 bpp modes (the desktop mode is never changed, see ED_SetDisplayMode). */
-static HRESULT STDMETHODCALLTYPE ED_EnumDisplayModes(void *self, DWORD flags, DDSURFACEDESC2 *filter, void *ctx, PF_D7EnumModes cb) {
-    static const struct { int w, h, bpp; } modes[] = {
-        { 640, 480, 32 }, { 640, 480, 16 }, { 800, 600, 32 }, { 800, 600, 16 },
-        { 1024, 768, 32 }, { 1280, 720, 32 }, { 1280, 960, 32 }, { 1920, 1080, 32 }
-    };
-    unsigned i;
-    if (!cb) return DDERR_INVALIDPARAMS;
-    for (i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
-        DDSURFACEDESC2 d;
-        memset(&d, 0, sizeof(d));
-        d.dwSize = sizeof(d);
-        d.dwFlags = DDSD_HEIGHT | DDSD_WIDTH | DDSD_PITCH | DDSD_PIXELFORMAT | DDSD_REFRESHRATE;
-        d.dwWidth = (DWORD)modes[i].w;
-        d.dwHeight = (DWORD)modes[i].h;
-        d.lPitch = modes[i].w * (modes[i].bpp / 8);
-        d.dwRefreshRate = 60;
-        if (modes[i].bpp == 32) D7_SetPf(&d.ddpfPixelFormat, DDPF_RGB, 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0);
-        else                    D7_SetPf(&d.ddpfPixelFormat, DDPF_RGB, 16, 0x0000F800, 0x000007E0, 0x0000001F, 0);
-        if (filter) {
-            if ((filter->dwFlags & DDSD_WIDTH) && filter->dwWidth != d.dwWidth) continue;
-            if ((filter->dwFlags & DDSD_HEIGHT) && filter->dwHeight != d.dwHeight) continue;
-            if ((filter->dwFlags & DDSD_PIXELFORMAT) && filter->ddpfPixelFormat.dwRGBBitCount != d.ddpfPixelFormat.dwRGBBitCount) continue;
-        }
-        if (cb(&d, ctx) == DDENUMRET_CANCEL) break;
-    }
-    return DD_OK;
-}
-D7FN(ED_EnumSurfaces, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c, DWORD d)
-D7FN(ED_FlipToGDISurface, DD_OK)
-static int D7_FillCaps(DDCAPS *c) {
-    DWORD sz;
-    if (!c) return 1;
-    sz = c->dwSize;
-    if (sz < 2 * sizeof(DWORD) || sz > sizeof(DDCAPS)) return 0;
-    memset(c, 0, sz);
-    c->dwSize = sz;
-    c->dwCaps = DDCAPS_3D | DDCAPS_BLT | DDCAPS_BLTCOLORFILL | DDCAPS_BLTSTRETCH | DDCAPS_COLORKEY | DDCAPS_GDI;
-    if (sz >= sizeof(DDCAPS)) {
-        c->dwVidMemTotal = 256u * 1024u * 1024u;
-        c->dwVidMemFree = 256u * 1024u * 1024u;
-    }
-    return 1;
-}
-
-static HRESULT STDMETHODCALLTYPE ED_GetCaps(void *self, DDCAPS *hal, DDCAPS *hel) {
-    if (!hal && !hel) return DDERR_INVALIDPARAMS;
-    if (!D7_FillCaps(hal) || !D7_FillCaps(hel)) return DDERR_INVALIDPARAMS;
-    return DD_OK;
-}
-D7FN(ED_GetGDISurface, DDERR_UNSUPPORTED, DWORD a)
-D7FN(ED_GetScanLine, DDERR_UNSUPPORTED, DWORD a)
-D7FN(ED_Initialize, DDERR_ALREADYINITIALIZED, DWORD a)
-D7FN(ED_RestoreDisplayMode, DD_OK)
-D7FN(ED_WaitForVerticalBlank, DD_OK, DWORD a, DWORD b)
-D7FN(ED_GetSurfaceFromDC, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-D7FN(ED_RestoreAllSurfaces, DD_OK)
-D7FN(ED_TestCooperativeLevel, DD_OK)
-D7FN(ED_StartModeTest, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
-D7FN(ED_EvaluateMode, DDERR_UNSUPPORTED, DWORD a, DWORD b)
-
-static void *g_d7DDVt[30] = {
-    (void*)ED_QueryInterface, (void*)ED_AddRef, (void*)ED_Release, (void*)ED_Compact,
-    (void*)ED_CreateClipper, (void*)ED_CreatePalette, (void*)ED_CreateSurface,
-    (void*)ED_DuplicateSurface, (void*)ED_EnumDisplayModes, (void*)ED_EnumSurfaces,
-    (void*)ED_FlipToGDISurface, (void*)ED_GetCaps, (void*)ED_GetDisplayMode,
-    (void*)ED_GetFourCCCodes, (void*)ED_GetGDISurface, (void*)ED_GetMonitorFrequency,
-    (void*)ED_GetScanLine, (void*)ED_GetVerticalBlankStatus, (void*)ED_Initialize,
-    (void*)ED_RestoreDisplayMode, (void*)ED_SetCooperativeLevel, (void*)ED_SetDisplayMode,
-    (void*)ED_WaitForVerticalBlank, (void*)ED_GetAvailableVidMem, (void*)ED_GetSurfaceFromDC,
-    (void*)ED_RestoreAllSurfaces, (void*)ED_TestCooperativeLevel, (void*)ED_GetDeviceIdentifier,
-    (void*)ED_StartModeTest, (void*)ED_EvaluateMode
-};
-
-static int D7E_Forced(void) {
-    char b[8];
-    return GetEnvironmentVariableA("SMD_FORCE_D3D7_EMU", b, sizeof(b)) != 0;
-}
-
-static int g_D7E_ConfigCreated = 0;
-
-static void D7E_WriteConfigAPI(const char *api) {
-    char path[MAX_PATH];
-    ExeDirFile("raindrop.ini", path);
-    WritePrivateProfileStringA("Graphics", "API", api, path);
-}
-
-static int D7E_ConfigD3D9(void) {
-    static int initialized = 0;
-    static int useD3D9 = 0;
-    char path[MAX_PATH];
-    char value[32];
-    if (!initialized) {
-        ExeDirFile("raindrop.ini", path);
-        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
-            HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
-                                      FILE_ATTRIBUTE_NORMAL, NULL);
-            if (file != INVALID_HANDLE_VALUE) {
-                static const char defaults[] = "[Graphics]\r\nAPI=DirectDraw\r\n";
-                DWORD written;
-                WriteFile(file, defaults, (DWORD)(sizeof(defaults) - 1), &written, NULL);
-                CloseHandle(file);
-                g_D7E_ConfigCreated = 1;
-                Log("Created raindrop.ini with default Graphics API");
-            }
-        }
-        GetPrivateProfileStringA("Graphics", "API", "DirectDraw", value, sizeof(value), path);
-        useD3D9 = (_stricmp(value, "D3D9") == 0 || _stricmp(value, "Direct3D9") == 0);
-        initialized = 1;
-        Log("Graphics API: %s (raindrop.ini or default)", useD3D9 ? "D3D9" : "DirectDraw");
-    }
-    return useD3D9;
-}
-
-static void D7E_SaveFallbackAPI(void) {
-    if (g_D7E_ConfigCreated) {
-        D7E_WriteConfigAPI("D3D9");
-        g_D7E_ConfigCreated = 0;
-        Log("Saved D3D9 fallback to raindrop.ini");
-    }
-}
-
-static HRESULT D7E_CreateDD7(void **out) {
-    if (!out) return DDERR_INVALIDPARAMS;
-    g_d7.active = 1;
-    g_d7DD.ref++;
-    *out = &g_d7DD;
-    Log("D3D7 emu: using the built-in DirectDraw7/Direct3D7 -> Direct3D9 layer");
-    return DD_OK;
-}
-
-static HMODULE g_real = NULL;
-static FARPROC p_DirectDrawCreate;
-static FARPROC p_DirectDrawCreateClipper;
-static FARPROC p_DirectDrawCreateEx;
-static FARPROC p_DirectDrawEnumerateA;
-static FARPROC p_DirectDrawEnumerateW;
-static FARPROC p_DirectDrawEnumerateExA;
-static FARPROC p_DirectDrawEnumerateExW;
-static FARPROC p_DllCanUnloadNow;
-static FARPROC p_DllGetClassObject;
-static FARPROC p_DllRegisterServer;
-static FARPROC p_DllUnregisterServer;
-
-static void LoadReal(void) {
-    if (g_real) return;
-    LogOpen();
-    QueryPerformanceFrequency(&g_qpcFreq);
-    char sys[MAX_PATH];
-    GetSystemDirectoryA(sys, MAX_PATH);
-    strcat(sys, "\\ddraw.dll");
-    g_real = LoadLibraryA(sys);
-    if (!g_real) {
-        Log("[Error] LoadSystem32 ddraw.dll failed (err=%08X)", (unsigned)GetLastError());
-        return;
-    }
-    Log("Real ddraw: using %s", sys);
-    p_DirectDrawCreate        = GetProcAddress(g_real, "DirectDrawCreate");
-    p_DirectDrawCreateClipper = GetProcAddress(g_real, "DirectDrawCreateClipper");
-    p_DirectDrawCreateEx      = GetProcAddress(g_real, "DirectDrawCreateEx");
-    p_DirectDrawEnumerateA    = GetProcAddress(g_real, "DirectDrawEnumerateA");
-    p_DirectDrawEnumerateW    = GetProcAddress(g_real, "DirectDrawEnumerateW");
-    p_DirectDrawEnumerateExA  = GetProcAddress(g_real, "DirectDrawEnumerateExA");
-    p_DirectDrawEnumerateExW  = GetProcAddress(g_real, "DirectDrawEnumerateExW");
-    p_DllCanUnloadNow         = GetProcAddress(g_real, "DllCanUnloadNow");
-    p_DllGetClassObject       = GetProcAddress(g_real, "DllGetClassObject");
-    p_DllRegisterServer       = GetProcAddress(g_real, "DllRegisterServer");
-    p_DllUnregisterServer     = GetProcAddress(g_real, "DllUnregisterServer");
-    Log("Smd ddraw proxy loaded (real=%p lowlatency=%d dwmflush=%d)",
-        (void*)g_real, g_LowLatency, g_UseDwmFlush);
-}
-
-typedef HRESULT (WINAPI *PF_DDC)(GUID*, LPDIRECTDRAW*, IUnknown*);
-typedef HRESULT (WINAPI *PF_DDClip)(DWORD, LPDIRECTDRAWCLIPPER*, IUnknown*);
-typedef HRESULT (WINAPI *PF_DDCEx)(GUID*, LPVOID*, REFIID, IUnknown*);
-typedef HRESULT (WINAPI *PF_DDEnum)(LPDDENUMCALLBACKA, LPVOID);
-typedef HRESULT (WINAPI *PF_DDEnumEx)(LPDDENUMCALLBACKEXA, LPVOID, DWORD);
-typedef HRESULT (WINAPI *PF_FPOCH)(void);
-
-typedef struct { GUID ids[16]; unsigned count; } DDAdapterList;
-static BOOL WINAPI CollectDDAdapter(GUID *id, LPSTR desc, LPSTR name, LPVOID context, HMONITOR monitor) {
-    DDAdapterList *list = (DDAdapterList*)context;
-    (void)desc; (void)name; (void)monitor;
-    if (id && list->count < sizeof(list->ids) / sizeof(list->ids[0]))
-        list->ids[list->count++] = *id;
-    return TRUE;
-}
-
-typedef struct { IDirectDraw7Vtbl *lpVtbl; IDirectDraw7 *orig; } DD7W;
-
-static const GUID k_IID_IDirectDraw7 = {
-    0x15E65EC0, 0x3B9C, 0x11D2,
-    { 0xB9, 0x2F, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B }
-};
-static const GUID k_IID_IDirect3D7 = {
-    0xF5049E77, 0x4861, 0x11D2,
-    { 0xA4, 0x07, 0x00, 0xA0, 0xC9, 0x06, 0x29, 0xA8 }
-};
-static const GUID k_IID_IDirectDraw = {
-    0x6C14DB80, 0xA733, 0x11CE,
-    { 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60 }
-};
-static const GUID k_IID_IDirectDraw2 = {
-    0xB3A6F3E0, 0x2B43, 0x11CF,
-    { 0xA2, 0xDE, 0x00, 0xAA, 0x00, 0xB9, 0x33, 0x56 }
-};
-static const GUID k_IID_IDirectDraw3 = {
-    0x618F8AD4, 0x8B7A, 0x11D0,
-    { 0x8F, 0xCC, 0x00, 0xC0, 0x4F, 0xD9, 0x18, 0x9D }
-};
-static const GUID k_IID_IDirectDraw4 = {
-    0x9C59509A, 0x39BD, 0x11D1,
-    { 0x8C, 0x4A, 0x00, 0xC0, 0x4F, 0xD9, 0x30, 0xC5 }
-};
-
-static HRESULT STDMETHODCALLTYPE WDD7_QueryInterface(IDirectDraw7 *self, REFIID riid, void **out) {
-    DD7W *w = (DD7W*)self;
-    if (!out) return E_POINTER;
-    *out = NULL;
-    if (IsEqualCLSID(riid, &k_IID_IDirectDraw) ||
-        IsEqualCLSID(riid, &k_IID_IDirectDraw2) ||
-        IsEqualCLSID(riid, &k_IID_IDirectDraw3) ||
-        IsEqualCLSID(riid, &k_IID_IDirectDraw4)) {
-        IDirectDraw7_AddRef(w->orig);
-        *out = self;
-        return DD_OK;
-    }
-    if (!IsEqualCLSID(riid, &k_IID_IDirectDraw7)) {
-        HRESULT hr = IDirectDraw7_QueryInterface(w->orig, riid, out);
-        if (FAILED(hr))
-            Log("DD7.QI failed iid=%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X hr=%08X",
-                (unsigned long)riid->Data1, (unsigned)riid->Data2, (unsigned)riid->Data3,
-                (unsigned)riid->Data4[0], (unsigned)riid->Data4[1],
-                (unsigned)riid->Data4[2], (unsigned)riid->Data4[3],
-                (unsigned)riid->Data4[4], (unsigned)riid->Data4[5],
-                (unsigned)riid->Data4[6], (unsigned)riid->Data4[7], hr);
-        else if (g_ApiCensus && IsEqualCLSID(riid, &k_IID_IDirect3D7))
-            CensusHookD3D7(*out);
-        return hr;
-    }
-    IDirectDraw7_AddRef(w->orig);
-    *out = self;
-    return DD_OK;
-}
-static ULONG STDMETHODCALLTYPE WDD7_AddRef(IDirectDraw7 *self) {
-    DD7W *w = (DD7W*)self;
-    return IDirectDraw7_AddRef(w->orig);
-}
-static ULONG STDMETHODCALLTYPE WDD7_Release(IDirectDraw7 *self) {
-    DD7W *w = (DD7W*)self;
-    ULONG r = IDirectDraw7_Release(w->orig);
-    Log("DD7.Release -> orig refs=%lu", r);
-    if (r == 0) {
-        free(w);
-        Log("DD7 wrapper destroyed");
-    }
-    return r;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_Compact(IDirectDraw7 *self) {
-    return IDirectDraw7_Compact(((DD7W*)self)->orig);
-}
-static HRESULT STDMETHODCALLTYPE WDD7_CreateClipper(IDirectDraw7 *self, DWORD f, LPDIRECTDRAWCLIPPER *c, IUnknown *u) {
-    DD7W *w = (DD7W*)self;
-    HRESULT hr = IDirectDraw7_CreateClipper(w->orig, f, c, u);
-    Log("DD7.CreateClipper f=%X -> hr=%08X", f, hr);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_CreatePalette(IDirectDraw7 *self, DWORD f, LPPALETTEENTRY t, LPDIRECTDRAWPALETTE *p, IUnknown *u) {
-    DD7W *w = (DD7W*)self;
-    HRESULT hr = IDirectDraw7_CreatePalette(w->orig, f, t, p, u);
-    Log("DD7.CreatePalette f=%X -> hr=%08X", f, hr);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_CreateSurface(IDirectDraw7 *self, LPDDSURFACEDESC2 d, LPDIRECTDRAWSURFACE7 *s, IUnknown *u) {
-    DD7W *w = (DD7W*)self;
-    HRESULT hr = IDirectDraw7_CreateSurface(w->orig, d, s, u);
-    if (d && g_LogAll)
-        Log("DD7.CreateSurface %lux%lux bpp=%d caps=%lX/%lX back=%d dwFlags=%lX -> hr=%08X",
-            (unsigned long)d->dwWidth, (unsigned long)d->dwHeight,
-            (d->dwFlags & DDSD_PIXELFORMAT) ? (int)d->ddpfPixelFormat.dwRGBBitCount : -1,
-            (unsigned long)((d->dwFlags & DDSD_CAPS) ? d->ddsCaps.dwCaps : 0),
-            (unsigned long)d->dwFlags, (int)d->dwBackBufferCount, hr);
-    else if (hr < 0)
-        Log("DD7.CreateSurface -> hr=%08X", hr);
-    if (hr < 0 && g_fullscreenRequested && d &&
-        (d->dwFlags & DDSD_CAPS) && (d->ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE))
-        TriggerWindowFallback("CreateSurface(primary) failed");
-    if (hr >= 0 && g_LowLatency && d && s && *s &&
-        (d->dwFlags & DDSD_CAPS) && (d->ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE))
-        HookPrimary(*s);
-    if (hr >= 0 && g_ApiCensus && s && *s)
-        CensusHookSurface(*s);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_DuplicateSurface(IDirectDraw7 *self, LPDIRECTDRAWSURFACE7 s, LPDIRECTDRAWSURFACE7 *o) {
-    return IDirectDraw7_DuplicateSurface(((DD7W*)self)->orig, s, o);
-}
-static HRESULT STDMETHODCALLTYPE WDD7_EnumDisplayModes(IDirectDraw7 *self, DWORD f, LPDDSURFACEDESC2 d, LPVOID c, LPDDENUMMODESCALLBACK2 cb) {
-    DD7W *w = (DD7W*)self;
-    HRESULT hr = IDirectDraw7_EnumDisplayModes(w->orig, f, d, c, cb);
-    Log("DD7.EnumDisplayModes f=%X -> hr=%08X", f, hr);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_EnumSurfaces(IDirectDraw7 *self, DWORD f, LPDDSURFACEDESC2 d, LPVOID c, LPDDENUMSURFACESCALLBACK7 cb) {
-    return IDirectDraw7_EnumSurfaces(((DD7W*)self)->orig, f, d, c, cb);
-}
-static HRESULT STDMETHODCALLTYPE WDD7_FlipToGDISurface(IDirectDraw7 *self) {
-    HRESULT hr = IDirectDraw7_FlipToGDISurface(((DD7W*)self)->orig);
-    Log("DD7.FlipToGDISurface -> hr=%08X", hr);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_GetCaps(IDirectDraw7 *self, LPDDCAPS h, LPDDCAPS hel) {
-    HRESULT hr = IDirectDraw7_GetCaps(((DD7W*)self)->orig, h, hel);
-    if (g_LogAll) Log("DD7.GetCaps -> hr=%08X", hr);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_GetDisplayMode(IDirectDraw7 *self, LPDDSURFACEDESC2 d) {
-    HRESULT hr = IDirectDraw7_GetDisplayMode(((DD7W*)self)->orig, d);
-    if (d && g_LogAll)
-        Log("DD7.GetDisplayMode -> hr=%08X %lux%lux modex=%s bpp=%d", hr,
-            (unsigned long)d->dwWidth, (unsigned long)d->dwHeight,
-            (d->ddpfPixelFormat.dwFlags & DDPF_RGB) ? "RGB" : "NOT_RGB",
-            (d->ddpfPixelFormat.dwFlags & DDPF_RGB) ? (int)d->ddpfPixelFormat.dwRGBBitCount : -1);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_GetFourCCCodes(IDirectDraw7 *self, LPDWORD n, LPDWORD l) {
-    return IDirectDraw7_GetFourCCCodes(((DD7W*)self)->orig, n, l);
-}
-static HRESULT STDMETHODCALLTYPE WDD7_GetGDISurface(IDirectDraw7 *self, LPDIRECTDRAWSURFACE7 *s) {
-    return IDirectDraw7_GetGDISurface(((DD7W*)self)->orig, s);
-}
-static HRESULT STDMETHODCALLTYPE WDD7_GetMonitorFrequency(IDirectDraw7 *self, LPDWORD f) {
-    HRESULT hr = IDirectDraw7_GetMonitorFrequency(((DD7W*)self)->orig, f);
-    if (g_LogAll) Log("DD7.GetMonitorFrequency -> hr=%08X freq=%lu", hr, f ? *f : 0);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_GetScanLine(IDirectDraw7 *self, LPDWORD s) {
-    return IDirectDraw7_GetScanLine(((DD7W*)self)->orig, s);
-}
-static HRESULT STDMETHODCALLTYPE WDD7_GetVerticalBlankStatus(IDirectDraw7 *self, BOOL *b) {
-    return IDirectDraw7_GetVerticalBlankStatus(((DD7W*)self)->orig, b);
-}
-static HRESULT STDMETHODCALLTYPE WDD7_Initialize(IDirectDraw7 *self, GUID *g) {
-    return IDirectDraw7_Initialize(((DD7W*)self)->orig, g);
-}
-static HRESULT STDMETHODCALLTYPE WDD7_RestoreDisplayMode(IDirectDraw7 *self) {
-    HRESULT hr = IDirectDraw7_RestoreDisplayMode(((DD7W*)self)->orig);
-    Log("DD7.RestoreDisplayMode -> hr=%08X", hr);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_SetCooperativeLevel(IDirectDraw7 *self, HWND hwnd, DWORD flags) {
-    DD7W *w7 = (DD7W*)self;
-    if (g_StripAllowModeX && (flags & DDSCL_ALLOWMODEX)) {
-        flags &= ~DDSCL_ALLOWMODEX;
-    }
-    HotkeyAttach(hwnd);
-    D7_BringToFront(hwnd);
-    if (flags & DDSCL_EXCLUSIVE) g_fullscreenRequested = 1;
-    HRESULT hr = IDirectDraw7_SetCooperativeLevel(w7->orig, hwnd, flags);
-    Log("DD7.SetCooperativeLevel hwnd=%p flags=%X -> hr=%08X",
-        (void*)hwnd, (unsigned)flags, hr);
-    if (hr >= 0 || !g_RetryCoopLevel) return hr;
-
-    if (flags & DDSCL_EXCLUSIVE) {
-        DWORD f = DDSCL_EXCLUSIVE | DDSCL_FULLSCREEN;
-        hr = IDirectDraw7_SetCooperativeLevel(w7->orig, hwnd, f);
-        Log("DD7.SetCooperativeLevel retry1 flags=%X -> hr=%08X", f, hr);
-        if (hr >= 0) return hr;
-        TriggerWindowFallback("SetCooperativeLevel(exclusive) failed");
-    }
-    {
-        DWORD f = DDSCL_NORMAL | DDSCL_NOWINDOWCHANGES;
-        hr = IDirectDraw7_SetCooperativeLevel(w7->orig, hwnd, f);
-        Log("DD7.SetCooperativeLevel retry2 flags=%X -> hr=%08X", f, hr);
-        if (hr >= 0) return hr;
-    }
-    if (flags & DDSCL_FULLSCREEN) {
-        DWORD f = DDSCL_FULLSCREEN | DDSCL_NOWINDOWCHANGES;
-        hr = IDirectDraw7_SetCooperativeLevel(w7->orig, hwnd, f);
-        Log("DD7.SetCooperativeLevel retry3 flags=%X -> hr=%08X", f, hr);
-        if (hr >= 0) return hr;
-    }
-    return DDERR_GENERIC;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_SetDisplayMode(IDirectDraw7 *self, DWORD wd, DWORD ht, DWORD bpp, DWORD refresh, DWORD flags) {
-    DD7W *w7 = (DD7W*)self;
-    HRESULT hr = IDirectDraw7_SetDisplayMode(w7->orig, wd, ht, bpp, refresh, flags);
-    Log("DD7.SetDisplayMode %lux%lux bpp=%lu refresh=%lu f=%X -> hr=%08X",
-        (unsigned long)wd, (unsigned long)ht, (unsigned long)bpp, (unsigned long)refresh, (unsigned)flags, hr);
-    if (hr < 0 && g_RetryDisplayMode)
-        hr = TrySetDisplayMode(w7->orig, wd, ht, bpp, refresh, flags);
-    if (hr < 0) {
-        g_displayModeFailures++;
-        if (bpp <= 16 || g_displayModeFailures >= 2)
-            TriggerWindowFallback("SetDisplayMode failed");
-    }
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_WaitForVerticalBlank(IDirectDraw7 *self, DWORD f, HANDLE ev) {
-    HRESULT hr = IDirectDraw7_WaitForVerticalBlank(((DD7W*)self)->orig, f, ev);
-    if (g_LogAll) Log("DD7.WaitForVerticalBlank f=%X -> hr=%08X", f, hr);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_GetAvailableVidMem(IDirectDraw7 *self, LPDDSCAPS2 c, LPDWORD t, LPDWORD freev) {
-    return IDirectDraw7_GetAvailableVidMem(((DD7W*)self)->orig, c, t, freev);
-}
-static HRESULT STDMETHODCALLTYPE WDD7_GetSurfaceFromDC(IDirectDraw7 *self, HDC dc, LPDIRECTDRAWSURFACE7 *s) {
-    return IDirectDraw7_GetSurfaceFromDC(((DD7W*)self)->orig, dc, s);
-}
-static HRESULT STDMETHODCALLTYPE WDD7_RestoreAllSurfaces(IDirectDraw7 *self) {
-    HRESULT hr = IDirectDraw7_RestoreAllSurfaces(((DD7W*)self)->orig);
-    Log("DD7.RestoreAllSurfaces -> hr=%08X", hr);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_TestCooperativeLevel(IDirectDraw7 *self) {
-    HRESULT hr = IDirectDraw7_TestCooperativeLevel(((DD7W*)self)->orig);
-    if (hr < 0 || g_LogAll) Log("DD7.TestCooperativeLevel -> hr=%08X", hr);
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_GetDeviceIdentifier(IDirectDraw7 *self, LPDDDEVICEIDENTIFIER2 p, DWORD f) {
-    DD7W *w = (DD7W*)self;
-    HRESULT hr = IDirectDraw7_GetDeviceIdentifier(w->orig, p, f);
-    Log("DD7.GetDeviceIdentifier -> hr=%08X dev=%lld desc=%.64s", hr,
-        p ? p->liDriverVersion.QuadPart : 0LL, p ? p->szDescription : "");
-    return hr;
-}
-static HRESULT STDMETHODCALLTYPE WDD7_StartModeTest(IDirectDraw7 *self, LPSIZE s, DWORD n, DWORD f) {
-    return IDirectDraw7_StartModeTest(((DD7W*)self)->orig, s, n, f);
-}
-static HRESULT STDMETHODCALLTYPE WDD7_EvaluateMode(IDirectDraw7 *self, DWORD f, DWORD *t) {
-    return IDirectDraw7_EvaluateMode(((DD7W*)self)->orig, f, t);
-}
-
-static IDirectDraw7Vtbl g_dd7Vtbl = {
-    WDD7_QueryInterface,
-    WDD7_AddRef,
-    WDD7_Release,
-    WDD7_Compact,
-    WDD7_CreateClipper,
-    WDD7_CreatePalette,
-    WDD7_CreateSurface,
-    WDD7_DuplicateSurface,
-    WDD7_EnumDisplayModes,
-    WDD7_EnumSurfaces,
-    WDD7_FlipToGDISurface,
-    WDD7_GetCaps,
-    WDD7_GetDisplayMode,
-    WDD7_GetFourCCCodes,
-    WDD7_GetGDISurface,
-    WDD7_GetMonitorFrequency,
-    WDD7_GetScanLine,
-    WDD7_GetVerticalBlankStatus,
-    WDD7_Initialize,
-    WDD7_RestoreDisplayMode,
-    WDD7_SetCooperativeLevel,
-    WDD7_SetDisplayMode,
-    WDD7_WaitForVerticalBlank,
-    WDD7_GetAvailableVidMem,
-    WDD7_GetSurfaceFromDC,
-    WDD7_RestoreAllSurfaces,
-    WDD7_TestCooperativeLevel,
-    WDD7_GetDeviceIdentifier,
-    WDD7_StartModeTest,
-    WDD7_EvaluateMode
-};
-
-static IDirectDraw7* WrapDD7(IDirectDraw7 *orig) {
-    DD7W *w = (DD7W*)malloc(sizeof(DD7W));
-    if (!w) return orig;
-    w->lpVtbl = &g_dd7Vtbl;
-    w->orig = orig;
-    IDirectDraw7_AddRef(orig);
-    return (IDirectDraw7*)w;
-}
-
-static HRESULT WINAPI Hook_DirectDrawCreateEx(GUID *guid, LPVOID *out, REFIID riid, IUnknown *unk) {
-    LoadReal();
-    if (!out) return DDERR_INVALIDPARAMS;
-    *out = NULL;
-    if (!IsEqualCLSID(riid, &k_IID_IDirectDraw7)) {
-        if (!p_DirectDrawCreateEx) return DDERR_GENERIC;
-        PF_DDCEx fn = (PF_DDCEx)p_DirectDrawCreateEx;
-        HRESULT hr = fn(guid, out, riid, unk);
-        Log("DirectDrawCreateEx (other) -> hr=%08X", hr);
-        return hr;
-    }
-    if (g_D7Emu && (D7E_Forced() || D7E_ConfigD3D9())) {
-        Log("GraphicsAPI: selecting built-in Direct3D9 emulation");
-        return D7E_CreateDD7(out);
-    }
-    if (!p_DirectDrawCreateEx) {
-        if (g_D7Emu) {
-            Log("System DirectDrawCreateEx is unavailable; switching to Direct3D9 emulation");
-            D7E_SaveFallbackAPI();
-            return D7E_CreateDD7(out);
-        }
-        return DDERR_GENERIC;
-    }
-    PF_DDCEx fn = (PF_DDCEx)p_DirectDrawCreateEx;
-    IDirectDraw7 *orig = NULL;
-    HRESULT hr = fn(guid, (LPVOID*)&orig, riid, unk);
-    Log("DirectDrawCreateEx(IID_IDirectDraw7) -> hr=%08X orig=%p", hr, (void*)orig);
-    if (hr < 0 || !orig) {
-        if (g_D7Emu) {
-            Log("DirectDraw7 creation failed (hr=%08X); switching to Direct3D9 emulation", (unsigned)hr);
-            D7E_SaveFallbackAPI();
-            return D7E_CreateDD7(out);
-        }
-        return hr;
-    }
-        IUnknown *d3d7 = NULL;
-        HRESULT d3dHr = IDirectDraw7_QueryInterface(orig, &k_IID_IDirect3D7, (void**)&d3d7);
-        if (d3dHr >= 0 && d3d7) {
-            IUnknown_Release(d3d7);
-            Log("Direct3D7 probe: available on default adapter");
-        } else {
-            Log("Direct3D7 probe failed on default adapter (hr=%08X); checking other adapters", (unsigned)d3dHr);
-            IDirectDraw7_Release(orig);
-            orig = NULL;
-            if (p_DirectDrawEnumerateExA) {
-                DDAdapterList list;
-                unsigned i;
-                memset(&list, 0, sizeof(list));
-                ((PF_DDEnumEx)p_DirectDrawEnumerateExA)(CollectDDAdapter, &list,
-                    DDENUM_ATTACHEDSECONDARYDEVICES | DDENUM_DETACHEDSECONDARYDEVICES);
-                for (i = 0; i < list.count; ++i) {
-                    IDirectDraw7 *adapter = NULL;
-                    HRESULT adapterHr = fn(&list.ids[i], (LPVOID*)&adapter, riid, unk);
-                    if (adapterHr < 0 || !adapter) continue;
-                    d3d7 = NULL;
-                    d3dHr = IDirectDraw7_QueryInterface(adapter, &k_IID_IDirect3D7, (void**)&d3d7);
-                    if (d3dHr >= 0 && d3d7) {
-                        IUnknown_Release(d3d7);
-                        Log("Direct3D7 probe: available on enumerated adapter %u", i);
-                        orig = adapter;
-                        hr = adapterHr;
-                        break;
-                    }
-                    IDirectDraw7_Release(adapter);
-                    Log("Direct3D7 probe failed on enumerated adapter %u (hr=%08X)", i, (unsigned)d3dHr);
-                }
-                if (!orig) {
-                    Log("No enumerated adapter exposes Direct3D7");
-                }
-            }
-            if (orig) goto ddraw_ready;
-            if (g_D7Emu) {
-                Log("No usable system Direct3D7 interface (hr=%08X); switching to Direct3D9 emulation",
-                    (unsigned)d3dHr);
-                D7E_SaveFallbackAPI();
-                return D7E_CreateDD7(out);
-            }
-            return d3dHr;
-        }
-ddraw_ready:
-    IDirectDraw7 *wrapped = WrapDD7(orig);
-    if (wrapped != orig) {
-        Log("DD7 wrapped ok");
-        IDirectDraw7_Release(orig);
-    }
-    *out = wrapped;
-    if (g_ApiCensus && wrapped != orig)
-        CensusHookVtbl((void**)&g_dd7Vtbl, CEN_DD7, 30, 0);
-    return hr;
-}
-
-#if defined(_MSC_VER)
-#define SMD_DLL_EXPORT
-#else
-#define SMD_DLL_EXPORT __declspec(dllexport)
-#endif
-
-SMD_DLL_EXPORT HRESULT WINAPI DirectDrawCreate(GUID *g, LPDIRECTDRAW *out, IUnknown *u) {
-    LoadReal();
-    if (!p_DirectDrawCreate) return DDERR_GENERIC;
-    HRESULT hr = ((PF_DDC)p_DirectDrawCreate)(g, out, u);
-    Log("DirectDrawCreate -> hr=%08X", hr);
-    return hr;
-}
-SMD_DLL_EXPORT HRESULT WINAPI DirectDrawCreateClipper(DWORD flags, LPDIRECTDRAWCLIPPER *c, IUnknown *u) {
-    LoadReal();
-    if (!p_DirectDrawCreateClipper) return DDERR_GENERIC;
-    HRESULT hr = ((PF_DDClip)p_DirectDrawCreateClipper)(flags, c, u);
-    Log("DirectDrawCreateClipper -> hr=%08X", hr);
-    return hr;
-}
-SMD_DLL_EXPORT HRESULT WINAPI DirectDrawCreateEx(GUID *g, LPVOID *o, REFIID i, IUnknown *u) {
-    return Hook_DirectDrawCreateEx(g, o, i, u);
-}
-SMD_DLL_EXPORT HRESULT WINAPI DirectDrawEnumerateA(LPDDENUMCALLBACKA cb, void *ctx) {
-    LoadReal();
-    if (!p_DirectDrawEnumerateA) return DDERR_GENERIC;
-    HRESULT hr = ((PF_DDEnum)p_DirectDrawEnumerateA)(cb, ctx);
-    Log("DirectDrawEnumerateA -> hr=%08X", hr);
-    return hr;
-}
-SMD_DLL_EXPORT HRESULT WINAPI DirectDrawEnumerateW(LPDDENUMCALLBACKW cb, void *ctx) {
-    typedef HRESULT (WINAPI *PF_DDEnumW)(LPDDENUMCALLBACKW, LPVOID);
-    LoadReal();
-    if (!p_DirectDrawEnumerateW) return DDERR_GENERIC;
-    HRESULT hr = ((PF_DDEnumW)p_DirectDrawEnumerateW)(cb, ctx);
-    Log("DirectDrawEnumerateW -> hr=%08X", hr);
-    return hr;
-}
-SMD_DLL_EXPORT HRESULT WINAPI DirectDrawEnumerateExA(LPDDENUMCALLBACKEXA cb, void *ctx, DWORD flags) {
-    LoadReal();
-    if (!p_DirectDrawEnumerateExA) return DDERR_GENERIC;
-    HRESULT hr = ((PF_DDEnumEx)p_DirectDrawEnumerateExA)(cb, ctx, flags);
-    Log("DirectDrawEnumerateExA -> hr=%08X", hr);
-    return hr;
-}
-SMD_DLL_EXPORT HRESULT WINAPI DirectDrawEnumerateExW(LPDDENUMCALLBACKEXW cb, void *ctx, DWORD flags) {
-    typedef HRESULT (WINAPI *PF_DDEnumExW)(LPDDENUMCALLBACKEXW, LPVOID, DWORD);
-    LoadReal();
-    if (!p_DirectDrawEnumerateExW) return DDERR_GENERIC;
-    HRESULT hr = ((PF_DDEnumExW)p_DirectDrawEnumerateExW)(cb, ctx, flags);
-    Log("DirectDrawEnumerateExW -> hr=%08X", hr);
-    return hr;
-}
-SMD_DLL_EXPORT HRESULT WINAPI DllCanUnloadNow(void) {
-    LoadReal();
-    if (!p_DllCanUnloadNow) return S_FALSE;
-    return ((PF_FPOCH)p_DllCanUnloadNow)();
-}
-SMD_DLL_EXPORT HRESULT WINAPI DllGetClassObject(REFCLSID cls, REFIID iid, void **out) {
-    typedef HRESULT (WINAPI *PF_DGCO)(REFCLSID, REFIID, void**);
-    LoadReal();
-    if (!p_DllGetClassObject) return CLASS_E_CLASSNOTAVAILABLE;
-    return ((PF_DGCO)p_DllGetClassObject)(cls, iid, out);
-}
-SMD_DLL_EXPORT HRESULT WINAPI DllRegisterServer(void) {
-    LoadReal();
-    if (!p_DllRegisterServer) return E_FAIL;
-    return ((PF_FPOCH)p_DllRegisterServer)();
-}
-SMD_DLL_EXPORT HRESULT WINAPI DllUnregisterServer(void) {
-    LoadReal();
-    if (!p_DllUnregisterServer) return E_FAIL;
-    return ((PF_FPOCH)p_DllUnregisterServer)();
-}
-
 /*
  * Extra practice: no replay save prompt.
  *
@@ -7486,7 +4829,7 @@ typedef void (__cdecl *PF_SceneSwitch)(int scene, int force);
 
 static void __cdecl StageEndSceneHook(int scene, int force) {
     if (scene == 5 && g_exRun) {
-        Log("ExArea: practice run ended, going to the title instead of the replay save scene");
+        SmdLog("ExArea: practice run ended, going to the title instead of the replay save scene");
         scene = 1;
     }
     ((PF_SceneSwitch)(uintptr_t)0x4254d0)(scene, force);
@@ -7498,19 +4841,20 @@ static void PatchExNoReplaySave(void) {
     int n = 0;
 
     if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
-        Log("ExNoReplaySave: unexpected image base, skipped");
+        SmdLog("ExNoReplaySave: unexpected image base, skipped");
         return;
     }
     for (; p + 9 <= end; p++) {
         if (p[0] == 0x6a && p[1] == 0x00 && p[2] == 0x6a && p[3] == 0x05 && p[4] == 0xe8) {
             if (HookCall((DWORD)(uintptr_t)(p + 4), 0x4254d0, (void*)&StageEndSceneHook)) {
-                Log("ExNoReplaySave: hooked scene 5 switch at 0x%08X", (unsigned)(uintptr_t)(p + 4));
+                SmdLog("ExNoReplaySave: hooked scene 5 switch at 0x%08X", (unsigned)(uintptr_t)(p + 4));
                 n++;
             }
         }
     }
-    Log("ExNoReplaySave: patched %d call site(s)", n);
+    SmdLog("ExNoReplaySave: patched %d call site(s)", n);
 }
+
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     switch (reason) {
@@ -7519,7 +4863,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         QueryPerformanceFrequency(&g_qpcFreq);
         Log("process attach (pid=%lu)", GetCurrentProcessId());
         LogWindowsVersion();
-        CensusInit();
+        SmdD3D9CensusInit();
         InitFallbackInstance();
         PatchColorDepth32();
         PatchForceWindowMode();
@@ -7540,13 +4884,13 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         PatchPauseAudio();
         PatchSoundFix();
         PatchFrameWait();
-        PatchEnterMask();
+        SmdD3D9PatchEnterMask();
         PatchKeepRunningInactive();
-        PatchModernController();
+        SmdControllerInit();
         break;
     case DLL_PROCESS_DETACH:
         Log("process detach");
-        CensusSummary();
+        SmdD3D9CensusSummary();
         SeSummary();
         if (g_log) {
             FILE *f = g_log;

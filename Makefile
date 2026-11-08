@@ -20,22 +20,34 @@ $(BUILD)/d3d9.dll: $(BUILD)/RefRain.o
 $(BUILD)/RefRain.o: src/RefRain.c src/d3dx9_font_compat.h | $(BUILD)
 	$(CC) -c -o $@ $< $(CFLAGS)
 
-# make smd : src/Smd.c -> build/ddraw.dll
+# make smd : Smd sources -> build/ddraw.dll
 smd: $(BUILD)/ddraw.dll
 
-# make smd-debug : Debug src/Smd.c -> build/debug/ddraw.dll
+# make smd-debug : Debug Smd sources -> build/debug/ddraw.dll
 smd-debug: $(BUILD)/debug/ddraw.dll
 
-$(BUILD)/debug/ddraw.dll: $(BUILD)/Smd_debug.o | $(BUILD)/debug
+$(BUILD)/debug/ddraw.dll: $(BUILD)/Smd_debug.o $(BUILD)/Smd_d3d9_debug.o $(BUILD)/Smd_controller_debug.o | $(BUILD)/debug
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldxguid
 
-$(BUILD)/Smd_debug.o: src/Smd.c | $(BUILD)
+$(BUILD)/Smd_debug.o: src/Smd.c src/Smd_internal.h | $(BUILD)
 	$(CC) -c -o $@ $< $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS)
 
-$(BUILD)/ddraw.dll: $(BUILD)/Smd.o
+$(BUILD)/Smd_d3d9_debug.o: src/Smd_d3d9.c src/Smd_internal.h | $(BUILD)
+	$(CC) -c -o $@ $< $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS)
+
+$(BUILD)/Smd_controller_debug.o: src/Smd_controller.c src/Smd_internal.h | $(BUILD)
+	$(CC) -c -o $@ $< $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS)
+
+$(BUILD)/ddraw.dll: $(BUILD)/Smd.o $(BUILD)/Smd_d3d9.o $(BUILD)/Smd_controller.o
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldxguid
 
-$(BUILD)/Smd.o: src/Smd.c | $(BUILD)
+$(BUILD)/Smd.o: src/Smd.c src/Smd_internal.h | $(BUILD)
+	$(CC) -c -o $@ $< $(SMD_CFLAGS) $(SMD_DEFS)
+
+$(BUILD)/Smd_d3d9.o: src/Smd_d3d9.c src/Smd_internal.h | $(BUILD)
+	$(CC) -c -o $@ $< $(SMD_CFLAGS) $(SMD_DEFS)
+
+$(BUILD)/Smd_controller.o: src/Smd_controller.c src/Smd_internal.h | $(BUILD)
 	$(CC) -c -o $@ $< $(SMD_CFLAGS) $(SMD_DEFS)
 
 $(BUILD):

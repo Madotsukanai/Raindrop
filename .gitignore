@@ -1,6 +1,7 @@
 build/
 .opencode/
 .smd_extract/
+.freebuff/
 d3d9.dll
 ddraw.dll
 extract_smd.sh

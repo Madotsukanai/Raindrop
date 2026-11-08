@@ -1,14 +1,13 @@
-# Windows build file for nmake + 32-bit MinGW-w64 GCC.
-# Run from a Visual Studio Developer Command Prompt after adding the MinGW32
-# bin directory to PATH, for example C:\msys64\mingw32\bin.
+# Build x86 Windows DLLs with clang-cl and the MSVC linker.
+# Run from an x86 Native Tools Command Prompt with LLVM tools installed.
 
-!IFNDEF MINGW_CC
-MINGW_CC = i686-w64-mingw32-gcc
+!IFNDEF CLANG_CL
+CLANG_CL = clang-cl
 !ENDIF
 
-CFLAGS = -O2 -Wall
-SMD_CFLAGS = -O2 -Wall -Wno-unused-function -Wno-unused-variable
-LDFLAGS = -shared -static-libgcc -s -Wl,--kill-at
+TARGET = --target=i686-pc-windows-msvc
+CFLAGS = /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS
+LINKFLAGS = /MACHINE:X86 /INCREMENTAL:NO /MANIFEST:NO
 
 all: build\d3d9.dll build\ddraw.dll
 
@@ -24,14 +23,14 @@ build:
 build\debug: build
 	@if not exist build\debug mkdir build\debug
 
-build\d3d9.dll: src\RefRain.c src\d3dx9_font_compat.h build
-	$(MINGW_CC) -o $@ src\RefRain.c $(CFLAGS) $(LDFLAGS) -lwinmm
+build\d3d9.dll: src\RefRain.c src\d3dx9_font_compat.h def\d3d9.def build
+	$(CLANG_CL) $(TARGET) $(CFLAGS) /LD src\RefRain.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\d3d9.def user32.lib winmm.lib
 
-build\ddraw.dll: src\Smd.c build
-	$(MINGW_CC) -o $@ src\Smd.c $(SMD_CFLAGS) $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldinput -ldxguid
+build\ddraw.dll: src\Smd.c src\Smd_d3d9.c src\Smd_controller.c src\Smd_internal.h def\ddraw.def build
+	$(CLANG_CL) $(TARGET) $(CFLAGS) /LD src\Smd.c src\Smd_d3d9.c src\Smd_controller.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\ddraw.def /FORCE:MULTIPLE user32.lib gdi32.lib dxguid.lib
 
-build\debug\ddraw.dll: src\Smd.c build\debug
-	$(MINGW_CC) -o $@ src\Smd.c $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldinput -ldxguid
+build\debug\ddraw.dll: src\Smd.c src\Smd_d3d9.c src\Smd_controller.c src\Smd_internal.h def\ddraw.def build\debug
+	$(CLANG_CL) $(TARGET) $(CFLAGS) /DSMD_DEBUG_BUILD /LD src\Smd.c src\Smd_d3d9.c src\Smd_controller.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\ddraw.def /FORCE:MULTIPLE user32.lib gdi32.lib dxguid.lib
 
 clean:
 	@if exist build rmdir /S /Q build
