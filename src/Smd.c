@@ -367,6 +367,15 @@ static void OnPresent(LONGLONG a, LONGLONG b, LONGLONG c, LONGLONG d, int flip, 
     LeaveCriticalSection(&g_cs);
 }
 
+static int SmdIsWine(void) {
+    static int v = -1;
+    if (v < 0) {
+        HMODULE ntd = GetModuleHandleA("ntdll.dll");
+        v = (ntd && GetProcAddress(ntd, "wine_get_version")) ? 1 : 0;
+    }
+    return v;
+}
+
 static void FinishPresent(IDirectDrawSurface7 *s, int flip, LARGE_INTEGER a, LARGE_INTEGER b) {
     LARGE_INTEGER c, d, t;
     int timedOut = 0;
@@ -384,7 +393,7 @@ static void FinishPresent(IDirectDrawSurface7 *s, int flip, LARGE_INTEGER a, LAR
         }
     }
     QueryPerformanceCounter(&c);
-    if (g_LowLatency && !flip && g_UseDwmFlush && g_pDwmFlush) g_pDwmFlush();
+    if (g_LowLatency && !flip && g_UseDwmFlush && g_pDwmFlush && !SmdIsWine()) g_pDwmFlush();
     QueryPerformanceCounter(&d);
     OnPresent(a.QuadPart, b.QuadPart, c.QuadPart, d.QuadPart, flip, timedOut);
 }
@@ -414,11 +423,109 @@ static void MeasureInit(void) {
 
 static void BatchFlush(void);
 
+static void SmdWineForceBorderless(HWND hwnd) {
+    MONITORINFO mi;
+    HMONITOR mon;
+    DWORD style;
+    if (!hwnd || !IsWindow(hwnd)) return;
+    mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+    memset(&mi, 0, sizeof(mi)); mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoA(mon, &mi)) return;
+    style = (DWORD)GetWindowLongA(hwnd, GWL_STYLE);
+    style &= ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
+    style |= WS_POPUP | WS_VISIBLE;
+    SetWindowLongA(hwnd, GWL_STYLE, (LONG)style);
+    SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                 mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                 SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+}
+
+/* Wine: when the game blits to the primary in "fullscreen", the 640x480 image can
+   land in the top-left of a larger (or badly sized) window.  Stretch to the window. */
+static void SmdWineStretchPrimary(IDirectDrawSurface7 *self, LPDIRECTDRAWSURFACE7 src, LPRECT sr) {
+    static int logged, fsLogged, dbg;
+    HDC wdc = NULL;
+    HWND hw = NULL;
+    RECT cr;
+    DDSURFACEDESC2 pd, sd;
+    int cw, ch, sw = 640, sh = 480;
+    if (!SmdIsWine() || !src) return;
+    memset(&pd, 0, sizeof(pd)); pd.dwSize = sizeof(pd);
+    if (SUCCEEDED(IDirectDrawSurface7_GetSurfaceDesc(self, &pd))) hw = (HWND)pd.lpSurface;
+    if (!hw || !IsWindow(hw)) hw = GetActiveWindow();
+    if (!hw || !IsWindow(hw)) hw = GetForegroundWindow();
+    if (!hw || !GetClientRect(hw, &cr)) {
+        if (dbg < 3) { dbg++; Log("WineStretch: no hwnd/client"); }
+        return;
+    }
+    cw = cr.right - cr.left; ch = cr.bottom - cr.top;
+    memset(&sd, 0, sizeof(sd)); sd.dwSize = sizeof(sd);
+    if (SUCCEEDED(IDirectDrawSurface7_GetSurfaceDesc(src, &sd)) && sd.dwWidth && sd.dwHeight) { sw = (int)sd.dwWidth; sh = (int)sd.dwHeight; }
+    if (sr) { sw = sr->right - sr->left; sh = sr->bottom - sr->top; }
+    /* Wine reports a 1920x1080 desktop-sized surface in "fullscreen" while rendering
+       640x480 content into its top-left; stretch the game rect to the window. */
+    if (sw > 800 || sh > 600) { sw = 640; sh = 480; sr = NULL; }
+    if (cw <= sw + 8 && ch <= sh + 8) {
+        SmdWineForceBorderless(hw);
+        if (!fsLogged) { fsLogged = 1; Log("WineStretch: forced borderless on hwnd=%p (client was %dx%d)", hw, cw, ch); }
+        if (GetClientRect(hw, &cr)) { cw = cr.right - cr.left; ch = cr.bottom - cr.top; }
+    }
+    if (cw <= sw + 8 && ch <= sh + 8) {
+        if (dbg < 5) { dbg++; Log("WineStretch: skip client=%dx%d src=%dx%d hw=%p", cw, ch, sw, sh, hw); }
+        return;
+    }
+    /* Blit to the primary DC (overwrites the 640x480 top-left region), then
+       stretch that region to fill the window. */
+    {
+        HDC pdc = NULL;
+        {
+            HDC memdc = CreateCompatibleDC(NULL);
+            HBITMAP bm = CreateCompatibleBitmap(GetDC(NULL), sw, sh);
+            HGDIOBJ oldbm = NULL;
+            if (memdc && bm) oldbm = SelectObject(memdc, bm);
+            if (SUCCEEDED(IDirectDrawSurface7_GetDC(self, &pdc)) && memdc && bm) {
+                BitBlt(memdc, 0, 0, sw, sh, pdc, 0, 0, SRCCOPY);
+                IDirectDrawSurface7_ReleaseDC(self, pdc); pdc = NULL;
+                wdc = GetDC(hw);
+                if (wdc) {
+                    RECT zr = {0,0,sw,sh};
+                    FillRect(wdc, &zr, (HBRUSH)GetStockObject(BLACK_BRUSH));
+                    SetStretchBltMode(wdc, COLORONCOLOR);
+                    StretchBlt(wdc, 0, 0, cw, ch, memdc, 0, 0, sw, sh, SRCCOPY);
+                    ReleaseDC(hw, wdc);
+                    if (!logged) { logged = 1; Log("WineStretch: primary stretched %dx%d -> client %dx%d (hwnd=%p)", sw, sh, cw, ch, hw); }
+                }
+            }
+            if (pdc) IDirectDrawSurface7_ReleaseDC(self, pdc);
+            if (memdc) { if (oldbm) SelectObject(memdc, oldbm); DeleteDC(memdc); }
+            if (bm) DeleteObject(bm);
+        }
+    }
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_Blt(IDirectDrawSurface7 *self, LPRECT dr, LPDIRECTDRAWSURFACE7 src, LPRECT sr, DWORD flags, LPDDBLTFX fx) {
     LARGE_INTEGER a, b;
+    RECT wdr, gsr;
+    LPRECT useDr = dr, useSr = sr;
     BatchFlush();
+    if (SmdIsWine() && self == g_primary && src) {
+        HWND hw = NULL; DDSURFACEDESC2 pd, sd; RECT cr;
+        int sw = 640, sh = 480, cw = 0, ch = 0;
+        memset(&sd, 0, sizeof(sd)); sd.dwSize = sizeof(sd);
+        if (SUCCEEDED(IDirectDrawSurface7_GetSurfaceDesc(src, &sd)) && sd.dwWidth > 800 && sd.dwHeight > 600)
+            { gsr.left = 0; gsr.top = 0; gsr.right = sw; gsr.bottom = sh; useSr = &gsr; }
+        memset(&pd, 0, sizeof(pd)); pd.dwSize = sizeof(pd);
+        if (SUCCEEDED(IDirectDrawSurface7_GetSurfaceDesc(self, &pd))) hw = (HWND)pd.lpSurface;
+        if (!hw || !IsWindow(hw)) hw = GetActiveWindow();
+        if (!hw || !IsWindow(hw)) hw = GetForegroundWindow();
+        if (hw && GetClientRect(hw, &cr)) { cw = cr.right - cr.left; ch = cr.bottom - cr.top; }
+        if (cw <= 648 && ch <= 488 && hw) { SmdWineForceBorderless(hw); if (GetClientRect(hw,&cr)){cw=cr.right-cr.left;ch=cr.bottom-cr.top;} }
+        /* Wine ddraw Blt-scaling on a desktop-sized primary is unstable; keep native blit.
+           Run in a window (WndMode) + gamescope for stable fullscreen scaling. */
+        useDr = dr; useSr = sr;
+    }
     QueryPerformanceCounter(&a);
-    HRESULT hr = g_origBlt(self, dr, src, sr, flags, fx);
+    HRESULT hr = g_origBlt(self, useDr, src, useSr, flags, fx);
     QueryPerformanceCounter(&b);
     if (hr >= 0 && self == g_primary && src && g_measureReady) FinishPresent(self, 0, a, b);
     return hr;

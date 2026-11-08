@@ -20,6 +20,7 @@
 #include "Smd_internal.h"
 
 static int g_fullscreenRequested = 0;
+static HWND g_fsHwnd = NULL;
 static int g_displayModeFailures = 0;
 
 static void D7ExeDirFile(const char *name, char *out) {
@@ -983,6 +984,15 @@ static int D7_InitD3D9(void) {
 
 /* Present; in borderless fullscreen the back buffer is stretched to the client area
    keeping its aspect ratio (black bars). */
+static int SmdIsWine(void) {
+    static int v = -1;
+    if (v < 0) {
+        HMODULE ntd = GetModuleHandleA("ntdll.dll");
+        v = (ntd && GetProcAddress(ntd, "wine_get_version")) ? 1 : 0;
+    }
+    return v;
+}
+
 static HRESULT D7_PresentFS(void) {
     RECT cr, dr;
     int cw, ch, w, h;
@@ -991,6 +1001,7 @@ static HRESULT D7_PresentFS(void) {
         return IDirect3DDevice9_Present(g_d7.dev, NULL, NULL, NULL, NULL);
     cw = cr.right - cr.left;
     ch = cr.bottom - cr.top;
+    (void)cw; (void)ch; /* Wine: no forced re-borderless */
     if (cw <= 0 || ch <= 0 || g_d7.dispW <= 0 || g_d7.dispH <= 0)
         return IDirect3DDevice9_Present(g_d7.dev, NULL, NULL, NULL, NULL);
     if (cw != g_d7.fsCw || ch != g_d7.fsCh) {
@@ -2005,7 +2016,7 @@ static void HotkeyAttach(HWND hwnd) {
 }
 
 static HRESULT STDMETHODCALLTYPE ED_SetCooperativeLevel(void *self, HWND hwnd, DWORD flags) {
-    if (hwnd) g_d7.hwnd = hwnd;
+    if (hwnd) { g_d7.hwnd = hwnd; g_fsHwnd = hwnd; }
     HotkeyAttach(hwnd);
     g_d7.fs = (flags & DDSCL_FULLSCREEN) ? 1 : 0;
     if (g_d7.fs) D7_SetupBorderless(hwnd);
@@ -2416,6 +2427,7 @@ static HRESULT STDMETHODCALLTYPE WDD7_SetCooperativeLevel(IDirectDraw7 *self, HW
     HRESULT hr = IDirectDraw7_SetCooperativeLevel(w7->orig, hwnd, flags);
     SmdLog("DD7.SetCooperativeLevel hwnd=%p flags=%X -> hr=%08X",
         (void*)hwnd, (unsigned)flags, hr);
+    /* Wine: leave sizing to the window manager/gamescope to avoid unstable scaling */
     if (hr >= 0 || !g_RetryCoopLevel) return hr;
 
     if (flags & DDSCL_EXCLUSIVE) {
@@ -2451,6 +2463,7 @@ static HRESULT STDMETHODCALLTYPE WDD7_SetDisplayMode(IDirectDraw7 *self, DWORD w
         if (bpp <= 16 || g_displayModeFailures >= 2)
             SmdTriggerWindowFallback("SetDisplayMode failed");
     }
+    /* Wine: skip forced borderless (causes unstable scaling/flicker with ddraw) */
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE WDD7_WaitForVerticalBlank(IDirectDraw7 *self, DWORD f, HANDLE ev) {

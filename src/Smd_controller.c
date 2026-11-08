@@ -88,8 +88,231 @@ static DIOBJECTDATAFORMAT g_diObjects[140];
 static int g_diFormatReady;
 static unsigned g_diScans;      /* DirectInput enumerations so far (details are logged for the first ones) */
 static unsigned g_diEnumSeen;   /* devices seen by the current enumeration */
-static unsigned g_nativeNoiseMask;
 static JOYCAPSA g_joyCapsId;     /* shared XInput caps instance (memcpy'd into game buffers) */
+
+/* Raw hidraw fallback (Wine/Proton on Linux): Wine's winmm and dinput backends can
+   misparse some pads (confirmed broken for Switch Pro Controller 057E:2009 on
+   hid-nintendo — a counting field lands in buttons/axes and the hat sticks at UP).
+   Reading the Linux hidraw report directly via Z:\dev\hidraw* bypasses all of that.
+   On real Windows, Z:\dev\hidraw* does not exist, so this never activates and the
+   normal XInput/DirectInput/winmm paths are used unchanged. */
+#define HIDRAW_MAX 16
+#define HIDRAW_REP 64
+static HANDLE g_hidHandle = INVALID_HANDLE_VALUE;
+static OVERLAPPED g_hidOv;
+static HANDLE g_hidEv;
+static unsigned char g_hidBuf[HIDRAW_REP];
+static JOYINFOEX g_hidState;
+static int g_hidReady;
+static int g_hidPending;
+static unsigned short g_hidVid, g_hidPid;
+static DWORD g_hidLastScan;
+static int g_hidScanned;
+
+static void JoyHidrawClose(void) {
+    if (g_hidEv) { CloseHandle(g_hidEv); g_hidEv = NULL; }
+    if (g_hidHandle != INVALID_HANDLE_VALUE) { CloseHandle(g_hidHandle); g_hidHandle = INVALID_HANDLE_VALUE; }
+    g_hidPending = g_hidReady = 0;
+}
+
+static int JoyHidrawMatch(unsigned short vid, unsigned short pid) {
+    /* only pads whose Wine winebus parsing is known-broken need the raw path;
+       everything else keeps using the normal (and on Windows, only) API paths */
+    return vid == 0x057Eu && pid == 0x2009u;   /* Nintendo Switch Pro Controller (USB) */
+}
+
+static void JoyHidParseSwitchPro(const unsigned char *r, DWORD n);
+
+static int JoyHidrawOpen(int idx) {
+    char dev[64], uev[80], buf[512];
+    HANDLE h;
+    DWORD rd = 0, got = 0;
+    unsigned vid = 0, pid = 0, bvid = 0, bpid = 0;
+    unsigned char *p, *end;
+
+    sprintf(dev, "Z:\\dev\\hidraw%d", idx);
+    sprintf(uev, "Z:\\sys\\class\\hidraw\\hidraw%d\\device\\uevent", idx);
+    h = CreateFileA(uev, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_EXISTING, 0, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        memset(buf, 0, sizeof(buf));
+        ReadFile(h, buf, sizeof(buf) - 1, &rd, NULL);
+        CloseHandle(h);
+    }
+    if (rd) {
+        /* HID_ID=BBBB:VVVVVVVV:PPPPPPPP */
+        end = (unsigned char*)buf + rd;
+        for (p = (unsigned char*)buf; p < end; p += strlen((char*)p) + 1) {
+            if (strncmp((char*)p, "HID_ID=", 7) == 0)
+                sscanf((char*)p + 7, "%x:%x:%x", &bvid, &vid, &pid);
+            if (p + strlen((char*)p) + 1 >= end) break;
+        }
+    }
+    /* sysfs unreadable? fall back to matching the known-broken pad by trying to read:
+       open the hidraw node and peek a report — if it looks like Switch Pro 0x30, accept */
+    if (!vid && !pid) {
+        HANDLE hp = CreateFileA(dev, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+            OPEN_EXISTING, 0, NULL);
+        if (hp != INVALID_HANDLE_VALUE) {
+            unsigned char probe[HIDRAW_REP];
+            DWORD prd = 0;
+            memset(probe, 0, sizeof(probe));
+            if (ReadFile(hp, probe, sizeof(probe), &prd, NULL) && prd >= 12 && probe[0] == 0x30) {
+                vid = 0x057E; pid = 0x2009; /* Switch Pro USB full report signature */
+                SmdLog("JoyBridge: hidraw%d identified as 057E:2009 by report signature", idx);
+            }
+            CloseHandle(hp);
+        }
+    }
+    if (!JoyHidrawMatch((unsigned short)vid, (unsigned short)pid)) return 0;
+
+    h = CreateFileA(dev, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        SmdLog("JoyBridge: hidraw%d %04X:%04X matched but CreateFile(overlapped) failed err=%u", idx, vid, pid, (unsigned)GetLastError());
+        return 0;
+    }
+    g_hidEv = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!g_hidEv) { CloseHandle(h); return 0; }
+    g_hidHandle = h;
+    g_hidVid = (unsigned short)vid;
+    g_hidPid = (unsigned short)pid;
+    memset(&g_hidOv, 0, sizeof(g_hidOv));
+    g_hidOv.hEvent = g_hidEv;
+    memset(&g_hidState, 0, sizeof(g_hidState));
+    g_hidState.dwXpos = g_hidState.dwYpos = g_hidState.dwZpos = g_hidState.dwRpos = 32767;
+    g_hidState.dwPOV = 0xFFFF;
+    g_hidReady = 1; /* advertise as ready immediately so broken backends don't inject phantoms */
+    g_hidPending = 0;
+    if (ReadFile(g_hidHandle, g_hidBuf, sizeof(g_hidBuf), &got, &g_hidOv)) {
+        g_hidPending = 0;
+        if (got) JoyHidParseSwitchPro(g_hidBuf, got);
+    } else if (GetLastError() == ERROR_IO_PENDING) {
+        g_hidPending = 1;
+    }
+    SmdLog("JoyBridge: raw hidraw%d opened for %04X:%04X (Linux hidraw fallback)", idx, vid, pid);
+    return 1;
+}
+
+static void JoyHidrawScan(void) {
+    DWORD now = GetTickCount();
+    int i, foundDev = 0;
+    if (g_hidHandle != INVALID_HANDLE_VALUE) return;
+    if (g_hidScanned && now - g_hidLastScan < 3000) return;
+    g_hidLastScan = now;
+    g_hidScanned = 1;
+    for (i = 0; i < HIDRAW_MAX; i++) {
+        char dev[64];
+        sprintf(dev, "Z:\\dev\\hidraw%d", i);
+        if (GetFileAttributesA(dev) != INVALID_FILE_ATTRIBUTES) foundDev = 1;
+        if (JoyHidrawOpen(i)) return;
+    }
+#ifdef SMD_DEBUG_BUILD
+    {
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            SmdLog("JoyBridge: hidraw scan: no matching raw device (hidraw nodes %s, pad 057E:2009)",
+                foundDev ? "seen" : "not seen under Z:\\dev");
+        }
+    }
+#else
+    (void)foundDev;
+#endif
+}
+
+static unsigned short JoyHidStick12(unsigned lo, unsigned hiNibble) {
+    unsigned v = (unsigned)lo | ((unsigned)(hiNibble & 0x0Fu) << 8); /* 0..4095 */
+    return (unsigned short)((v * 65535u) / 4095u);
+}
+static unsigned short JoyHidStick12hi(unsigned mid, unsigned hi) {
+    unsigned v = ((unsigned)(mid & 0xF0u) >> 4) | ((unsigned)hi << 4);
+    return (unsigned short)((v * 65535u) / 4095u);
+}
+
+static void JoyHidParseSwitchPro(const unsigned char *r, DWORD n) {
+    unsigned b3, b4, b5, dw = 0;
+    if (n < 12 || r[0] != 0x30) return;
+    b3 = r[3]; b4 = r[4]; b5 = r[5];
+    /* byte 3: Y,X,B,A, RSR,RSL,R,ZR */
+    if (b3 & 0x08) dw |= JOY_BUTTON1;  /* A */
+    if (b3 & 0x04) dw |= JOY_BUTTON2;  /* B */
+    if (b3 & 0x02) dw |= JOY_BUTTON3;  /* X */
+    if (b3 & 0x01) dw |= JOY_BUTTON4;  /* Y */
+    if (b3 & 0x40) dw |= JOY_BUTTON8;  /* R */
+    if (b3 & 0x80) dw |= JOY_BUTTON16; /* ZR */
+    /* byte 4: Minus,Plus,RStick,LStick,Home,Capture */
+    if (b4 & 0x02) dw |= JOY_BUTTON5;  /* Plus / Start */
+    if (b4 & 0x01) dw |= JOY_BUTTON6;  /* Minus / Back */
+    if (b4 & 0x08) dw |= JOY_BUTTON9;  /* LStick */
+    if (b4 & 0x04) dw |= JOY_BUTTON10; /* RStick */
+    /* byte 5: Down,Up,Right,Left, SR,SL,L,ZL */
+    if (b5 & 0x40) dw |= JOY_BUTTON7;  /* L */
+    if (b5 & 0x80) dw |= JOY_BUTTON15; /* ZL */
+    /* d-pad: also emit POV (projected to axes later) */
+    if (b5 & 0x02)      g_hidState.dwPOV = 0;      /* Up */
+    else if (b5 & 0x04) g_hidState.dwPOV = 9000;   /* Right */
+    else if (b5 & 0x01) g_hidState.dwPOV = 18000;  /* Down */
+    else if (b5 & 0x08) g_hidState.dwPOV = 27000;  /* Left */
+    else                g_hidState.dwPOV = 0xFFFF;
+    /* diagonals */
+    if ((b5 & 0x0A) == 0x0A) g_hidState.dwPOV = 4500;   /* Up+Right */
+    if ((b5 & 0x06) == 0x06) g_hidState.dwPOV = 13500;  /* Right+Down */
+    if ((b5 & 0x05) == 0x05) g_hidState.dwPOV = 22500;  /* Down+Left */
+    if ((b5 & 0x09) == 0x09) g_hidState.dwPOV = 31500;  /* Left+Up */
+
+    g_hidState.dwButtons = dw;
+    /* left stick: bytes 6,7,8 */
+    g_hidState.dwXpos = JoyHidStick12(r[6], r[7]);
+    g_hidState.dwYpos = 65535u - JoyHidStick12hi(r[7], r[8]); /* up = large in raw? invert for Windows (down = large) */
+    /* right stick: bytes 9,10,11 */
+    if (n >= 12) {
+        g_hidState.dwZpos = JoyHidStick12(r[9], r[10]);
+        g_hidState.dwRpos = 65535u - JoyHidStick12hi(r[10], r[11]);
+    }
+    g_hidReady = 1;
+}
+
+static void JoyHidrawPoll(void) {
+    DWORD got = 0;
+    int drain = 0;
+    JoyHidrawScan();
+    if (g_hidHandle == INVALID_HANDLE_VALUE) return;
+    /* drain all available reports and keep only the latest (low latency) */
+    for (;;) {
+        if (g_hidPending) {
+            if (WaitForSingleObject(g_hidEv, 0) != WAIT_OBJECT_0) break;
+            if (!GetOverlappedResult(g_hidHandle, &g_hidOv, &got, FALSE)) { JoyHidrawClose(); return; }
+            g_hidPending = 0;
+            if (g_hidVid == 0x057Eu && g_hidPid == 0x2009u) JoyHidParseSwitchPro(g_hidBuf, got);
+        }
+        ResetEvent(g_hidEv);
+        memset(&g_hidOv, 0, sizeof(g_hidOv));
+        g_hidOv.hEvent = g_hidEv;
+        if (ReadFile(g_hidHandle, g_hidBuf, sizeof(g_hidBuf), &got, &g_hidOv)) {
+            if (g_hidVid == 0x057Eu && g_hidPid == 0x2009u) JoyHidParseSwitchPro(g_hidBuf, got);
+            if (++drain >= 16) break; /* keep queue bounded */
+            continue;
+        } else if (GetLastError() == ERROR_IO_PENDING) {
+            g_hidPending = 1;
+            break;
+        } else {
+            JoyHidrawClose();
+            return;
+        }
+    }
+}
+
+static int JoyHidrawState(JOYINFOEX *out) {
+    JOYINFOEX ji0;
+    if (!g_hidReady) return 0;
+    ji0 = g_hidState;
+    ji0.dwSize = sizeof(ji0);
+    ji0.dwFlags = JOY_RETURNALL;
+    /* let JoyNativeToJi handle POV->axes projection and button-count; copy back raw here */
+    *out = ji0;
+    return 1;
+}
 
 static void JoyLogCapsConnected(unsigned id, unsigned connected)
 {
@@ -156,7 +379,9 @@ static void JoyDirectInputFormatInit(void) {
 
 /* Same d-pad-to-axes projection the XInput and DirectInput paths use. */
 static void JoyPovToAxes(DWORD pov, DWORD *xpos, DWORD *ypos) {
-    if (pov >= 31500 && pov <= 4500) *ypos = 0;          /* up */
+    /* POV is 0..35900 (hundredths of a degree, 0 = up), with 0xFFFF = centered */
+    if (pov == 0xFFFFu || pov == 0xFFFFFFFFu) return;
+    if (pov <= 4500 || pov >= 31500) *ypos = 0;          /* up (includes 0) */
     else if (pov >= 13500 && pov <= 22500) *ypos = 65535; /* down */
     if (pov >= 4500 && pov <= 13500) *xpos = 65535;       /* right */
     else if (pov >= 22500 && pov <= 31500) *xpos = 0;     /* left */
@@ -200,15 +425,23 @@ static BOOL CALLBACK JoyEnumDirectInput(const DIDEVICEINSTANCEA *instance, void 
     axisRange.lMin = -1000;
     axisRange.lMax = 1000;
     for (i = 0; i < 8; i++) {
+        HRESULT hrSet, hrGet;
         axisRange.diph.dwObj = DIDFT_ABSAXIS | DIDFT_MAKEINSTANCE(g_diAxisInstance[i]);
-        if (FAILED(IDirectInputDevice8_SetProperty(device, DIPROP_RANGE, &axisRange.diph)) &&
-            SUCCEEDED(IDirectInputDevice8_GetProperty(device, DIPROP_RANGE, &axisRange.diph))) {
+        hrSet = IDirectInputDevice8_SetProperty(device, DIPROP_RANGE, &axisRange.diph);
+        /* always read the range back: Wine or the driver may clamp the range we asked for,
+           so trust the actual device range when it reports one */
+        hrGet = IDirectInputDevice8_GetProperty(device, DIPROP_RANGE, &axisRange.diph);
+        if (SUCCEEDED(hrGet)) {
             g_diAxisMin[g_diCount][i] = axisRange.lMin;
             g_diAxisMax[g_diCount][i] = axisRange.lMax;
+        } else if (FAILED(hrSet)) {
+            g_diAxisMin[g_diCount][i] = -1000;
+            g_diAxisMax[g_diCount][i] = 1000;
         } else {
             g_diAxisMin[g_diCount][i] = -1000;
             g_diAxisMax[g_diCount][i] = 1000;
         }
+        (void)hrSet;
     }
     IDirectInputDevice8_Acquire(device);
     g_diDevices[g_diCount++] = device;
@@ -287,7 +520,14 @@ static int JoyDirectInputState(unsigned id, JOYINFOEX *out) {
         IDirectInputDevice8_Acquire(device);
         hr = IDirectInputDevice8_Poll(device);
     }
-    if (FAILED(hr)) return 0;
+    if (FAILED(hr)) {
+#ifdef SMD_DEBUG_BUILD
+        static unsigned pollFails[8];
+        if (id < 8 && pollFails[id]++ < 5)
+            SmdLog("JoyBridge: DI poll failed id=%u hr=%08X", id, (unsigned)hr);
+#endif
+        return 0;
+    }
     memset(&state, 0, sizeof(state));
     hr = IDirectInputDevice8_GetDeviceState(device, sizeof(state), &state);
 #ifdef SMD_DEBUG_BUILD
@@ -357,7 +597,6 @@ static void JoyLogStateChange(const char *source, unsigned id, const JOYINFOEX *
 
 /* what the legacy winmm joystick API (Wine's own implementation on Linux) reports for ids 0..3 */
 static void JoyNativeToJi(const JOYINFOEX *nat, JOYINFOEX *ji, DWORD requestedSize, DWORD requestedFlags);
-static int JoyNativeNoiseRead(unsigned id, JOYINFOEX *st);
 static unsigned JoyNativeRead(unsigned id, JOYINFOEX *exe);
 static void JoyLogNativeCaps(void) {
     unsigned id;
@@ -375,10 +614,9 @@ static void JoyLogNativeCaps(void) {
     }
 }
 
-/* One-time classification of the native winmm slots (at attach, before the game polls):
-   a slot that reports persistent non-zero buttons and no POV with the pad untouched is a
-   phantom artifact and gets excluded from serving the game.  Doing this here keeps the
-   game's per-frame polls free of anything expensive. */
+/* One-time pass over the native winmm slots at attach (before the game polls).  The real
+   pad can live on any id (Wine enumerates phantom slots before the physical one), so this
+   only logs what exists; which id serves the game is decided per poll with hysteresis. */
 static void JoyClassifyNatives(void) {
     unsigned id;
     if (!g_winmmJoyGetCapsA || !g_winmmJoyGetPosEx) return;
@@ -387,12 +625,9 @@ static void JoyClassifyNatives(void) {
         JOYINFOEX st;
         if (g_winmmJoyGetCapsA(id, &jc, sizeof(jc)) != JOYERR_NOERROR) continue;
         if (JoyNativeRead(id, &st) != JOYERR_NOERROR) continue;
-        if (JoyNativeNoiseRead(id, &st)) {
-            g_nativeNoiseMask |= 1u << id;
-            SmdLog("JoyBridge: native winmm id=%u reports phantom idle input "
-                "(buttons=%08X axes=%u,%u), ignoring it", id, st.dwButtons,
-                (unsigned)jc.wNumAxes, (unsigned)jc.wNumButtons);
-        }
+        SmdLog("JoyBridge: native winmm id=%u idle state: X=%u Y=%u Z=%u B=%08X POV=%u", id,
+            (unsigned)st.dwXpos, (unsigned)st.dwYpos, (unsigned)st.dwZpos,
+            (unsigned)st.dwButtons, (unsigned)st.dwPOV);
     }
 }
 
@@ -502,16 +737,24 @@ void SmdControllerPoll(void) {
 }
 
 static unsigned JoyNativeBest(void);
+static int JoyDirectInputState(unsigned id, JOYINFOEX *out);
 static unsigned __stdcall JoyGetCapsA(unsigned id, JOYCAPSA *jc, unsigned cb);
 
-/* fill the game's JOYCAPSA buffer with the values it expects (full 0..0xFFFF axis ranges) */
+/* fill the game's JOYCAPSA buffer with the values it expects.  The game computes the stick
+   centres from caps itself: X centre = (wXmin+wXmax)/2 and Y centre = (wZmin+wRmin)/2,
+   each with a 0x4e20 dead zone.  Those must both land on 32767 or every centre position
+   reads as "sticks down" through Wine's 0/65535 caps. */
 static void JoyVirtualCaps(JOYCAPSA *jc, const char *name, WORD mid, WORD pid) {
     memset(jc, 0, sizeof(*jc));
     jc->wMid = mid;
     jc->wPid = pid;
     strcpy(jc->szPname, name);
-    jc->wXmin = jc->wYmin = jc->wZmin = jc->wRmin = jc->wUmin = jc->wVmin = 0;
-    jc->wXmax = jc->wYmax = jc->wZmax = jc->wRmax = jc->wUmax = jc->wVmax = 0xFFFF;
+    jc->wXmin = 0;      jc->wXmax = 0xFFFE;
+    jc->wYmin = 0;      jc->wYmax = 0xFFFE;
+    jc->wZmin = 0x7FFF; jc->wZmax = 0xFFFF;
+    jc->wRmin = 0x7FFF; jc->wRmax = 0xFFFF;
+    jc->wUmin = 0;      jc->wUmax = 0xFFFE;
+    jc->wVmin = 0;      jc->wVmax = 0xFFFE;
     jc->wPeriodMin = jc->wPeriodMax = 10000;
     jc->wMaxButtons = jc->wNumButtons = 16;
     jc->wMaxAxes = jc->wNumAxes = 6;
@@ -531,32 +774,23 @@ static unsigned __stdcall JoyGetCapsA(unsigned id, JOYCAPSA *jc, unsigned cb) {
     if (id >= 4) return g_winmmJoyGetCapsA ? g_winmmJoyGetCapsA(id, jc, cb) : JOYERR_UNPLUGGED;
 
     xi = JoyXInputGrab(id, &(unsigned char[16]){0});
-    if (id == 0 && !xi && JoyNativeBest() == 0xFFFFFFFFu) {
-        /* XInput-only system (real Windows): without a bridge the game's joystick
-           #1 would simply not exist and the pad stays invisible to the game. */
-        xi = 1;
-    }
     JoyLogCapsConnected(id, (unsigned)xi);
+    if (id == 0) {
+        /* game slot #1: always virtual.  The real data may come from XInput, native winmm
+           (any id - see JoyPickNative) or DirectInput, but JoyGetPosEx owns that choice;
+           keeping caps cheap and stable matters because the game's frame poll calls caps
+           for the slot every single frame before reading the state. */
+        JoyVirtualCaps(jc, "Smd Bridged Pad", 0x57E, 0x2009);
+        return JOYERR_NOERROR;
+    }
     if (xi) {
         JoyVirtualCaps(jc, "Modern Controller (XInput)", 0x28E, 0x2FF);
         return JOYERR_NOERROR;
     }
 
-    if (g_winmmJoyGetCapsA) {
-        unsigned nr;
-        if (g_nativeNoiseMask & (1u << id)) return JOYERR_UNPLUGGED;
-        nr = g_winmmJoyGetCapsA(id, jc, cb);
-        if (nr == JOYERR_NOERROR && jc->wXmax <= 3) {
-            jc->wXmin = jc->wYmin = jc->wZmin = jc->wRmin = jc->wUmin = jc->wVmin = 0;
-            jc->wXmax = jc->wYmax = jc->wZmax = jc->wRmax = jc->wUmax = jc->wVmax = 0xFFFF;
-        }
-        return nr;
-    }
-
-    /* nothing native and no real XInput: keep the game's joystick #1 alive in
-       case a pad is attached later (it then feeds JoyGetPosEx's DirectInput path) */
-    if (id != 0) return JOYERR_UNPLUGGED;
-    return JOYERR_NOERROR;
+    if (g_winmmJoyGetCapsA)
+        return g_winmmJoyGetCapsA(id, jc, cb);
+    return JOYERR_UNPLUGGED;
 }
 
 /* centred sticks (the game's own threshold is 0x4e20 = 20000 around the centre), no button, no POV */
@@ -567,33 +801,26 @@ static int JoyStateNeutral(const JOYINFOEX *j) {
 }
 
 /* The physical pad under Wine/Linux is exposed through the legacy winmm joystick API (the
-   "Wine joystick driver"); on regular Windows the pad comes through XInput instead.  Some
-   slots report phantom input even with no pad attached (Wine keeps an extra dead entry with
-   permanently non-zero fake buttons), so a source is only used after it has proven sane. */
+   "Wine joystick driver"); on regular Windows the pad comes through XInput instead. */
 static void JoyNativeToJi(const JOYINFOEX *nat, JOYINFOEX *ji, DWORD requestedSize, DWORD requestedFlags) {
+    int count = 0;
+    unsigned b;
     *ji = *nat;
     ji->dwSize = requestedSize;
     ji->dwFlags = requestedFlags;
-    if (ji->dwPOV == 0 && (ji->dwXpos == 32767u || ji->dwXpos == 32768u) &&
-        (ji->dwYpos == 32767u || ji->dwYpos == 32768u) && ji->dwButtons == 0) {
-        /* Wine reports POV 0 for a padded direction it cannot see; that would read as a stuck UP. */
-        ji->dwPOV = 0xFFFFu;
-    }
-}
-
-/* Wine can expose more than one "Wine joystick driver" id; some of them are artifacts that
-   permanently report fake buttons (and POV 0 = stuck up).  Persistently non-zero buttons
-   while the physical sticks sit at centre only show up on such artifacts: classify them. */
-static int JoyNativeNoiseRead(unsigned id, JOYINFOEX *st) {
-    JOYINFOEX s2;
-    unsigned commonButtons;
-    if (!g_winmmJoyGetPosEx || id >= 4) return 0;
-    Sleep(30);
-    if (JoyNativeRead(id, &s2) != JOYERR_NOERROR) return 0;
-    commonButtons = st->dwButtons & s2.dwButtons;
-    if (commonButtons && st->dwPOV == 0 && s2.dwPOV == 0) return 1;
-    if (commonButtons == st->dwButtons && st->dwPOV == 0 && s2.dwPOV == 0) return 1;
-    return 0;
+    /* POV 0 = d-pad UP (valid).  Do not neutralize it — an old heuristic for Wine's
+       broken backends ate real UP presses; the hidraw/DI fixes make that unnecessary. */
+    /* Wine passthrough pads can keep phantom button bits >=16 alive (watched bit 17 on a
+       Switch Pro Controller); the game turns every dwButtons bit into an action code, and
+       only bits 1..16 are mapped, so strip the rest. */
+    ji->dwButtons &= 0xFFFFu;
+    b = ji->dwButtons;
+    while (b) { b &= (b - 1); count++; }
+    ji->dwButtonNumber = (DWORD)count;
+    /* the game polls with dwFlags=0x83 and never reads dwPOV: give the hat as stick motion,
+       same as the XInput and DirectInput paths do */
+    if (ji->dwPOV != 0xFFFFu && ji->dwPOV != 0xFFFFFFFFu)
+        JoyPovToAxes(ji->dwPOV, &ji->dwXpos, &ji->dwYpos);
 }
 
 /* Pick the native winmm id that will serve the game's id 0.  Only slots free of phantom
@@ -612,7 +839,6 @@ static unsigned JoyNativeBest(void) {
     g_nativeSaneMask = 0;
     for (id = 0; id < 4; id++) {
         JOYCAPSA jc;
-        if (g_nativeNoiseMask & (1u << id)) continue;
         if (g_winmmJoyGetCapsA(id, &jc, sizeof(jc)) != JOYERR_NOERROR) continue;
         g_nativeSaneMask |= 1u << id;
         if (best == 0xFFFFFFFFu) best = id;
@@ -682,15 +908,41 @@ static unsigned JoyPickNative(void) {
     return firstSane;
 }
 
+/* Same hysteresis pick for DirectInput joysticks.  The Wine legacy winmm passthrough
+   feeds corrupted state for many pads (watched on a Switch Pro Controller: a running
+   bit-counter in dwButtons, the hat stuck at UP and axis low bits jittering), while
+   DirectInput delivers usage-mapped values, so DirectInput is tried first for the
+   game's slot #1 and native winmm only as the fallback. */
+static int g_diServingId = -1;
+
+static int JoyPickDI(void) {
+    JOYINFOEX st;
+    int it, first = -1, active = -1;
+
+    if (!g_diCount) return -1;
+    for (it = 0; it < (int)g_diCount; it++) {
+        if (first < 0) first = it;
+        if (!JoyDirectInputState(it, &st)) continue;
+        if (JoyStateNeutral(&st)) continue;
+        if (g_diServingId == it) return it;             /* incumbent works */
+        if (active < 0) active = it;                    /* first active */
+    }
+    if (active >= 0) {
+        if (active != g_diServingId)
+            SmdLog("JoyBridge: game input now served from DirectInput joystick %d (input detected there)", active);
+        g_diServingId = active;
+        return active;
+    }
+    if (g_diServingId >= 0 && g_diServingId < (int)g_diCount)
+        return g_diServingId;                           /* nothing active: keep the incumbent */
+    g_diServingId = first;
+    return first;
+}
+
 /* The data path for the game's per-frame polls.  Order of preference:
-   1. native winmm  - the real pad under Wine, and the only source for non-XInput pads
-   2. XInput        - the real pad on classic Windows (phantom interfaces never make it here)
-   3. DirectInput   - working everywhere but coarsest; only as a last resort            */
-/* Which native winmm slot gets polled when the game asks for joystick #1?  Wine's
-   legacy winmm sometimes exposes just a subsection of the real devices (or entirely
-   silent ones: the physical input can be routed to Steam Input's virtual devices).
-   JoyPickNative therefore stays as "which of the enumerated slots the game's #1 polls"
-   and the ACTIVE-source check below decides whether that data actually reaches the game. */
+   1. DirectInput   - usage-mapped and stable (Wine's winmm passthrough corrupts some pads)
+   2. native winmm  - fallback; feeds the pad on systems without DirectInput support
+   3. XInput        - first-class on real Windows (phantom interfaces never make it here) */
 static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
     DWORD requestedSize = ji ? ji->dwSize : 0, requestedFlags = ji ? ji->dwFlags : 0;
     JOYINFOEX st;
@@ -700,20 +952,61 @@ static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
 
     if (id == 0) {
         int haveNative = 0;
-        unsigned nativeId = JoyPickNative();
-        if (nativeId != 0xFFFFFFFFu && JoyNativeRead(nativeId, &st) == JOYERR_NOERROR) {
-            int neutral = JoyStateNeutral(&st);
-            JoyNativeToJi(&st, ji, requestedSize, requestedFlags);
-            haveNative = 1;
-            if (!neutral) {
+        /* 0. raw hidraw (Linux/Wine only, known-broken pads): bypasses Wine's misparsed
+           winmm/dinput backends entirely; no-ops on real Windows */
+        JoyHidrawPoll();
+        if (g_hidReady) {
+            /* matched pad present: hidraw is the ground truth (Wine's winmm/dinput
+               misparse this device).  Serve it even when idle so the broken backends
+               cannot inject phantom button presses. */
+            JOYINFOEX hs = g_hidState;
+            hs.dwSize = sizeof(hs);
+            hs.dwFlags = JOY_RETURNALL;
+            JoyNativeToJi(&hs, ji, requestedSize, requestedFlags);
 #ifdef SMD_DEBUG_BUILD
-                JoyLogStateChange("served native winmm", id, ji);
-                JoyLogPoll(id, "native", ji);
+            JoyLogStateChange("served hidraw", id, ji);
+            JoyLogPoll(id, "hidraw", ji);
+#endif
+            g_joyPlugged[id] = 1;
+            return JOYERR_NOERROR;
+        }
+        /* 1. DirectInput (best on Wine): the legacy winmm passthrough is broken for several
+           pads (e.g. Switch Pro reports a counting button field and stuck-up POV/axis bits);
+           DirectInput delivers usage-mapped state that is stable */
+        JoyDirectInputScan();
+        {
+            JOYINFOEX diSt;
+            int diId = JoyPickDI();
+            if (diId >= 0 && JoyDirectInputState(diId, &diSt) == 1 && !JoyStateNeutral(&diSt)) {
+                JoyNativeToJi(&diSt, ji, requestedSize, requestedFlags);
+#ifdef SMD_DEBUG_BUILD
+                JoyLogStateChange("served DirectInput", id, ji);
+                JoyLogPoll(id, "dinput", ji);
 #endif
                 g_joyPlugged[id] = 1;
                 return JOYERR_NOERROR;
             }
         }
+        /* 2. native winmm (fallback for pads without a sane DirectInput device, or real
+           systems that do not route XInput through winmm) */
+        {
+            JOYINFOEX natSt;
+            unsigned nativeId = JoyPickNative();
+            if (nativeId != 0xFFFFFFFFu && JoyNativeRead(nativeId, &natSt) == JOYERR_NOERROR) {
+                int neutral = JoyStateNeutral(&natSt);
+                JoyNativeToJi(&natSt, ji, requestedSize, requestedFlags);
+                haveNative = 1;
+                if (!neutral) {
+#ifdef SMD_DEBUG_BUILD
+                    JoyLogStateChange("served native winmm", id, ji);
+                    JoyLogPoll(id, "native", ji);
+#endif
+                    g_joyPlugged[id] = 1;
+                    return JOYERR_NOERROR;
+                }
+            }
+        }
+        /* 3. XInput (first-class on real Windows; phantom on Wine) */
         if (JoyXInputGrab(id, &st)) {
             unsigned char *x = (unsigned char*)&st;
             unsigned short btn = *(unsigned short*)(x + 4);
@@ -772,16 +1065,6 @@ static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
                 return JOYERR_NOERROR;
             }
         }
-        JoyDirectInputScan();
-        if (JoyDirectInputState(id, &st) && !JoyStateNeutral(&st)) {
-            JoyNativeToJi(&st, ji, requestedSize, requestedFlags);
-#ifdef SMD_DEBUG_BUILD
-            JoyLogStateChange("served DirectInput", id, ji);
-            JoyLogPoll(id, "dinput", ji);
-#endif
-            g_joyPlugged[id] = 1;
-            return JOYERR_NOERROR;
-        }
         if (haveNative) {
             /* nothing is pressed on any source: the idle native data is already in ji */
 #ifdef SMD_DEBUG_BUILD
@@ -812,6 +1095,28 @@ static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
         JoyLogStateChange("DirectInput", id, ji);
 #endif
         g_joyPlugged[id] = 1;
+        return JOYERR_NOERROR;
+    }
+    if (id == 0) {
+        /* no source reports slot #1 at all: the game never checks joyGetPosEx's return
+           value but reads the buffer directly, so answer success with a neutral state
+           instead of UNPLUGGED with an untouched buffer full of stale stack values */
+        memset(ji, 0, requestedSize);
+        ji->dwSize = requestedSize;
+        ji->dwFlags = requestedFlags;
+        ji->dwXpos = ji->dwYpos = ji->dwZpos = ji->dwRpos = 32767;
+        ji->dwUpos = ji->dwVpos = 0;
+        ji->dwPOV = 0xFFFF;
+#ifdef SMD_DEBUG_BUILD
+        {
+            static DWORD lastIdle;
+            DWORD now = GetTickCount();
+            if (now - lastIdle >= 2000) {
+                lastIdle = now;
+                SmdLog("JoyBridge: no live source for slot #1, serving neutral idle");
+            }
+        }
+#endif
         return JOYERR_NOERROR;
     }
     if (g_joyPlugged[id]) SmdLog("JoyBridge: joystick id=%u unplugged (no source reports it)", id);
