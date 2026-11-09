@@ -40,6 +40,25 @@ nmake /f NMakefile
 nmake /f NMakefile smd-debug
 ```
 
+## ビルド（Linux）
+
+MinGW-w64（32bit）でクロスコンパイルします。`i686-w64-mingw32-gcc` をインストールしてから、リポジトリのルートで `make` を実行してください。
+
+```sh
+# Arch / CachyOS
+sudo pacman -S mingw-w64-gcc
+
+# Debian / Ubuntu
+sudo apt install mingw-w64
+```
+
+```sh
+make smd          # 五月雨用 build/ddraw.dll
+make smd-debug    # デバッグ版 build/debug/ddraw.dll (SMD_DEBUG_BUILD, ログ有効)
+make refrain      # RefRain用 build/d3d9.dll
+make all          # refrain + smd
+```
+
 ## 機能
 
 - 入力遅延の軽減

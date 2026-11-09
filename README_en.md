@@ -37,6 +37,25 @@ This creates `build\d3d9.dll` and `build\ddraw.dll`. Build the Smd debug DLL at 
 nmake /f NMakefile smd-debug
 ```
 
+## Building on Linux
+
+Cross-compile with MinGW-w64 (32-bit). Install `i686-w64-mingw32-gcc`, then run `make` from the repository root:
+
+```sh
+# Arch / CachyOS
+sudo pacman -S mingw-w64-gcc
+
+# Debian / Ubuntu
+sudo apt install mingw-w64
+```
+
+```sh
+make smd          # Samidare: build/ddraw.dll
+make smd-debug    # debug: build/debug/ddraw.dll (SMD_DEBUG_BUILD, logging enabled)
+make refrain      # RefRain: build/d3d9.dll
+make all          # refrain + smd
+```
+
 ## Features
 
 - Reduced input latency
