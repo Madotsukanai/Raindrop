@@ -23,8 +23,8 @@ Download `d3d9.dll` from [Releases](https://github.com/Madotsukanai/Raindrop/rel
 
 To open the Practice menu, move the cursor to “DIVE 2 M.R.S.” and press the key assigned to Concept Reactor.
 
-## Building on Windows
-
+## Building
+### Windows
 Use `clang-cl` from an x86 Native Tools Command Prompt. Add the LLVM/Clang tools in Visual Studio Installer, then run this from the repository root. `NMakefile` uses the MSVC Windows SDK, `link.exe`, and libraries to produce x86 DLLs. The bundled D3DX9 compatibility declarations mean the legacy DirectX SDK is not required:
 
 ```bat
