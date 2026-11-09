@@ -6,7 +6,7 @@ An enhancement patch adding features such as stage selection for *Samidare* Ver.
 
 ### Samidare
 
-Download `ddraw.dll` from [Releases](https://github.com/Madotsukanai/Raindrop/releases/latest), copy it to the same directory as `Rain.exe` (SHA-256: `ae35b0ad17094bd21f86bc464504ceeafc50941e5207d75a3065e44049138211`), and start the game.
+Download and apply the update patch from the [official site](https://www.rebrank.org/download.htm), then download `ddraw.dll` from [Releases](https://github.com/Madotsukanai/Raindrop/releases/latest), copy it to the same directory as `Rain.exe` (SHA-256: `ae35b0ad17094bd21f86bc464504ceeafc50941e5207d75a3065e44049138211`), and start the game.
 
 Choose the graphics API in `raindrop.ini` in the same directory as `Rain.exe`:
 
@@ -15,7 +15,8 @@ Choose the graphics API in `raindrop.ini` in the same directory as `Rain.exe`:
 API=DirectDraw
 ```
 
-`API=DirectDraw` uses the system DirectDraw implementation and falls back to D3D9 if it is unavailable. Set `API=D3D9` to use the built-in D3D9 implementation from startup. If the file or setting is missing, `DirectDraw` is used.
+`API=DirectDraw` uses the system DirectDraw implementation and falls back to D3D9 if it is unavailable. Set `API=D3D9` to use the built-in D3D9 implementation from startup. If the file or setting is missing, `DirectDraw` is used.<br>
+On Wine/Proton, keeping the default `DirectDraw` is recommended.
 
 ### RefRain
 
@@ -28,13 +29,12 @@ To open the Practice menu, move the cursor to “DIVE 2 M.R.S.” and press the 
 Use `clang-cl` from an x86 Native Tools Command Prompt. Add the LLVM/Clang tools in Visual Studio Installer, then run this from the repository root. `NMakefile` uses the MSVC Windows SDK, `link.exe`, and libraries to produce x86 DLLs. The bundled D3DX9 compatibility declarations mean the legacy DirectX SDK is not required:
 
 ```bat
-nmake /f NMakefile
-```
-
-This creates `build\d3d9.dll` and `build\ddraw.dll`. Build the Smd debug DLL at `build\debug\ddraw.dll` with:
-
-```bat
-nmake /f NMakefile smd-debug
+nmake /f NMakefile smd            :: Samidare: build\ddraw.dll
+nmake /f NMakefile smd-debug      :: Samidare debug: build\debug\ddraw.dll (SMD_DEBUG_BUILD, logging enabled)
+nmake /f NMakefile refrain        :: RefRain: build\d3d9.dll
+nmake /f NMakefile refrain-debug  :: RefRain debug: build\debug\d3d9.dll (REFRAIN_DEBUG_BUILD, logging enabled)
+nmake /f NMakefile debug          :: all debug builds (refrain-debug + smd-debug)
+nmake /f NMakefile                :: refrain + smd
 ```
 
 ## Building on Linux
@@ -74,7 +74,7 @@ After clearing all stages, select Extra in Practice and use the left and right k
 
 Fixes known game bugs, including scores carrying over after retrying from the results screen, some sound effects such as the enemy bullet warning not playing, and an invisible option in the replay menu.
 
-- Replay desynchronization fixes for some environments
+- Replay desynchronization fixes in Wine/Proton environments
 
 Forces bullet and player coordinates in replays to use 24-bit floating-point calculations.
 

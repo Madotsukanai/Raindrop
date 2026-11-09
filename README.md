@@ -31,13 +31,12 @@ Wine/Protonではデフォルトの`DirectDraw`のままにすることを推奨
 Visual Studioのx86 Native Tools環境で`clang-cl`を使います。Visual Studio InstallerでLLVM/Clangツールを追加し、リポジトリのルートで次を実行してください。`NMakefile`はMSVCのWindows SDK、`link.exe`およびライブラリを使ってx86 DLLを作成します。D3DX9ヘッダーは同梱の互換定義を使うため、旧DirectX SDKは不要です。
 
 ```bat
-nmake /f NMakefile
-```
-
-通常版は`build\d3d9.dll`と`build\ddraw.dll`に作成されます。Smdのデバッグ版は次のコマンドで`build\debug\ddraw.dll`に作成します。
-
-```bat
-nmake /f NMakefile smd-debug
+nmake /f NMakefile smd            :: 五月雨用 build\ddraw.dll
+nmake /f NMakefile smd-debug      :: 五月雨デバッグ版 build\debug\ddraw.dll (SMD_DEBUG_BUILD, ログ有効)
+nmake /f NMakefile refrain        :: RefRain用 build\d3d9.dll
+nmake /f NMakefile refrain-debug  :: RefRainデバッグ版 build\debug\d3d9.dll (REFRAIN_DEBUG_BUILD, ログ有効)
+nmake /f NMakefile debug          :: すべてのデバッグ版 (refrain-debug + smd-debug)
+nmake /f NMakefile                :: refrain + smd
 ```
 
 ### Linux
