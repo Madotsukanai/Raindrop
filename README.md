@@ -53,10 +53,12 @@ sudo apt install mingw-w64
 ```
 
 ```sh
-make smd          # 五月雨用 build/ddraw.dll
-make smd-debug    # デバッグ版 build/debug/ddraw.dll (SMD_DEBUG_BUILD, ログ有効)
-make refrain      # RefRain用 build/d3d9.dll
-make all          # refrain + smd
+make smd            # 五月雨用 build/ddraw.dll
+make smd-debug      # 五月雨デバッグ版 build/debug/ddraw.dll (SMD_DEBUG_BUILD, ログ有効)
+make refrain        # RefRain用 build/d3d9.dll
+make refrain-debug  # RefRainデバッグ版 build/debug/d3d9.dll (REFRAIN_DEBUG_BUILD, ログ有効)
+make debug          # すべてのデバッグ版 (refrain-debug + smd-debug)
+make all            # refrain + smd
 ```
 
 ## 機能

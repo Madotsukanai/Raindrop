@@ -50,10 +50,12 @@ sudo apt install mingw-w64
 ```
 
 ```sh
-make smd          # Samidare: build/ddraw.dll
-make smd-debug    # debug: build/debug/ddraw.dll (SMD_DEBUG_BUILD, logging enabled)
-make refrain      # RefRain: build/d3d9.dll
-make all          # refrain + smd
+make smd            # Samidare: build/ddraw.dll
+make smd-debug      # Samidare debug: build/debug/ddraw.dll (SMD_DEBUG_BUILD, logging enabled)
+make refrain        # RefRain: build/d3d9.dll
+make refrain-debug  # RefRain debug: build/debug/d3d9.dll (REFRAIN_DEBUG_BUILD, logging enabled)
+make debug          # all debug builds (refrain-debug + smd-debug)
+make all            # refrain + smd
 ```
 
 ## Features
