@@ -316,7 +316,14 @@ static int JoyHidrawState(JOYINFOEX *out) {
 
 static void JoyLogCapsConnected(unsigned id, unsigned connected)
 {
+#ifdef SMD_DEBUG_BUILD
+    static unsigned char last[4] = { 0xff, 0xff, 0xff, 0xff };
+    if (id < 4 && last[id] == (unsigned char)connected) return;
+    if (id < 4) last[id] = (unsigned char)connected;
     SmdLog("JoyBridge: joyGetDevCapsA id=%u xinput-connected=%u", id, connected);
+#else
+    (void)id; (void)connected;
+#endif
 }
 
 /* DirectInput's SetCooperativeLevel needs a window of this process: a foreground window of another

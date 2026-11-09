@@ -3735,7 +3735,8 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         if (target > 0) {
             int startFrame = frame;
             int sel = isBoss ? 3 : ((g_exArea >= 0 && g_exArea < EX_AREA_N) ? g_exAreaBgGroup[g_exArea] : 0);
-            int areaBgMode = g_ExBgMode;
+            /* EX area practice: use settle mode so background tiles match normal play */
+            int areaBgMode = (!isBoss && g_exRun) ? 2 : g_ExBgMode;
             /* The fast-forward runs the real stage update with no input, so the player is hit over and
                over while the frames are simulated. Keep the state the run started with (lives, game-over
                countdown, game-over/continue flags) and put it back after the jump. */
@@ -4791,12 +4792,10 @@ static void BatchTryInstall(void) {
 
     g_devSelf = dev;
     if (SmdD3D9EmuActive()) {
-        /* In the Direct3D9 layer a render / texture-stage state change flushes the batch itself, and only
-           when the value really changes, so the always-flush stubs on those two slots (20, 37) are left out:
-           redundant state calls no longer split the sprite batches. */
-        static const unsigned char devSlotsEmu[] = { 5, 6, 8, 10, 11, 13, 14, 16, 18, 26, 29, 30, 31, 32,
-                                                     34, 39, 43, 44, 45 };
-        nd = BatchStubSlots(vt, devSlotsEmu, (int)sizeof(devSlotsEmu));
+        /* D3D9 emulation layer has its own batching/state tracking; don't hook its device. */
+        Log("Batch: skipped for D3D9 emulation device %p", dev);
+        g_batchFailed = 1;
+        return;
     } else {
         nd = BatchStubSlots(vt, devSlots, (int)sizeof(devSlots));
     }
@@ -4818,6 +4817,129 @@ static const int g_FrameWaitSleep = 1;
 static const double g_FrameWaitMarginMs = 2.0;
 static const double g_FrameWaitMarginHiResMs = 0.7;
 
+/* In-game FPS counter (bottom-right HUD, 0x414A80 draws 0x416010 at 0x414ABF) shows integer fps.
+   Show 1 decimal place using the game's digit glyphs + a dot glyph from the same atlas. */
+typedef void (__cdecl *PF_DrawNumber)(int value, int font, int x, int y, int unk1, int a, int g, int b, int color);
+static LARGE_INTEGER g_fpsSampleTime;
+static unsigned int g_fpsSampleFrames;
+static double g_fpsTenths; /* fixed at 1 decimal, e.g. 598 = 59.8 */
+static int g_fpsDotLogged;
+
+/* 0x4089A0 glyph blit: __thiscall(ecx=tex, 10 stack args), ret 0x28. Mirrors 416145:
+   (dstX,dstY,srcH,srcW,srcX,srcY,srcH,srcW,0,color). */
+static void __attribute__((noinline)) GameBlitGlyph(void *tex, int dstX, int dstY, int srcH, int srcW, int srcX, int srcY, int color) {
+    struct { uintptr_t fn; void *tex; int a[10]; } s;
+    s.fn = 0x4089a0; s.tex = tex;
+    s.a[0]=dstX; s.a[1]=dstY; s.a[2]=srcH; s.a[3]=srcW; s.a[4]=srcX; s.a[5]=srcY; s.a[6]=srcH; s.a[7]=srcW; s.a[8]=0; s.a[9]=color;
+    __asm__ volatile(
+        "mov %[s], %%eax\n\t"
+        "pushl 44(%%eax)\n\tpushl 40(%%eax)\n\tpushl 36(%%eax)\n\tpushl 32(%%eax)\n\tpushl 28(%%eax)\n\t"
+        "pushl 24(%%eax)\n\tpushl 20(%%eax)\n\tpushl 16(%%eax)\n\tpushl 12(%%eax)\n\tpushl 8(%%eax)\n\t"
+        "mov 4(%%eax), %%ecx\n\tcall *0(%%eax)"
+        : : [s]"r"(&s) : "eax","ecx","edx","memory");
+}
+
+/* Same blit with a separate destination size: (dstX,dstY,dstW,dstH,srcX,srcY,srcW,srcH,0,alpha). */
+static void __attribute__((noinline)) GameBlitGlyphScaled(void *tex, int dstX, int dstY, int dstW, int dstH,
+                                                          int srcX, int srcY, int srcW, int srcH, int alpha) {
+    struct { uintptr_t fn; void *tex; int a[10]; } s;
+    s.fn = 0x4089a0; s.tex = tex;
+    s.a[0]=dstX; s.a[1]=dstY; s.a[2]=dstW; s.a[3]=dstH; s.a[4]=srcX; s.a[5]=srcY; s.a[6]=srcW; s.a[7]=srcH; s.a[8]=0; s.a[9]=alpha;
+    __asm__ volatile(
+        "mov %[s], %%eax\n\t"
+        "pushl 44(%%eax)\n\tpushl 40(%%eax)\n\tpushl 36(%%eax)\n\tpushl 32(%%eax)\n\tpushl 28(%%eax)\n\t"
+        "pushl 24(%%eax)\n\tpushl 20(%%eax)\n\tpushl 16(%%eax)\n\tpushl 12(%%eax)\n\tpushl 8(%%eax)\n\t"
+        "mov 4(%%eax), %%ecx\n\tcall *0(%%eax)"
+        : : [s]"r"(&s) : "eax","ecx","edx","memory");
+}
+
+/* 0x416010 args: (value, digit count, x, y, font index, texSel, alpha, zero-pad flag, color).  x is the
+   right-most digit's left edge; digit i (from the right) is at x + cw[font]*i; the 0x4089A0 last arg is alpha.
+   The parameter names below keep the old order: `font` = digit count, `unk1` = font index. */
+static void __cdecl FpsDisplayHook(int value, int font, int x, int y, int unk1, int a, int g, int b, int color) {
+    LARGE_INTEGER now;
+    int *gw = (int*)0x4db0c4, *gh = (int*)0x4db0e0, *sy = (int*)0x4db0fc, *cw = (int*)0x4db0a8, *sx = (int*)0x4db118;
+    void *tex = a ? *(void**)0x4db13c : *(void**)0x4db144; /* same selection as 416010 */
+    PF_DrawNumber draw = (PF_DrawNumber)(uintptr_t)0x416010;
+    int fi = unk1; /* real font index */
+    int count = font;
+
+    int v, ip, tenths, digitW, cellW, cellH, baseSY, baseSX;
+    int oneSX, inkX, inkY, dotSize, dotX, dotY, slot, tenthX, dotGW, dotGH, dotDW, dotDH;
+
+    (void)value;
+    if (fi < 0 || fi > 3) fi = 1;
+    font = fi;
+    QueryPerformanceCounter(&now);
+    g_fpsSampleFrames++;
+    if (g_fpsSampleTime.QuadPart && g_qpcFreq.QuadPart) {
+        double dt = (double)(now.QuadPart - g_fpsSampleTime.QuadPart) / (double)g_qpcFreq.QuadPart;
+        if (dt >= 0.25) {
+            g_fpsTenths = ((double)g_fpsSampleFrames / dt) * 10.0;
+            g_fpsSampleFrames = 0;
+            g_fpsSampleTime = now;
+        }
+    } else {
+        g_fpsSampleTime = now;
+        g_fpsSampleFrames = 0;
+        g_fpsTenths = 600.0;
+    }
+    v = (int)(g_fpsTenths + 0.5);
+    if (v < 0) v = 0;
+    if (v > 9999) v = 9999;
+    ip = v / 10;
+    tenths = v % 10;
+
+    /* Keep right edge near original: shift left by (dot slot + tenths digit). */
+    digitW = cw[font] ? cw[font] : 8;
+    cellW = gw[font] ? gw[font] : digitW;
+    cellH = gh[font] ? gh[font] : digitW;
+    baseSY = sy[font];
+    baseSX = sx[font];
+
+    /* Decimal point generated from the in-game digit atlas (pbgtk/PBG5 -> Grp.ac5 Text2/shield.tga;
+       font3: sy=104, gh=16, digits at sx+(gh+4)*n, no '.' glyph exists). Sample a solid block from
+       the '1' glyph stroke so color/alpha/texture match the digits, placed on the digit baseline. */
+    /* Text.tga (tex 0x4db144) has a real '.' glyph: font 4's row (sy=132) reads "0123456789." with the dot in
+       the 11th cell, i.e. srcX = (gh+4)*10 + sx.  Blit that whole cell, centred in the dot slot. */
+    dotGW = gw[4] ? gw[4] : cellW;
+    dotGH = gh[4] ? gh[4] : cellH;
+    inkX = (dotGH + 4) * 10 + sx[4];
+    inkY = sy[4];
+    dotSize = dotGW;
+    oneSX = 0;
+    slot = digitW * 2 / 3 > 4 ? digitW * 2 / 3 : 4;  /* width reserved for the dot, between int part and tenths */
+    /* x is the LEFT edge of the whole number (digit i of count at x + cw*i, least significant digit last).
+       Keep the right edge: int part is shifted left by slot + cw, then dot slot, then the tenths digit in
+       the original last-digit cell. */
+    tenthX = x + digitW * (count - 1);
+    /* enlarge the dot 1.5x, keep its bottom on the digit row, nudge it right */
+    /* the game passes (gh, gw) as the (w, h) pair for both dst and src (see 416145), keep that order */
+    dotDW = dotGH * 3 / 2;
+    dotDH = dotGW * 3 / 2;
+    dotX = tenthX - slot + (slot - dotDW) / 2 + 3;
+    dotY = y + dotGW - dotDH;
+
+    if (!g_fpsDotLogged) {
+        g_fpsDotLogged = 1;
+        Log("FpsDisplay: font=%d digitW=%d gw=%d gh=%d sy=%d sx=%d ink=%d,%d sz=%d dot=%d,%d tex=%p tex2=%p",
+            font, digitW, cellW, cellH, baseSY, baseSX, inkX, inkY, dotSize, dotX, dotY, tex, *(void**)0x4db144);
+    }
+    draw(ip, count, x - digitW - slot, y, unk1, a, g, b, color);
+    if (tex) GameBlitGlyphScaled(tex, dotX, dotY, dotDW, dotDH, inkX, inkY, dotGH, dotGW, g);
+    draw(tenths, 1, tenthX, y, unk1, a, g, b, color);
+}
+
+static void PatchFpsDisplay(void) {
+    int n;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("FpsDisplay: unexpected image base, skipped");
+        return;
+    }
+    n = HookCall(0x414abf, 0x416010, (void*)&FpsDisplayHook);
+    Log("FpsDisplay: %s (1 decimal)", n ? "patched" : "skipped");
+}
+
 /* A high-resolution waitable timer (Windows 10 1803+) wakes up within ~0.5 ms, so the frame wait can sleep
    almost the whole remaining time instead of leaving 2 ms for busy-waiting.  Without it the 1 ms system
    timer resolution is requested and the old margin is kept. */
@@ -4832,7 +4954,7 @@ static void FrameWaitInit(void) {
     PF_CWTEx cw = k ? (PF_CWTEx)(void*)GetProcAddress(k, "CreateWaitableTimerExW") : NULL;
 
     g_fwTimerInit = 1;
-    if (cw) {
+    if (!SmdIsWine() && cw) {
         g_fwTimer = cw(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
         if (g_fwTimer) g_fwHiRes = 1;
     }
@@ -4851,7 +4973,8 @@ static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
     SmdControllerPoll();
     BatchTryInstall();
     r = ((PF_FrameTimer)(uintptr_t)0x424f20)(ctx);
-    if (g_FrameWaitSleep && (r & 0xff) == 0) {
+    /* on Wine the original paces adequately; adding sleep on top double-waits → <60fps */
+    if (g_FrameWaitSleep && !SmdIsWine() && (r & 0xff) == 0) {
         unsigned acc = (unsigned)ctx[3], dacc = (unsigned)ctx[4], per = (unsigned)ctx[1];
         double rem = 30000.0 - (double)acc;
         if (per > 0 && per < 1000000) {
@@ -4991,6 +5114,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         PatchPauseAudio();
         PatchSoundFix();
         PatchFrameWait();
+        PatchFpsDisplay();
         SmdD3D9PatchEnterMask();
         PatchKeepRunningInactive();
         SmdControllerInit();

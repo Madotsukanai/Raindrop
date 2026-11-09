@@ -19,281 +19,20 @@
 #endif
 #include "Smd_internal.h"
 
+/* D3D9/DDraw emulation restored from Raindrop 0.1.9 (tag 0.1.9, commit 8eb18cc). */
 static int g_fullscreenRequested = 0;
-static HWND g_fsHwnd = NULL;
 static int g_displayModeFailures = 0;
-
-static void D7ExeDirFile(const char *name, char *out) {
+static void ExeDirFile(const char *name, char *out) {
     GetModuleFileNameA(NULL, out, MAX_PATH);
     char *slash = strrchr(out, '\\');
     if (slash) *(slash + 1) = 0;
     strcat(out, name);
 }
+void SmdD3D9CensusInit(void) {}
+void SmdD3D9CensusSummary(void) {}
+void SmdD3D9CensusSummaryPeriodic(void) {}
+void SmdD3D9PatchEnterMask(void) {}
 
-static HRESULT D7TrySetDisplayMode(IDirectDraw7 *orig, DWORD wd, DWORD ht, DWORD bpp, DWORD refresh, DWORD flags) {
-    DWORD tries[3] = { 0, 0, 60 };
-    DEVMODEA dm;
-    HRESULT hr = DDERR_GENERIC;
-    int i;
-
-    memset(&dm, 0, sizeof(dm));
-    dm.dmSize = sizeof(dm);
-    if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
-        tries[1] = dm.dmDisplayFrequency;
-    for (i = 0; i < 3; i++) {
-        if (i == 1 && tries[1] == 0) continue;
-        if (tries[i] == refresh && flags == 0) continue;
-        hr = IDirectDraw7_SetDisplayMode(orig, wd, ht, bpp, tries[i], 0);
-        SmdLog("DD7.SetDisplayMode retry refresh=%lu -> hr=%08X", (unsigned long)tries[i], (unsigned)hr);
-        if (hr >= 0) return hr;
-    }
-    return hr;
-}
-
-/* ------------------------------------------------------------------------
-   API census (diagnostic).
-   Windows 11 25H2's ddraw.dll does not expose IDirect3D7, so the game needs a
-   Direct3D7 -> Direct3D9 layer.  Before writing one, record exactly which
-   DirectDraw7 / Surface7 / Direct3D7 / Device7 methods (and which arguments)
-   the game uses.  Every vtable slot (except IUnknown) is replaced with a small
-   stub that logs the call and jumps to the original.  Run the game once on a
-   system where D3D7 works (e.g. Wine) and read "Api[...]" / "ApiSummary[...]"
-   lines in Smd_ddraw.log.
-   ------------------------------------------------------------------------ */
-#ifndef SMD_API_CENSUS
-#define SMD_API_CENSUS 0
-#endif
-static const int g_ApiCensus = SMD_API_CENSUS;
-
-enum { CEN_DD7 = 0, CEN_D3D7 = 1, CEN_DEV = 2, CEN_SURF = 3, CEN_IFACES = 4 };
-
-static const char *const g_cenIfName[CEN_IFACES] = { "dd7", "d3d7", "dev", "surf" };
-static const char *const g_cenNameDD7[30] = {
-    "QueryInterface", "AddRef", "Release", "Compact", "CreateClipper", "CreatePalette", "CreateSurface",
-    "DuplicateSurface", "EnumDisplayModes", "EnumSurfaces", "FlipToGDISurface", "GetCaps", "GetDisplayMode",
-    "GetFourCCCodes", "GetGDISurface", "GetMonitorFrequency", "GetScanLine", "GetVerticalBlankStatus",
-    "Initialize", "RestoreDisplayMode", "SetCooperativeLevel", "SetDisplayMode", "WaitForVerticalBlank",
-    "GetAvailableVidMem", "GetSurfaceFromDC", "RestoreAllSurfaces", "TestCooperativeLevel",
-    "GetDeviceIdentifier", "StartModeTest", "EvaluateMode"
-};
-static const char *const g_cenNameD3D7[8] = {
-    "QueryInterface", "AddRef", "Release", "EnumDevices", "CreateDevice", "CreateVertexBuffer",
-    "EnumZBufferFormats", "EvictManagedTextures"
-};
-static const char *const g_cenNameDev[49] = {
-    "QueryInterface", "AddRef", "Release", "GetCaps", "EnumTextureFormats", "BeginScene", "EndScene",
-    "GetDirect3D", "SetRenderTarget", "GetRenderTarget", "Clear", "SetTransform", "GetTransform",
-    "SetViewport", "MultiplyTransform", "GetViewport", "SetMaterial", "GetMaterial", "SetLight", "GetLight",
-    "SetRenderState", "GetRenderState", "BeginStateBlock", "EndStateBlock", "PreLoad", "DrawPrimitive",
-    "DrawIndexedPrimitive", "SetClipStatus", "GetClipStatus", "DrawPrimitiveStrided",
-    "DrawIndexedPrimitiveStrided", "DrawPrimitiveVB", "DrawIndexedPrimitiveVB", "ComputeSphereVisibility",
-    "GetTexture", "SetTexture", "GetTextureStageState", "SetTextureStageState", "ValidateDevice",
-    "ApplyStateBlock", "CaptureStateBlock", "DeleteStateBlock", "CreateStateBlock", "Load", "LightEnable",
-    "GetLightEnable", "SetClipPlane", "GetClipPlane", "GetInfo"
-};
-static const char *const g_cenNameSurf[49] = {
-    "QueryInterface", "AddRef", "Release", "AddAttachedSurface", "AddOverlayDirtyRect", "Blt", "BltBatch",
-    "BltFast", "DeleteAttachedSurface", "EnumAttachedSurfaces", "EnumOverlayZOrders", "Flip",
-    "GetAttachedSurface", "GetBltStatus", "GetCaps", "GetClipper", "GetColorKey", "GetDC", "GetFlipStatus",
-    "GetOverlayPosition", "GetPalette", "GetPixelFormat", "GetSurfaceDesc", "Initialize", "IsLost", "Lock",
-    "ReleaseDC", "Restore", "SetClipper", "SetColorKey", "SetOverlayPosition", "SetPalette", "Unlock",
-    "UpdateOverlay", "UpdateOverlayDisplay", "UpdateOverlayZOrder", "GetDDInterface", "PageLock",
-    "PageUnlock", "SetSurfaceDesc", "SetPrivateData", "GetPrivateData", "FreePrivateData",
-    "GetUniquenessValue", "ChangeUniquenessValue", "SetPriority", "GetPriority", "SetLOD", "GetLOD"
-};
-
-static const char *CensusName(unsigned iface, unsigned slot) {
-    switch (iface) {
-    case CEN_DD7:  return slot < 30 ? g_cenNameDD7[slot] : "?";
-    case CEN_D3D7: return slot < 8 ? g_cenNameD3D7[slot] : "?";
-    case CEN_DEV:  return slot < 49 ? g_cenNameDev[slot] : "?";
-    case CEN_SURF: return slot < 49 ? g_cenNameSurf[slot] : "?";
-    }
-    return "?";
-}
-
-#define CEN_SLOTS 64
-#define CEN_SEEN_N 8192
-typedef struct { unsigned tag, a[3]; unsigned char used; } CenSeen;
-
-static CRITICAL_SECTION g_cenCs;
-static unsigned g_cenCount[CEN_IFACES][CEN_SLOTS];
-static unsigned g_cenLogged[CEN_IFACES][CEN_SLOTS];
-static CenSeen g_cenSeen[CEN_SEEN_N];
-static unsigned g_cenSeenUsed = 0;
-static unsigned char *g_cenStubMem = NULL;
-static unsigned g_cenStubUsed = 0;
-static void **g_cenVt[16];
-static int g_cenVtN = 0;
-
-void SmdD3D9CensusInit(void) {
-    InitializeCriticalSection(&g_cenCs);
-}
-
-/* Called from the stubs: tag = (iface << 8) | slot, argp -> {this, arg1, arg2, ...}. */
-static void __cdecl CensusHit(unsigned tag, unsigned *argp) {
-    unsigned iface = tag >> 8, slot = tag & 0xff;
-    unsigned a1 = argp[1], a2 = argp[2], a3 = argp[3];
-    unsigned cap, h, i;
-
-    if (iface >= CEN_IFACES || slot >= CEN_SLOTS) return;
-    EnterCriticalSection(&g_cenCs);
-    g_cenCount[iface][slot]++;
-    cap = (iface == CEN_DEV && (slot == 20 || slot == 37)) ? 512 : 48;
-    if (g_cenLogged[iface][slot] < cap && g_cenSeenUsed < CEN_SEEN_N * 3 / 4) {
-        h = (tag * 2654435761u) ^ (a1 * 40503u) ^ (a2 * 2246822519u) ^ (a3 * 3266489917u);
-        for (i = h % CEN_SEEN_N; ; i = (i + 1) % CEN_SEEN_N) {
-            CenSeen *s = &g_cenSeen[i];
-            if (!s->used) {
-                s->used = 1;
-                s->tag = tag;
-                s->a[0] = a1; s->a[1] = a2; s->a[2] = a3;
-                g_cenSeenUsed++;
-                g_cenLogged[iface][slot]++;
-                SmdLog("Api[%s] %s #%u this=%08X args=%08X %08X %08X %08X %08X", g_cenIfName[iface],
-                    CensusName(iface, slot), g_cenCount[iface][slot], argp[0], a1, a2, a3, argp[4], argp[5]);
-                break;
-            }
-            if (s->tag == tag && s->a[0] == a1 && s->a[1] == a2 && s->a[2] == a3) break;
-        }
-    }
-    LeaveCriticalSection(&g_cenCs);
-}
-
-void SmdD3D9CensusSummary(void) {
-    unsigned iface, slot;
-    if (!g_ApiCensus) return;
-    EnterCriticalSection(&g_cenCs);
-    for (iface = 0; iface < CEN_IFACES; iface++)
-        for (slot = 0; slot < CEN_SLOTS; slot++)
-            if (g_cenCount[iface][slot])
-                SmdLog("ApiSummary[%s] %s calls=%u", g_cenIfName[iface], CensusName(iface, slot),
-                    g_cenCount[iface][slot]);
-    LeaveCriticalSection(&g_cenCs);
-}
-
-void SmdD3D9CensusSummaryPeriodic(void) {
-    static int n = 0;
-    if (g_ApiCensus && ++n % 6 == 0) SmdD3D9CensusSummary();
-}
-
-/* pushad; pushfd; lea eax,[esp+28h]; push eax; push tag; call CensusHit;
-   add esp,8; popfd; popad; jmp [orig] */
-static void *CensusMakeStub(unsigned tag, void *orig) {
-    unsigned char *p;
-    DWORD rel, holder;
-
-    if (!g_cenStubMem) {
-        g_cenStubMem = (unsigned char*)VirtualAlloc(NULL, 16384, MEM_COMMIT | MEM_RESERVE,
-                                                     PAGE_EXECUTE_READWRITE);
-        g_cenStubUsed = 0;
-    }
-    if (!g_cenStubMem || g_cenStubUsed + 48 > 16384) return NULL;
-    p = g_cenStubMem + g_cenStubUsed;
-    g_cenStubUsed += 48;
-    p[0] = 0x60; p[1] = 0x9c;
-    p[2] = 0x8d; p[3] = 0x44; p[4] = 0x24; p[5] = 0x28;
-    p[6] = 0x50;
-    p[7] = 0x68; memcpy(p + 8, &tag, 4);
-    p[12] = 0xe8;
-    rel = (DWORD)(uintptr_t)&CensusHit - (DWORD)(uintptr_t)(p + 17);
-    memcpy(p + 13, &rel, 4);
-    p[17] = 0x83; p[18] = 0xc4; p[19] = 0x08;
-    p[20] = 0x9d; p[21] = 0x61;
-    p[22] = 0xff; p[23] = 0x25;
-    holder = (DWORD)(uintptr_t)(p + 32);
-    memcpy(p + 24, &holder, 4);
-    memcpy(p + 32, &orig, 4);
-    return p;
-}
-
-static int CensusVtblDone(void **vt) {
-    int i;
-    for (i = 0; i < g_cenVtN; i++)
-        if (g_cenVt[i] == vt) return 1;
-    if (g_cenVtN < 16) g_cenVt[g_cenVtN++] = vt;
-    return 0;
-}
-
-/* Replace slots 3..n-1 of vt (except those set in skip) with logging stubs. */
-static void CensusHookVtbl(void **vt, unsigned iface, unsigned n, unsigned long long skip) {
-    unsigned slot;
-    int ok = 0;
-
-    if (!g_ApiCensus || !vt || IsBadReadPtr(vt, n * sizeof(void*))) return;
-    if (CensusVtblDone(vt)) return;
-    for (slot = 3; slot < n; slot++) {
-        void *stub, *old = NULL;
-        if (skip & (1ULL << slot)) continue;
-        stub = CensusMakeStub((iface << 8) | slot, vt[slot]);
-        if (stub && SmdPatchVtblSlot(&vt[slot], stub, &old)) ok++;
-    }
-    SmdLog("Api: %s vtable %p hooked (%d slots)", g_cenIfName[iface], (void*)vt, ok);
-}
-
-static void CensusHookSurface(void *surf) {
-    if (g_ApiCensus && surf) CensusHookVtbl(*(void***)surf, CEN_SURF, 49, 0);
-}
-
-static void CensusHookDevice(void *dev) {
-    if (g_ApiCensus && dev) CensusHookVtbl(*(void***)dev, CEN_DEV, 49, 0);
-}
-
-typedef HRESULT (STDMETHODCALLTYPE *PF_CenCreateDevice)(void*, const GUID*, void*, void**);
-static PF_CenCreateDevice g_cenOrigCreateDevice = NULL;
-
-static HRESULT STDMETHODCALLTYPE CensusCreateDevice(void *self, const GUID *cls, void *surf, void **dev) {
-    HRESULT hr = g_cenOrigCreateDevice(self, cls, surf, dev);
-    SmdLog("Api[d3d7] CreateDevice clsid=%08lX-%04X-%04X-%02X%02X surf=%p -> hr=%08X dev=%p",
-        cls ? (unsigned long)cls->Data1 : 0UL, cls ? (unsigned)cls->Data2 : 0U, cls ? (unsigned)cls->Data3 : 0U,
-        cls ? (unsigned)cls->Data4[0] : 0U, cls ? (unsigned)cls->Data4[1] : 0U, surf, (unsigned)hr,
-        (dev ? *dev : NULL));
-    if (hr >= 0 && dev && *dev) CensusHookDevice(*dev);
-    return hr;
-}
-
-static void CensusHookD3D7(void *d3d) {
-    void **vt, *old = NULL;
-
-    if (!g_ApiCensus || !d3d) return;
-    vt = *(void***)d3d;
-    if (!vt || IsBadReadPtr(vt, 8 * sizeof(void*))) return;
-    if (CensusVtblDone(vt)) return;
-    g_cenOrigCreateDevice = (PF_CenCreateDevice)vt[4];
-    SmdPatchVtblSlot(&vt[4], (void*)&CensusCreateDevice, &old);
-    {
-        unsigned slot;
-        int ok = 0;
-        for (slot = 3; slot < 8; slot++) {
-            void *stub, *o = NULL;
-            if (slot == 4) continue;
-            stub = CensusMakeStub((CEN_D3D7 << 8) | slot, vt[slot]);
-            if (stub && SmdPatchVtblSlot(&vt[slot], stub, &o)) ok++;
-        }
-        SmdLog("Api: d3d7 vtable %p hooked (CreateDevice + %d slots)", (void*)vt, ok);
-    }
-}
-
-/* ==========================================================================
-   DirectDraw7 / Direct3D7 -> Direct3D9 emulation (SMD_D3D7_EMU)
-
-   Windows 11 (build 26200) ddraw.dll does not hand out IDirect3D7, so the game
-   cannot create its Direct3D7 device.  When that happens (or when the
-   environment variable SMD_FORCE_D3D7_EMU is set, for testing on Wine), this
-   layer replaces the system DirectDraw completely:
-
-     - surfaces live in system memory (DIB sections, so GetDC works)
-     - the Direct3D7 device is a Direct3D9 device on the game window
-     - textures are converted to A8R8G8B8 Direct3D9 textures on demand, the
-       DDCKEY_SRCBLT colour key becomes alpha 0
-     - Blt(primary <- back buffer) presents the Direct3D9 back buffer
-
-   Only the methods that the game was observed to call (see the "API census"
-   above) are implemented; everything else returns DDERR_UNSUPPORTED or an
-   harmless success.  The structure of the render/texture-stage state
-   translation follows the approach of DxWrapper's Dd7to9 (zlib license,
-   https://github.com/elishacloud/dxwrapper); no source from it is copied.
-   ========================================================================== */
 #ifndef SMD_D3D7_EMU
 #define SMD_D3D7_EMU 1
 #endif
@@ -391,6 +130,7 @@ static void D7_SetTex(DWORD stage, IDirect3DTexture9 *t) {
 }
 
 int SmdD3D9EmuActive(void) { return g_d7.active; }
+static int D7_EmuActive(void) { return g_d7.active; }
 
 /* Draw batching (see D7_BatchFlush): consecutive sprite quads are collected here. */
 #define D7_BATCH_FVF 0x1c4
@@ -984,15 +724,6 @@ static int D7_InitD3D9(void) {
 
 /* Present; in borderless fullscreen the back buffer is stretched to the client area
    keeping its aspect ratio (black bars). */
-static int SmdIsWine(void) {
-    static int v = -1;
-    if (v < 0) {
-        HMODULE ntd = GetModuleHandleA("ntdll.dll");
-        v = (ntd && GetProcAddress(ntd, "wine_get_version")) ? 1 : 0;
-    }
-    return v;
-}
-
 static HRESULT D7_PresentFS(void) {
     RECT cr, dr;
     int cw, ch, w, h;
@@ -1001,7 +732,6 @@ static HRESULT D7_PresentFS(void) {
         return IDirect3DDevice9_Present(g_d7.dev, NULL, NULL, NULL, NULL);
     cw = cr.right - cr.left;
     ch = cr.bottom - cr.top;
-    (void)cw; (void)ch; /* Wine: no forced re-borderless */
     if (cw <= 0 || ch <= 0 || g_d7.dispW <= 0 || g_d7.dispH <= 0)
         return IDirect3DDevice9_Present(g_d7.dev, NULL, NULL, NULL, NULL);
     if (cw != g_d7.fsCw || ch != g_d7.fsCh) {
@@ -1058,6 +788,7 @@ typedef struct { float x, y, z, rhw; DWORD color; float u, v; } D7Quad;
 static int D7_BltToDev(const RECT *drIn, D7Surf *s, const RECT *srIn, int useKey) {
     RECT dr, sr;
     IDirect3DTexture9 *t;
+    IDirect3DStateBlock9 *sb = g_d7.sb;
     IDirect3DDevice9 *dev = g_d7.dev;
     D7Quad q[4];
     float x0, y0, x1, y1, u0, v0, u1, v1;
@@ -1856,7 +1587,7 @@ static int ReadWndModeConfig(void) {
     size_t n = 0, vs = 0, ve = 0;
     char *buf;
     int r = -1;
-    D7ExeDirFile("config.txt", path);
+    ExeDirFile("config.txt", path);
     buf = WndModeReadFile(path, &n);
     if (!buf) return -1;
     if (WndModeFind(buf, n, &vs, &ve))
@@ -1873,7 +1604,7 @@ static int WriteWndModeConfig(int windowed) {
     FILE *f;
     int ok = 0;
 
-    D7ExeDirFile("config.txt", path);
+    ExeDirFile("config.txt", path);
     buf = WndModeReadFile(path, &n);
     if (!buf) { SmdLog("WndMode: cannot read %s", path); return 0; }
     if (!WndModeFind(buf, n, &vs, &ve)) {
@@ -1977,7 +1708,7 @@ static int HookIat(const char *func, void *hook, void **orig) {
     return n;
 }
 
-void SmdD3D9PatchEnterMask(void) {
+static void PatchEnterMask(void) {
     int a = HookIat("GetAsyncKeyState", (void*)&Hook_GetAsyncKeyState, (void**)&g_origGetAsyncKeyState);
     int b = HookIat("GetKeyState", (void*)&Hook_GetKeyState, (void**)&g_origGetKeyState);
     int c = HookIat("GetKeyboardState", (void*)&Hook_GetKeyboardState, (void**)&g_origGetKeyboardState);
@@ -2016,7 +1747,7 @@ static void HotkeyAttach(HWND hwnd) {
 }
 
 static HRESULT STDMETHODCALLTYPE ED_SetCooperativeLevel(void *self, HWND hwnd, DWORD flags) {
-    if (hwnd) { g_d7.hwnd = hwnd; g_fsHwnd = hwnd; }
+    if (hwnd) g_d7.hwnd = hwnd;
     HotkeyAttach(hwnd);
     g_d7.fs = (flags & DDSCL_FULLSCREEN) ? 1 : 0;
     if (g_d7.fs) D7_SetupBorderless(hwnd);
@@ -2150,8 +1881,17 @@ static int g_D7E_ConfigCreated = 0;
 
 static void D7E_WriteConfigAPI(const char *api) {
     char path[MAX_PATH];
-    D7ExeDirFile("raindrop.ini", path);
+    ExeDirFile("raindrop.ini", path);
     WritePrivateProfileStringA("Graphics", "API", api, path);
+}
+
+static int SmdIsWine(void) {
+    static int v = -1;
+    if (v < 0) {
+        HMODULE ntd = GetModuleHandleA("ntdll.dll");
+        v = (ntd && GetProcAddress(ntd, "wine_get_version")) ? 1 : 0;
+    }
+    return v;
 }
 
 static int D7E_ConfigD3D9(void) {
@@ -2160,7 +1900,7 @@ static int D7E_ConfigD3D9(void) {
     char path[MAX_PATH];
     char value[32];
     if (!initialized) {
-        D7ExeDirFile("raindrop.ini", path);
+        ExeDirFile("raindrop.ini", path);
         if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
             HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
                                       FILE_ATTRIBUTE_NORMAL, NULL);
@@ -2175,8 +1915,13 @@ static int D7E_ConfigD3D9(void) {
         }
         GetPrivateProfileStringA("Graphics", "API", "DirectDraw", value, sizeof(value), path);
         useD3D9 = (_stricmp(value, "D3D9") == 0 || _stricmp(value, "Direct3D9") == 0);
+        if (useD3D9 && SmdIsWine()) {
+            SmdLog("Graphics API: D3D9 requested, but Wine/Proton detected -> falling back to DirectDraw (D3D9 emu unstable under Wine)");
+            useD3D9 = 0;
+        } else {
+            SmdLog("Graphics API: %s (raindrop.ini or default)", useD3D9 ? "D3D9" : "DirectDraw");
+        }
         initialized = 1;
-        SmdLog("Graphics API: %s (raindrop.ini or default)", useD3D9 ? "D3D9" : "DirectDraw");
     }
     return useD3D9;
 }
@@ -2213,7 +1958,8 @@ static FARPROC p_DllUnregisterServer;
 
 static void LoadReal(void) {
     if (g_real) return;
-    SmdLogOpen();
+    
+    /* g_qpcFreq handled in Smd.c */
     char sys[MAX_PATH];
     GetSystemDirectoryA(sys, MAX_PATH);
     strcat(sys, "\\ddraw.dll");
@@ -2302,8 +2048,8 @@ static HRESULT STDMETHODCALLTYPE WDD7_QueryInterface(IDirectDraw7 *self, REFIID 
                 (unsigned)riid->Data4[2], (unsigned)riid->Data4[3],
                 (unsigned)riid->Data4[4], (unsigned)riid->Data4[5],
                 (unsigned)riid->Data4[6], (unsigned)riid->Data4[7], hr);
-        else if (g_ApiCensus && IsEqualCLSID(riid, &k_IID_IDirect3D7))
-            CensusHookD3D7(*out);
+        else if (0 && IsEqualCLSID(riid, &k_IID_IDirect3D7))
+            // CensusHookD3D7(*out);
         return hr;
     }
     IDirectDraw7_AddRef(w->orig);
@@ -2356,8 +2102,6 @@ static HRESULT STDMETHODCALLTYPE WDD7_CreateSurface(IDirectDraw7 *self, LPDDSURF
     if (hr >= 0 && g_LowLatency && d && s && *s &&
         (d->dwFlags & DDSD_CAPS) && (d->ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE))
         SmdHookPrimary(*s);
-    if (hr >= 0 && g_ApiCensus && s && *s)
-        CensusHookSurface(*s);
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE WDD7_DuplicateSurface(IDirectDraw7 *self, LPDIRECTDRAWSURFACE7 s, LPDIRECTDRAWSURFACE7 *o) {
@@ -2405,7 +2149,7 @@ static HRESULT STDMETHODCALLTYPE WDD7_GetMonitorFrequency(IDirectDraw7 *self, LP
 static HRESULT STDMETHODCALLTYPE WDD7_GetScanLine(IDirectDraw7 *self, LPDWORD s) {
     return IDirectDraw7_GetScanLine(((DD7W*)self)->orig, s);
 }
-static HRESULT STDMETHODCALLTYPE WDD7_GetVerticalBlankStatus(IDirectDraw7 *self, BOOL *b) {
+static HRESULT STDMETHODCALLTYPE WDD7_GetVerticalBlankStatus(IDirectDraw7 *self, WINBOOL *b) {
     return IDirectDraw7_GetVerticalBlankStatus(((DD7W*)self)->orig, b);
 }
 static HRESULT STDMETHODCALLTYPE WDD7_Initialize(IDirectDraw7 *self, GUID *g) {
@@ -2427,7 +2171,6 @@ static HRESULT STDMETHODCALLTYPE WDD7_SetCooperativeLevel(IDirectDraw7 *self, HW
     HRESULT hr = IDirectDraw7_SetCooperativeLevel(w7->orig, hwnd, flags);
     SmdLog("DD7.SetCooperativeLevel hwnd=%p flags=%X -> hr=%08X",
         (void*)hwnd, (unsigned)flags, hr);
-    /* Wine: leave sizing to the window manager/gamescope to avoid unstable scaling */
     if (hr >= 0 || !g_RetryCoopLevel) return hr;
 
     if (flags & DDSCL_EXCLUSIVE) {
@@ -2457,13 +2200,12 @@ static HRESULT STDMETHODCALLTYPE WDD7_SetDisplayMode(IDirectDraw7 *self, DWORD w
     SmdLog("DD7.SetDisplayMode %lux%lux bpp=%lu refresh=%lu f=%X -> hr=%08X",
         (unsigned long)wd, (unsigned long)ht, (unsigned long)bpp, (unsigned long)refresh, (unsigned)flags, hr);
     if (hr < 0 && g_RetryDisplayMode)
-        hr = D7TrySetDisplayMode(w7->orig, wd, ht, bpp, refresh, flags);
+        hr = IDirectDraw7_SetDisplayMode(w7->orig, wd, ht, bpp, refresh, 0);
     if (hr < 0) {
         g_displayModeFailures++;
         if (bpp <= 16 || g_displayModeFailures >= 2)
             SmdTriggerWindowFallback("SetDisplayMode failed");
     }
-    /* Wine: skip forced borderless (causes unstable scaling/flicker with ddraw) */
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE WDD7_WaitForVerticalBlank(IDirectDraw7 *self, DWORD f, HANDLE ev) {
@@ -2629,42 +2371,34 @@ ddraw_ready:
         IDirectDraw7_Release(orig);
     }
     *out = wrapped;
-    if (g_ApiCensus && wrapped != orig)
-        CensusHookVtbl((void**)&g_dd7Vtbl, CEN_DD7, 30, 0);
     return hr;
 }
 
-#if defined(_MSC_VER)
-#define SMD_DLL_EXPORT
-#else
-#define SMD_DLL_EXPORT __declspec(dllexport)
-#endif
-
-SMD_DLL_EXPORT HRESULT WINAPI DirectDrawCreate(GUID *g, LPDIRECTDRAW *out, IUnknown *u) {
+__declspec(dllexport) HRESULT WINAPI DirectDrawCreate(GUID *g, LPDIRECTDRAW *out, IUnknown *u) {
     LoadReal();
     if (!p_DirectDrawCreate) return DDERR_GENERIC;
     HRESULT hr = ((PF_DDC)p_DirectDrawCreate)(g, out, u);
     SmdLog("DirectDrawCreate -> hr=%08X", hr);
     return hr;
 }
-SMD_DLL_EXPORT HRESULT WINAPI DirectDrawCreateClipper(DWORD flags, LPDIRECTDRAWCLIPPER *c, IUnknown *u) {
+__declspec(dllexport) HRESULT WINAPI DirectDrawCreateClipper(DWORD flags, LPDIRECTDRAWCLIPPER *c, IUnknown *u) {
     LoadReal();
     if (!p_DirectDrawCreateClipper) return DDERR_GENERIC;
     HRESULT hr = ((PF_DDClip)p_DirectDrawCreateClipper)(flags, c, u);
     SmdLog("DirectDrawCreateClipper -> hr=%08X", hr);
     return hr;
 }
-SMD_DLL_EXPORT HRESULT WINAPI DirectDrawCreateEx(GUID *g, LPVOID *o, REFIID i, IUnknown *u) {
+__declspec(dllexport) HRESULT WINAPI DirectDrawCreateEx(GUID *g, LPVOID *o, REFIID i, IUnknown *u) {
     return Hook_DirectDrawCreateEx(g, o, i, u);
 }
-SMD_DLL_EXPORT HRESULT WINAPI DirectDrawEnumerateA(LPDDENUMCALLBACKA cb, void *ctx) {
+__declspec(dllexport) HRESULT WINAPI DirectDrawEnumerateA(LPDDENUMCALLBACKA cb, void *ctx) {
     LoadReal();
     if (!p_DirectDrawEnumerateA) return DDERR_GENERIC;
     HRESULT hr = ((PF_DDEnum)p_DirectDrawEnumerateA)(cb, ctx);
     SmdLog("DirectDrawEnumerateA -> hr=%08X", hr);
     return hr;
 }
-SMD_DLL_EXPORT HRESULT WINAPI DirectDrawEnumerateW(LPDDENUMCALLBACKW cb, void *ctx) {
+__declspec(dllexport) HRESULT WINAPI DirectDrawEnumerateW(LPDDENUMCALLBACKW cb, void *ctx) {
     typedef HRESULT (WINAPI *PF_DDEnumW)(LPDDENUMCALLBACKW, LPVOID);
     LoadReal();
     if (!p_DirectDrawEnumerateW) return DDERR_GENERIC;
@@ -2672,14 +2406,14 @@ SMD_DLL_EXPORT HRESULT WINAPI DirectDrawEnumerateW(LPDDENUMCALLBACKW cb, void *c
     SmdLog("DirectDrawEnumerateW -> hr=%08X", hr);
     return hr;
 }
-SMD_DLL_EXPORT HRESULT WINAPI DirectDrawEnumerateExA(LPDDENUMCALLBACKEXA cb, void *ctx, DWORD flags) {
+__declspec(dllexport) HRESULT WINAPI DirectDrawEnumerateExA(LPDDENUMCALLBACKEXA cb, void *ctx, DWORD flags) {
     LoadReal();
     if (!p_DirectDrawEnumerateExA) return DDERR_GENERIC;
     HRESULT hr = ((PF_DDEnumEx)p_DirectDrawEnumerateExA)(cb, ctx, flags);
     SmdLog("DirectDrawEnumerateExA -> hr=%08X", hr);
     return hr;
 }
-SMD_DLL_EXPORT HRESULT WINAPI DirectDrawEnumerateExW(LPDDENUMCALLBACKEXW cb, void *ctx, DWORD flags) {
+__declspec(dllexport) HRESULT WINAPI DirectDrawEnumerateExW(LPDDENUMCALLBACKEXW cb, void *ctx, DWORD flags) {
     typedef HRESULT (WINAPI *PF_DDEnumExW)(LPDDENUMCALLBACKEXW, LPVOID, DWORD);
     LoadReal();
     if (!p_DirectDrawEnumerateExW) return DDERR_GENERIC;
@@ -2687,25 +2421,35 @@ SMD_DLL_EXPORT HRESULT WINAPI DirectDrawEnumerateExW(LPDDENUMCALLBACKEXW cb, voi
     SmdLog("DirectDrawEnumerateExW -> hr=%08X", hr);
     return hr;
 }
-SMD_DLL_EXPORT HRESULT WINAPI DllCanUnloadNow(void) {
+__declspec(dllexport) HRESULT WINAPI DllCanUnloadNow(void) {
     LoadReal();
     if (!p_DllCanUnloadNow) return S_FALSE;
     return ((PF_FPOCH)p_DllCanUnloadNow)();
 }
-SMD_DLL_EXPORT HRESULT WINAPI DllGetClassObject(REFCLSID cls, REFIID iid, void **out) {
+__declspec(dllexport) HRESULT WINAPI DllGetClassObject(REFCLSID cls, REFIID iid, void **out) {
     typedef HRESULT (WINAPI *PF_DGCO)(REFCLSID, REFIID, void**);
     LoadReal();
     if (!p_DllGetClassObject) return CLASS_E_CLASSNOTAVAILABLE;
     return ((PF_DGCO)p_DllGetClassObject)(cls, iid, out);
 }
-SMD_DLL_EXPORT HRESULT WINAPI DllRegisterServer(void) {
+__declspec(dllexport) HRESULT WINAPI DllRegisterServer(void) {
     LoadReal();
     if (!p_DllRegisterServer) return E_FAIL;
     return ((PF_FPOCH)p_DllRegisterServer)();
 }
-SMD_DLL_EXPORT HRESULT WINAPI DllUnregisterServer(void) {
+__declspec(dllexport) HRESULT WINAPI DllUnregisterServer(void) {
     LoadReal();
     if (!p_DllUnregisterServer) return E_FAIL;
     return ((PF_FPOCH)p_DllUnregisterServer)();
 }
 
+/*
+ * Extra practice: no replay save prompt.
+ *
+ * When a stage ends, the scene update (0x413ab0) goes to the title for a practice run (BYTE 0x4dade0 != 0)
+ * and to scene 5 (replay save prompt) otherwise: `push 0; push 5; call 0x4254d0` at 0x413bdb.  The Extra
+ * practice is started like a normal Extra run (0x4dade0 = 0), so it ended in the replay save prompt.
+ * Every `push 0; push 5; call 0x4254d0` (cdecl, 0x4254d0(scene, force)) in the code is redirected to a hook
+ * that asks for the title (scene 1) instead while an Extra practice run (g_exRun) is active.
+ */
+typedef void (__cdecl *PF_SceneSwitch)(int scene, int force);
