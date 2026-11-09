@@ -26,8 +26,8 @@ Wine/Protonではデフォルトの`DirectDraw`のままにすることを推奨
 
 「DIVE 2 M.R.S.」にカーソルを合わせ、コンセプトリアクターを入力しながら決定するとプラクティスメニューが開きます。
 
-## ビルド（Windows）
-
+## ビルド
+### Windows
 Visual Studioのx86 Native Tools環境で`clang-cl`を使います。Visual Studio InstallerでLLVM/Clangツールを追加し、リポジトリのルートで次を実行してください。`NMakefile`はMSVCのWindows SDK、`link.exe`およびライブラリを使ってx86 DLLを作成します。D3DX9ヘッダーは同梱の互換定義を使うため、旧DirectX SDKは不要です。
 
 ```bat
@@ -40,7 +40,7 @@ nmake /f NMakefile
 nmake /f NMakefile smd-debug
 ```
 
-## ビルド（Linux）
+### Linux
 
 MinGW-w64（32bit）でクロスコンパイルします。`i686-w64-mingw32-gcc` をインストールしてから、リポジトリのルートで `make` を実行してください。
 
