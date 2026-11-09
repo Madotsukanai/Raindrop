@@ -3367,16 +3367,17 @@ static unsigned char __cdecl ExStageClearOp(void *thr, void *args) {
     }
     if (g_exRun && g_exBossRun == 1) {
         if (!g_exBossReturnAtFrame) {
-            g_exBossReturnAtFrame = *(volatile int*)(uintptr_t)0x4dadf8 + 60;
-            Log("ExArea: Boss 1 defeated; returning to Practice in 60 frames (at %d)",
+            g_exBossReturnAtFrame = *(volatile int*)(uintptr_t)0x4dadf8 + 180;
+            Log("ExArea: Boss 1 defeated; returning to Practice in 180 frames (at %d)",
                 g_exBossReturnAtFrame);
         }
         return 1;
     }
     if (g_exRun && g_exBossRun == 2 && g_exBoss2BgmSeen) {
-        if (!g_exBossReturnAtFrame) {
-            g_exBossReturnAtFrame = *(volatile int*)(uintptr_t)0x4dadf8 + 60;
-            Log("ExArea: Boss 2 defeated; returning to Practice in 60 frames (at %d)",
+        int at = *(volatile int*)(uintptr_t)0x4dadf8 + 180;
+        if (!g_exBossReturnAtFrame || at < g_exBossReturnAtFrame) {
+            g_exBossReturnAtFrame = at;
+            Log("ExArea: Boss 2 defeated; returning to Practice in 180 frames (at %d)",
                 g_exBossReturnAtFrame);
         }
         return 1;
@@ -3463,6 +3464,7 @@ static void ExBoss2Step(int frame) {
     } else if (boss != g_exBoss1Obj) {
         /* a different boss object: this is Boss 2, leave it alone */
         g_exBoss2Kill = 0;
+        g_exBoss2ObjectSeen = 1;
         Log("ExArea: Boss 2 appeared (object %p, hp=%.3f) %d frame(s) after the Boss 1 jump", (void*)boss,
             *(float*)((char*)boss + 0x48), g_exBoss2KillFrames);
         return;
@@ -3672,8 +3674,8 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
     if (g_exRun && g_exBossRun == 1 && g_exBoss1DonePending) {
         g_exBoss1DonePending = 0;
         if (!g_exBossReturnAtFrame) {
-            g_exBossReturnAtFrame = frame + 60;
-            Log("ExArea: Boss 1 defeat transition reached; returning to Practice in 60 frames (at %d)",
+            g_exBossReturnAtFrame = frame + 180;
+            Log("ExArea: Boss 1 defeat transition reached; returning to Practice in 180 frames (at %d)",
                 g_exBossReturnAtFrame);
         }
     }
@@ -3689,15 +3691,19 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         unsigned *b = *(unsigned**)(uintptr_t)0x4dae04;
         if (b != g_exLastBoss) {
             g_exBossRunLogged++;
-            if (b && !IsBadReadPtr(b, 0x824))
+            if (b && !IsBadReadPtr(b, 0x824)) {
+                if (g_exBossRun == 2 && g_exBoss2BgmSeen) g_exBoss2ObjectSeen = 1;
                 Log("ExDlg: Boss practice: current boss object -> %p type=%u hp=%.3f (frame %d)", (void*)b, b[1],
                     *(float*)((char*)b + 0x48), frame);
-            else if (g_exLastBoss) {
-                Log("ExDlg: Boss practice: current boss object -> none (frame %d, was %p)", frame,
-                    (void*)g_exLastBoss);
-                if ((g_exBossRun == 1 || (g_exBoss2BgmSeen && g_exBoss2ObjectSeen)) && !g_exBossReturnAtFrame) {
-                    g_exBossReturnAtFrame = frame + 60;
-                    Log("ExArea: Boss %d defeated; returning to Practice in 60 frames (at %d)",
+            } else if (g_exLastBoss) {
+                Log("ExDlg: Boss practice: current boss object -> none (frame %d, was %p) [run=%d bgm2=%d seen=%d ret=%d]",
+                    frame, (void*)g_exLastBoss, g_exBossRun, g_exBoss2BgmSeen, g_exBoss2ObjectSeen, g_exBossReturnAtFrame);
+                if ((g_exBossRun == 1 || g_exBoss2BgmSeen) && !g_exBossReturnAtFrame) {
+                    /* Fallback when the stage clear opcode never fires: return 3 seconds after the
+                       boss object disappears (both Boss 1 and Boss 2).  ExStageClearOp can override
+                       this with an earlier natural return. */
+                    g_exBossReturnAtFrame = frame + 180;
+                    Log("ExArea: Boss %d defeated; returning to Practice in 180 frames (at %d)",
                         g_exBossRun, g_exBossReturnAtFrame);
                 }
             }
@@ -3739,7 +3745,7 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
                 }
                 frame = target;
                 if ((stage == 1 || stage == 2) && g_practiceBossTarget == 1) {
-                    g_practiceBgmSeekSeconds = stage == 1 ? 41 : 51;
+                    g_practiceBgmSeekSeconds = stage == 1 ? 38 : 48;
                     g_practiceBgmFadeInFrames = 0;
                     g_practiceBgmSeekPending = 1;
                     g_practiceBgmSeekDeadline = target + 120;
@@ -4419,25 +4425,31 @@ static int PracticeSeekBgmInner(int seconds) {
             (unsigned)positionHr);
         return 0;
     }
-    *(DWORD*)((char*)music + 0x4c) = 0;
-    *(DWORD*)((char*)music + 0x54) = 0;
-    *(DWORD*)((char*)music + 0x58) = 0;
-    Log("Practice/BGM seek step 17: calling rebuffer(0x4133b0)");
-    refilled = rebuffer(music) != 0;
-    Log("Practice/BGM seek step 18: rebuffer returned %d", refilled);
-    if (refilled) {
-        playHr = IDirectSoundBuffer_Play(ds, 0, 0,
-            (status & DSBSTATUS_LOOPING) ? DSBPLAY_LOOPING : 0);
-    } else if (status & DSBSTATUS_PLAYING) {
-        playHr = IDirectSoundBuffer_Play(ds, 0, 0,
-            (status & DSBSTATUS_LOOPING) ? DSBPLAY_LOOPING : 0);
+    /* Refilling the ring via the game's rebuffer(0x4133b0) crashes on some paths (Stage 1 MidBoss
+       practice seek) with a null deref inside the rebuffer, and is racy with the loader/streaming
+       thread.  The decoder source is already seeked; clear the stale ring to silence and restart
+       playback so the refill replaces it with seeked audio.  Do not touch music+0x4c/+0x50/+0x54/+0x58
+       (stream cursor state) — altering them misaligns refill (silence/delayed/wrong offset) and
+       touching +0x58 crashed rebuffer.  Without rebuffer the ring/cursor alignment is imperfect, so
+       playback starts near (not exactly at) the seek target; this is preferable to a crash. */
+    {
+        DSBCAPS caps;
+        void *p1 = NULL, *p2 = NULL;
+        DWORD b1 = 0, b2 = 0;
+        memset(&caps, 0, sizeof(caps));
+        caps.dwSize = sizeof(caps);
+        if (SUCCEEDED(IDirectSoundBuffer_GetCaps(ds, &caps)) &&
+            SUCCEEDED(IDirectSoundBuffer_Lock(ds, 0, caps.dwBufferBytes, &p1, &b1, &p2, &b2, DSBLOCK_ENTIREBUFFER))) {
+            if (p1 && b1) memset(p1, 0, b1);
+            if (p2 && b2) memset(p2, 0, b2);
+            IDirectSoundBuffer_Unlock(ds, p1, b1, p2, b2);
+        }
     }
-    Log("Practice/BGM seek step 19: Play hr=%08X", (unsigned)playHr);
-    if (!refilled) {
-        Log("PracticeBoss: native audio refill failed at source offset %lu", (unsigned long)offset);
-        return 0;
-    }
-    Log("PracticeBoss: native BGM source seeked to %lu seconds and ring refilled (id=%d, frame_offset=%lu, sample_rate=%lu, byte_rate=%lu, align=%u)",
+    Log("Practice/BGM seek step 17: Play (rebuffer skipped, ring cleared)");
+    playHr = IDirectSoundBuffer_Play(ds, 0, 0,
+        (status & DSBSTATUS_LOOPING) ? DSBPLAY_LOOPING : 0);
+    Log("Practice/BGM seek step 18: Play hr=%08X", (unsigned)playHr);
+    Log("PracticeBoss: native BGM source seeked to %lu seconds (id=%d, frame_offset=%lu, sample_rate=%lu, byte_rate=%lu, align=%u)",
         (unsigned long)targetSeconds, g_practiceBgmLastId, (unsigned long)offset,
         (unsigned long)samplesPerSec, (unsigned long)avgBytesPerSec, (unsigned)blockAlign);
     return 1;
