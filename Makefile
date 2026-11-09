@@ -8,6 +8,9 @@ LDFLAGS = -shared -static-libgcc -s -Wl,--kill-at
 
 all: refrain smd
 
+# make debug : every debug build (logging enabled) -> build/debug/d3d9.dll and build/debug/ddraw.dll
+debug: refrain-debug smd-debug
+
 # make refrain : src/RefRain.c -> build/d3d9.dll
 # Standalone deployment: place d3d9.dll beside RefRain.exe.  Windows loads
 # it in preference to the system DLL, and it forwards Direct3DCreate9 to the
@@ -19,6 +22,15 @@ $(BUILD)/d3d9.dll: $(BUILD)/RefRain.o
 
 $(BUILD)/RefRain.o: src/RefRain.c src/d3dx9_font_compat.h | $(BUILD)
 	$(CC) -c -o $@ $< $(CFLAGS)
+
+# make refrain-debug : same, with logging (stage_select.log) enabled -> build/debug/d3d9.dll
+refrain-debug: $(BUILD)/debug/d3d9.dll
+
+$(BUILD)/debug/d3d9.dll: $(BUILD)/RefRain_debug.o | $(BUILD)/debug
+	$(CC) -o $@ $^ $(LDFLAGS) -lwinmm
+
+$(BUILD)/RefRain_debug.o: src/RefRain.c src/d3dx9_font_compat.h | $(BUILD)
+	$(CC) -c -o $@ $< $(CFLAGS) -DREFRAIN_DEBUG_BUILD
 
 # make smd : Smd sources -> build/ddraw.dll
 smd: $(BUILD)/ddraw.dll
@@ -59,4 +71,4 @@ $(BUILD)/debug:
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all refrain smd smd-debug clean
+.PHONY: all debug refrain refrain-debug smd smd-debug clean

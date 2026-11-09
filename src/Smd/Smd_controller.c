@@ -459,8 +459,16 @@ static void JoyDirectInputScan(void) {
     PF_DirectInput8Create create;
     HWND hwnd;
     DWORD now = GetTickCount();
+    static unsigned scanSeq;
+    LARGE_INTEGER s0, s1, sfreq;
+    unsigned seq;
+
     if (g_di8 && now - g_diLastScan < 1000) return;
     g_diLastScan = now;
+    seq = ++scanSeq;
+    QueryPerformanceCounter(&s0);
+    QueryPerformanceFrequency(&sfreq);
+    SmdLog("JoyBridge: DI scan #%u begin (window pending)", seq);
     if (!g_dinputModule) {
         g_dinputModule = LoadLibraryA("dinput8.dll");
         if (!g_dinputModule) {
@@ -494,9 +502,11 @@ static void JoyDirectInputScan(void) {
         g_diScans++;
         g_diEnumSeen = 0;
         ehr = IDirectInput8_EnumDevices(g_di8, DI8DEVCLASS_GAMECTRL, JoyEnumDirectInput, hwnd, DIEDFL_ATTACHEDONLY);
+        QueryPerformanceCounter(&s1);
         if (oldCount != g_diCount || g_diScans <= 3)
-            SmdLog("JoyBridge: DirectInput scan #%u: EnumDevices hr=%08X, %u device(s) enumerated, %u usable (was %u), window=%p",
-                g_diScans, (unsigned)ehr, g_diEnumSeen, g_diCount, oldCount, (void*)hwnd);
+            SmdLog("JoyBridge: DirectInput scan #%u: EnumDevices hr=%08X, %u device(s) enumerated, %u usable (was %u), window=%p, took %.2f ms",
+                g_diScans, (unsigned)ehr, g_diEnumSeen, g_diCount, oldCount, (void*)hwnd,
+                (double)(s1.QuadPart - s0.QuadPart) * 1000.0 / (double)sfreq.QuadPart);
     }
 }
 
@@ -520,6 +530,12 @@ static int JoyDirectInputState(unsigned id, JOYINFOEX *out) {
     DWORD pov;
     unsigned i, buttons = 0;
     JOYINFOEX ji0;
+    static unsigned pollSeq;
+
+    {
+        unsigned n = ++pollSeq;
+        if (n <= 3000) SmdLog("JoyBridge: DI poll enter #%u id=%u", n, id);
+    }
     if (id >= g_diCount || !out) return 0;
     device = g_diDevices[id];
     hr = IDirectInputDevice8_Poll(device);

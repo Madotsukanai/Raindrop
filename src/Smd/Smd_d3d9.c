@@ -28,10 +28,24 @@ static void ExeDirFile(const char *name, char *out) {
     if (slash) *(slash + 1) = 0;
     strcat(out, name);
 }
-void SmdD3D9CensusInit(void) {}
-void SmdD3D9CensusSummary(void) {}
-void SmdD3D9CensusSummaryPeriodic(void) {}
-void SmdD3D9PatchEnterMask(void) {}
+
+/* Debug call tracer: logs the first D7_TRACE_LIMIT  DirectDraw7/Direct3D7 API calls
+   so a startup hang can be located by looking at the last logged call. */
+#ifdef SMD_DEBUG_BUILD
+static unsigned g_d7TraceTotal;
+#define D7_TRACE_LIMIT 6000
+static void TraceHit(const char *name) {
+    if (g_d7TraceTotal++ >= D7_TRACE_LIMIT) return;
+    SmdLog("TRACE %05u %s", g_d7TraceTotal - 1, name);
+}
+static void TraceHitN(const char *name, unsigned long a, unsigned long b) {
+    if (g_d7TraceTotal++ >= D7_TRACE_LIMIT) return;
+    SmdLog("TRACE %05u %s(%08lX,%08lX)", g_d7TraceTotal - 1, name, a, b);
+}
+#else
+#define TraceHit(n) ((void)0)
+#define TraceHitN(n, a, b) ((void)0)
+#endif
 
 #ifndef SMD_D3D7_EMU
 #define SMD_D3D7_EMU 1
@@ -143,6 +157,7 @@ static void D7_BatchFlush(void) {
     IDirect3DDevice9 *dev = g_d7.dev;
     IDirect3DTexture9 *tex = NULL;
     unsigned quads = g_d7bq;
+    TraceHitN("Dev.BatchFlush", quads, 0);
     SmdBatchFlushQuads();   /* called before every real state change: the queued sprites use the old state */
     if (!quads) return;
     g_d7bq = 0;
@@ -376,6 +391,7 @@ static IDirect3DTexture9 *D7_GetTex(D7Surf *s) {
     RECT rc;
     const DWORD *lut;
 
+    TraceHitN("Surf.GetTexUpload", s->w | (s->h << 8) | (s->dirty << 16), (unsigned long)(uintptr_t)s);
     if (!g_d7.dev || !s->bits || (s->bpp != 16 && s->bpp != 32)) return NULL;
     if (!s->tex) {
         HRESULT hr = IDirect3DDevice9_CreateTexture(g_d7.dev, (UINT)s->w, (UINT)s->h, 1, 0,
@@ -685,7 +701,16 @@ static int D7_InitD3D9(void) {
     pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
     pp.hDeviceWindow = hwnd;
     pp.Windowed = TRUE;
-    pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    {
+        D3DDISPLAYMODE dm;
+        UINT rr = 0;
+        if (SUCCEEDED(IDirect3D9_GetAdapterDisplayMode(g_d7.d3d, D3DADAPTER_DEFAULT, &dm)))
+            rr = dm.RefreshRate;
+        pp.PresentationInterval = (rr >= 59 && rr <= 61) ? D3DPRESENT_INTERVAL_ONE
+                                                        : D3DPRESENT_INTERVAL_IMMEDIATE;
+        SmdLog("D3D7 emu: vsync %s (display %u Hz)",
+            pp.PresentationInterval == D3DPRESENT_INTERVAL_ONE ? "on" : "off (pacing)", rr);
+    }
     hr = D3DERR_NOTAVAILABLE;
     if (g_D7PureDevice) {
         hr = IDirect3D9_CreateDevice(g_d7.d3d, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
@@ -757,10 +782,85 @@ static HRESULT D7_PresentFS(void) {
     return IDirect3DDevice9_Present(g_d7.dev, NULL, &dr, NULL, NULL);
 }
 
+/* Present pacing: align early frame arrivals to 16.667 ms boundaries so D3D9 holds a stable 60.0 fps.
+   On a 60 Hz display the device uses vblank sync (INTERVAL_ONE) so this is usually a no-op; on other
+   refresh rates or async present paths it smooths game-loop jitter.  Disengages when present itself is
+   the bottleneck (driver stall / device loss). */
+static LARGE_INTEGER g_paceFreq;
+static LARGE_INTEGER g_lastPresent;
+static double g_costEwmaMs;
+static int g_paceTimerInit;
+static HANDLE g_paceTimer;
+static int g_paceHiRes;
+static const double D7_PACE_INTERVAL_MS = 16.666667;
+
+static void D7PaceWait(void);
+static int SmdIsWine(void);
+
+static void D7PaceUpdate(LARGE_INTEGER t1, double cost) {
+    if (!g_paceFreq.QuadPart) return;
+    g_lastPresent = t1;
+    g_costEwmaMs = g_costEwmaMs ? g_costEwmaMs * 0.85 + cost * 0.15 : cost;
+}
+
+static void D7PaceWait(void) {
+    LARGE_INTEGER now;
+    double rem, margin, wait;
+    if (!g_paceFreq.QuadPart || !g_lastPresent.QuadPart) return;
+    if (g_costEwmaMs > 4.0) return;   /* present/driver is the bottleneck; don't add latency */
+    QueryPerformanceCounter(&now);
+    rem = D7_PACE_INTERVAL_MS -
+        (double)(now.QuadPart - g_lastPresent.QuadPart) * 1000.0 / (double)g_paceFreq.QuadPart;
+    if (rem <= 0.3 || rem > 4.0) return;  /* only align early arrivals; late frames pass through */
+    if (!g_paceTimerInit) {
+        typedef HANDLE (WINAPI *PF_CWTExW)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+        HMODULE k = GetModuleHandleA("kernel32.dll");
+        PF_CWTExW cw = k ? (PF_CWTExW)(void*)GetProcAddress(k, "CreateWaitableTimerExW") : NULL;
+        g_paceTimerInit = 1;
+        if (cw && !SmdIsWine()) {
+            g_paceTimer = cw(NULL, NULL, 2, TIMER_ALL_ACCESS);
+            if (g_paceTimer) g_paceHiRes = 1;
+        }
+        if (!g_paceHiRes && !SmdIsWine()) {
+            typedef UINT (WINAPI *PF_TBP)(UINT);
+            HMODULE mm = LoadLibraryA("winmm.dll");
+            PF_TBP tbp = mm ? (PF_TBP)(void*)GetProcAddress(mm, "timeBeginPeriod") : NULL;
+            if (tbp) tbp(1);
+        }
+        SmdLog("D7Present: pacing timer %s", g_paceHiRes ? "high-resolution" : "MsgWait");
+    }
+    margin = g_paceHiRes ? 0.4 : 2.0;
+    wait = rem - margin;
+    if (g_paceHiRes && g_paceTimer && wait > 0.1) {
+        LARGE_INTEGER lt;
+        lt.QuadPart = -(LONGLONG)(wait * 10000.0);
+        if (SetWaitableTimer(g_paceTimer, &lt, 0, NULL, NULL, FALSE))
+            MsgWaitForMultipleObjects(1, &g_paceTimer, FALSE, INFINITE, QS_ALLINPUT);
+    } else if (wait > 1.0) {
+        MsgWaitForMultipleObjects(0, NULL, FALSE, (DWORD)wait, QS_ALLINPUT);
+    }
+    for (;;) {  /* fine-align the final fraction of a millisecond */
+        LARGE_INTEGER cur;
+        QueryPerformanceCounter(&cur);
+        if ((double)(cur.QuadPart - g_lastPresent.QuadPart) * 1000.0 / (double)g_paceFreq.QuadPart
+            >= D7_PACE_INTERVAL_MS - 0.05) break;
+    }
+}
+
 static void D7_Present(void) {
+    LARGE_INTEGER t0, t1;
+    TraceHit("Dev.Present(emu)");
     HRESULT hr;
+    double cost;
     if (!g_d7.dev) return;
+    if (!g_paceFreq.QuadPart) QueryPerformanceFrequency(&g_paceFreq);
+    D7PaceWait();
+    QueryPerformanceCounter(&t0);
     hr = D7_PresentFS();
+    QueryPerformanceCounter(&t1);
+    cost = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)g_paceFreq.QuadPart;
+    D7PaceUpdate(t1, cost);
+    SmdLog("D7Present: hr=%08X elapsed=%.2f ms", (unsigned)hr, cost);
     if (hr == D3DERR_DEVICELOST || hr == D3DERR_DEVICENOTRESET) {
         hr = IDirect3DDevice9_TestCooperativeLevel(g_d7.dev);
         if (hr == D3DERR_DEVICENOTRESET) {
@@ -896,6 +996,7 @@ static HRESULT STDMETHODCALLTYPE ES_AddAttachedSurface(void *self, void *att) {
 static HRESULT STDMETHODCALLTYPE ES_Blt(void *self, RECT *dr, void *srcp, RECT *sr, DWORD flags, DDBLTFX *fx) {
     D7Surf *d = (D7Surf*)self, *s = (D7Surf*)srcp;
 
+    TraceHitN("Surf.Blt", (unsigned long)flags, s ? (unsigned long)s->caps : 0);
     if (d->isPrimary) {
         if (s && (s == g_d7.back3d || (s->caps & DDSCAPS_3DDEVICE) || s == d->back)) {
             D7_Present();
@@ -929,6 +1030,7 @@ static HRESULT STDMETHODCALLTYPE ES_Blt(void *self, RECT *dr, void *srcp, RECT *
 static HRESULT STDMETHODCALLTYPE ES_BltFast(void *self, DWORD x, DWORD y, void *srcp, RECT *sr, DWORD trans) {
     D7Surf *d = (D7Surf*)self, *s = (D7Surf*)srcp;
     RECT dr, src;
+    TraceHitN("Surf.BltFast", (unsigned long)trans, s ? (unsigned long)s->caps : 0);
     if (!s) return DDERR_INVALIDPARAMS;
     if (sr) src = *sr; else { src.left = 0; src.top = 0; src.right = s->w; src.bottom = s->h; }
     dr.left = (LONG)x; dr.top = (LONG)y;
@@ -945,6 +1047,7 @@ static HRESULT STDMETHODCALLTYPE ES_BltFast(void *self, DWORD x, DWORD y, void *
 }
 
 static HRESULT STDMETHODCALLTYPE ES_Flip(void *self, void *target, DWORD flags) {
+    TraceHitN("Surf.Flip", flags, 0);
     if (((D7Surf*)self)->isPrimary) D7_Present();
     return DD_OK;
 }
@@ -984,8 +1087,9 @@ static void D7_SyncD3D9PixelsToDib(D7Surf *s) {
     int x, y;
     if (!s || !s->bits || (s->bpp != 16 && s->bpp != 32) || !g_d7.dev ||
         (s != g_d7.back3d && !s->isPrimary)) return;
-    D7_BatchFlush();
+    TraceHit("Surf.SyncBackbuffer");
     hr = IDirect3DDevice9_GetBackBuffer(g_d7.dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &back);
+
     if (FAILED(hr) || !back) return;
     hr = IDirect3DSurface9_GetDesc(back, &desc);
     if (SUCCEEDED(hr))
@@ -1014,6 +1118,7 @@ static void D7_SyncD3D9PixelsToDib(D7Surf *s) {
 
 static HRESULT STDMETHODCALLTYPE ES_GetDC(void *self, HDC *out) {
     D7Surf *s = (D7Surf*)self;
+    TraceHitN("Surf.GetDC", s->w, s->h);
     if (!out) return DDERR_INVALIDPARAMS;
     if (!s->dib) return DDERR_CANTCREATEDC;
     D7_SyncD3D9PixelsToDib(s);
@@ -1061,6 +1166,7 @@ static HRESULT STDMETHODCALLTYPE ES_GetSurfaceDesc(void *self, DDSURFACEDESC2 *d
 
 static HRESULT STDMETHODCALLTYPE ES_Lock(void *self, RECT *r, DDSURFACEDESC2 *d, DWORD flags, HANDLE ev) {
     D7Surf *s = (D7Surf*)self;
+    TraceHitN("Surf.Lock", (unsigned long)flags, r ? (unsigned long)r->left | ((unsigned long)r->top << 8) : 0);
     if (!d) return DDERR_INVALIDPARAMS;
     if (!s->bits) return DDERR_SURFACELOST;
     if (s == g_d7.back3d && D7_Warn(D7W_BACKLOCK))
@@ -1118,14 +1224,26 @@ D7FN(ES_BltBatch, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
 D7FN(ES_DeleteAttachedSurface, DD_OK, DWORD a, DWORD b)
 D7FN(ES_EnumAttachedSurfaces, DDERR_UNSUPPORTED, DWORD a, DWORD b)
 D7FN(ES_EnumOverlayZOrders, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
-D7FN(ES_GetBltStatus, DD_OK, DWORD a)
+static HRESULT STDMETHODCALLTYPE ES_GetBltStatus(void *self, DWORD a) {
+    TraceHit("Surf.GetBltStatus");
+    return DD_OK;
+}
+static HRESULT STDMETHODCALLTYPE ES_GetFlipStatus(void *self, DWORD a) {
+    TraceHit("Surf.GetFlipStatus");
+    return DD_OK;
+}
 D7FN(ES_GetClipper, DDERR_NOCLIPPERATTACHED, DWORD a)
-D7FN(ES_GetFlipStatus, DD_OK, DWORD a)
 D7FN(ES_GetOverlayPosition, DDERR_UNSUPPORTED, DWORD a, DWORD b)
 D7FN(ES_GetPalette, DDERR_NOPALETTEATTACHED, DWORD a)
 D7FN(ES_Initialize, DDERR_ALREADYINITIALIZED, DWORD a, DWORD b)
-D7FN(ES_IsLost, DD_OK)
-D7FN(ES_Restore, DD_OK)
+static HRESULT STDMETHODCALLTYPE ES_IsLost(void *self) {
+    TraceHit("Surf.IsLost");
+    return DD_OK;
+}
+static HRESULT STDMETHODCALLTYPE ES_Restore(void *self) {
+    TraceHit("Surf.Restore");
+    return DD_OK;
+}
 D7FN(ES_SetClipper, DD_OK, DWORD a)
 D7FN(ES_SetOverlayPosition, DDERR_UNSUPPORTED, DWORD a, DWORD b)
 D7FN(ES_SetPalette, DD_OK, DWORD a)
@@ -1190,11 +1308,13 @@ static HRESULT STDMETHODCALLTYPE EV_EnumTextureFormats(void *self, PF_D7EnumPF c
 }
 
 static HRESULT STDMETHODCALLTYPE EV_BeginScene(void *self) {
+    TraceHit("Dev.BeginScene");
     if (g_d7.dev && SUCCEEDED(IDirect3DDevice9_BeginScene(g_d7.dev))) g_d7.inScene = 1;
     return DD_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE EV_EndScene(void *self) {
+    TraceHit("Dev.EndScene");
     if (g_d7.dev) { IDirect3DDevice9_EndScene(g_d7.dev); g_d7.inScene = 0; }
     return DD_OK;
 }
@@ -1207,12 +1327,14 @@ static HRESULT STDMETHODCALLTYPE EV_GetDirect3D(void *self, void **out) {
 }
 
 static HRESULT STDMETHODCALLTYPE EV_Clear(void *self, DWORD count, void *rects, DWORD flags, DWORD color, float z, DWORD stencil) {
+    TraceHitN("Dev.Clear", count, flags);
     if (g_d7.dev && (flags & D3DCLEAR_TARGET))
         IDirect3DDevice9_Clear(g_d7.dev, count, (const D3DRECT*)rects, D3DCLEAR_TARGET, color, z, stencil);
     return DD_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE EV_SetViewport(void *self, void *vp) {
+    TraceHit("Dev.SetViewport");
     if (g_d7.dev && vp) IDirect3DDevice9_SetViewport(g_d7.dev, (const D3DVIEWPORT9*)vp);
     return DD_OK;
 }
@@ -1229,6 +1351,7 @@ static int D7_RsPass(DWORD st) {
 
 static HRESULT STDMETHODCALLTYPE EV_SetRenderState(void *self, DWORD st, DWORD v) {
     static unsigned char logged[256];
+    TraceHitN("Dev.SetRenderState", st, v);
     if (!g_d7.dev) return DD_OK;
     switch (st) {
     case 17: D7_ApplySamp(0, D3DSAMP_MAGFILTER, D7_MapFilter(v)); break;
@@ -1255,6 +1378,7 @@ static HRESULT STDMETHODCALLTYPE EV_GetRenderState(void *self, DWORD st, DWORD *
 static HRESULT STDMETHODCALLTYPE EV_SetTexture(void *self, DWORD stage, void *tex) {
     D7Surf *s = (D7Surf*)tex;
     IDirect3DTexture9 *t = NULL;
+    TraceHitN("Dev.SetTexture", stage, (unsigned long)(uintptr_t)tex);
     if (!g_d7.dev || stage >= 8) return DD_OK;
     g_d7.curTex[stage] = s;
     if (s) t = D7_GetTex(s);
@@ -1263,6 +1387,7 @@ static HRESULT STDMETHODCALLTYPE EV_SetTexture(void *self, DWORD stage, void *te
 }
 
 static HRESULT STDMETHODCALLTYPE EV_SetTextureStageState(void *self, DWORD stage, DWORD type, DWORD v) {
+    TraceHitN("Dev.SetTextureStageState", stage | (type << 8), v);
     if (!g_d7.dev || stage >= 8) return DD_OK;
     switch (type) {
     case 12: D7_ApplySamp(stage, D3DSAMP_ADDRESSU, v); D7_ApplySamp(stage, D3DSAMP_ADDRESSV, v); break;
@@ -1309,7 +1434,8 @@ static void D7_CkBegin(void) {
 }
 
 static void D7_CkEnd(void) {
-    D7_ApplyRS(D3DRS_ALPHATESTENABLE, g_d7.rsSet[D3DRS_ALPHATESTENABLE] ? 0 : 0);
+    D7_ApplyRS(D3DRS_ALPHATESTENABLE,
+               g_d7.rsSet[D3DRS_ALPHATESTENABLE] ? g_d7.rs[D3DRS_ALPHATESTENABLE] : FALSE);
 }
 
 static HRESULT STDMETHODCALLTYPE EV_DrawPrimitive(void *self, DWORD type, DWORD fvf, void *verts, DWORD count, DWORD flags) {
@@ -1317,6 +1443,7 @@ static HRESULT STDMETHODCALLTYPE EV_DrawPrimitive(void *self, DWORD type, DWORD 
     D7Surf *t0;
     int ck;
 
+    TraceHitN("Dev.DrawPrimitive", type | (count << 8) | (fvf << 16), (unsigned long)(uintptr_t)verts);
     if (!g_d7.dev || !verts || !count) return DD_OK;
     stride = D7_FvfStride(fvf);
     switch (type) {
@@ -1849,13 +1976,22 @@ static HRESULT STDMETHODCALLTYPE ED_GetCaps(void *self, DDCAPS *hal, DDCAPS *hel
     return DD_OK;
 }
 D7FN(ED_GetGDISurface, DDERR_UNSUPPORTED, DWORD a)
-D7FN(ED_GetScanLine, DDERR_UNSUPPORTED, DWORD a)
+static HRESULT STDMETHODCALLTYPE ED_GetScanLine(void *self, DWORD *s) {
+    TraceHit("DD7.GetScanLine");
+    return DDERR_UNSUPPORTED;
+}
 D7FN(ED_Initialize, DDERR_ALREADYINITIALIZED, DWORD a)
 D7FN(ED_RestoreDisplayMode, DD_OK)
-D7FN(ED_WaitForVerticalBlank, DD_OK, DWORD a, DWORD b)
+static HRESULT STDMETHODCALLTYPE ED_WaitForVerticalBlank(void *self, DWORD a, DWORD b) {
+    TraceHit("DD7.WaitForVerticalBlank");
+    return DD_OK;
+}
 D7FN(ED_GetSurfaceFromDC, DDERR_UNSUPPORTED, DWORD a, DWORD b)
 D7FN(ED_RestoreAllSurfaces, DD_OK)
-D7FN(ED_TestCooperativeLevel, DD_OK)
+static HRESULT STDMETHODCALLTYPE ED_TestCooperativeLevel(void *self) {
+    TraceHit("DD7.TestCooperativeLevel");
+    return DD_OK;
+}
 D7FN(ED_StartModeTest, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
 D7FN(ED_EvaluateMode, DDERR_UNSUPPORTED, DWORD a, DWORD b)
 
@@ -1913,13 +2049,26 @@ static int D7E_ConfigD3D9(void) {
                 SmdLog("Created raindrop.ini with default Graphics API");
             }
         }
-        GetPrivateProfileStringA("Graphics", "API", "DirectDraw", value, sizeof(value), path);
+        /* The sentinel default tells us whether the user explicitly configured the API or
+           the ini only contains the default.  An explicit D3D9 request is honoured even
+           under Wine/Proton (DXVK provides d3d9 there); the fallback must not silently
+           override the user's config, otherwise Proton runs end up on the Wine builtin
+           DirectDraw, where the game cannot init and exits immediately. */
+        GetPrivateProfileStringA("Graphics", "API", "\x1notconfigured", value, sizeof(value), path);
         useD3D9 = (_stricmp(value, "D3D9") == 0 || _stricmp(value, "Direct3D9") == 0);
-        if (useD3D9 && SmdIsWine()) {
-            SmdLog("Graphics API: D3D9 requested, but Wine/Proton detected -> falling back to DirectDraw (D3D9 emu unstable under Wine)");
-            useD3D9 = 0;
+        if (_stricmp(value, "\x1notconfigured") == 0) {
+            GetPrivateProfileStringA("Graphics", "API", "DirectDraw", value, sizeof(value), path);
+            if (useD3D9 && SmdIsWine()) {
+                SmdLog("Graphics API: D3D9 default, but Wine/Proton detected -> falling back to DirectDraw (D3D9 emu unstable under Wine)");
+                useD3D9 = 0;
+            } else {
+                SmdLog("Graphics API: %s (default)", useD3D9 ? "D3D9" : "DirectDraw");
+            }
         } else {
-            SmdLog("Graphics API: %s (raindrop.ini or default)", useD3D9 ? "D3D9" : "DirectDraw");
+            if (useD3D9 && SmdIsWine())
+                SmdLog("Graphics API: D3D9 explicitly configured in raindrop.ini, Wine/Proton detected -> using it anyway");
+            else
+                SmdLog("Graphics API: %s (raindrop.ini)", useD3D9 ? "D3D9" : "DirectDraw");
         }
         initialized = 1;
     }

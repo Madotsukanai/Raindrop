@@ -14,12 +14,6 @@ void SmdControllerInit(void);
 void SmdControllerPoll(void);
 int SmdControllerIsConnected(unsigned id);
 
-void SmdD3D9CensusInit(void);
-void SmdD3D9CensusSummary(void);
-void SmdD3D9CensusSummaryPeriodic(void);
-void SmdD3D9PatchEnterMask(void);
-int SmdD3D9EmuActive(void);
-
 extern const int g_LogAll;
 extern const int g_StripAllowModeX;
 extern const int g_RetryCoopLevel;

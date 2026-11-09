@@ -4,7 +4,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <ddraw.h>
-#include <d3d9.h>
 #include <mmsystem.h>
 #include <dinput.h>
 #include <mmreg.h>
@@ -290,7 +289,6 @@ static DWORD WINAPI KeyThread(LPVOID unused) {
 
 static void FlushStats(LONGLONG now) {
     double sec = TicksToMs(now - g_winStart) / 1000.0;
-    SmdD3D9CensusSummaryPeriodic();
     Log("stats %.1fs mode=%s lowlatency=%d dwmflush=%d frames=%lld fps=%.1f timeouts=%lld",
         sec, g_lastFlip ? "flip" : "blt", g_LowLatency, (g_LowLatency && g_UseDwmFlush && g_pDwmFlush) ? 1 : 0,
         (long long)g_frames, sec > 0 ? (double)g_frames / sec : 0.0, (long long)g_timeouts);
@@ -503,7 +501,59 @@ static void SmdWineStretchPrimary(IDirectDrawSurface7 *self, LPDIRECTDRAWSURFACE
     }
 }
 
-static HRESULT STDMETHODCALLTYPE Hook_Blt(IDirectDrawSurface7 *self, LPRECT dr, LPDIRECTDRAWSURFACE7 src, LPRECT sr, DWORD flags, LPDDBLTFX fx) {
+/* DirectDraw present pacing (real ddraw path): aligns frame presents to 16.667 ms boundaries to smooth
+   60 fps jitter.  Skips when present/vsync is already the bottleneck. */
+static LARGE_INTEGER g_ddLastPresent;
+static double g_ddCostEwmaMs;
+static int g_ddPaceTimerInit;
+static HANDLE g_ddPaceTimer;
+static int g_ddPaceHiRes;
+static const double SMD_PACE_INTERVAL_MS = 16.666667;
+
+static void DDPaceWait(void) {
+    LARGE_INTEGER now;
+    double rem, margin, wait;
+    if (!g_qpcFreq.QuadPart || !g_ddLastPresent.QuadPart) return;
+    if (g_ddCostEwmaMs > 4.0) return;
+    QueryPerformanceCounter(&now);
+    rem = SMD_PACE_INTERVAL_MS -
+        (double)(now.QuadPart - g_ddLastPresent.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
+    if (rem <= 0.3 || rem > 4.0) return;
+    if (!g_ddPaceTimerInit) {
+        typedef HANDLE (WINAPI *PF_CWTExW)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+        HMODULE k = GetModuleHandleA("kernel32.dll");
+        PF_CWTExW cw = k ? (PF_CWTExW)(void*)GetProcAddress(k, "CreateWaitableTimerExW") : NULL;
+        g_ddPaceTimerInit = 1;
+        if (cw && !SmdIsWine()) {
+            g_ddPaceTimer = cw(NULL, NULL, 2, TIMER_ALL_ACCESS);
+            if (g_ddPaceTimer) g_ddPaceHiRes = 1;
+        }
+    }
+    margin = g_ddPaceHiRes ? 0.4 : 2.0;
+    wait = rem - margin;
+    if (g_ddPaceHiRes && g_ddPaceTimer && wait > 0.1) {
+        LARGE_INTEGER lt;
+        lt.QuadPart = -(LONGLONG)(wait * 10000.0);
+        if (SetWaitableTimer(g_ddPaceTimer, &lt, 0, NULL, NULL, FALSE))
+            MsgWaitForMultipleObjects(1, &g_ddPaceTimer, FALSE, INFINITE, QS_ALLINPUT);
+    } else if (wait > 1.0) {
+        MsgWaitForMultipleObjects(0, NULL, FALSE, (DWORD)wait, QS_ALLINPUT);
+    }
+    for (;;) {
+        LARGE_INTEGER cur;
+        QueryPerformanceCounter(&cur);
+        if ((double)(cur.QuadPart - g_ddLastPresent.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart
+            >= SMD_PACE_INTERVAL_MS - 0.05) break;
+    }
+}
+
+static void DDPaceUpdate(LARGE_INTEGER t1, double cost) {
+    g_ddLastPresent = t1;
+    g_ddCostEwmaMs = g_ddCostEwmaMs ? g_ddCostEwmaMs * 0.85 + cost * 0.15 : cost;
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_Blt(IDirectDrawSurface7 *self, LPRECT dr, LPDIRECTDRAWSURFACE7 src,
+                                          LPRECT sr, DWORD flags, LPDDBLTFX fx) {
     LARGE_INTEGER a, b;
     RECT wdr, gsr;
     LPRECT useDr = dr, useSr = sr;
@@ -524,20 +574,30 @@ static HRESULT STDMETHODCALLTYPE Hook_Blt(IDirectDrawSurface7 *self, LPRECT dr, 
            Run in a window (WndMode) + gamescope for stable fullscreen scaling. */
         useDr = dr; useSr = sr;
     }
+    /* Hook_Blt: pace before primary-present blits */
+    int isPresent = (self == g_primary && src);
+    if (isPresent) DDPaceWait();
     QueryPerformanceCounter(&a);
     HRESULT hr = g_origBlt(self, useDr, src, useSr, flags, fx);
     QueryPerformanceCounter(&b);
-    if (hr >= 0 && self == g_primary && src && g_measureReady) FinishPresent(self, 0, a, b);
+    if (hr >= 0 && isPresent && g_measureReady) {
+        DDPaceUpdate(b, TicksToMs(b.QuadPart - a.QuadPart));
+        FinishPresent(self, 0, a, b);
+    }
     return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_Flip(IDirectDrawSurface7 *self, LPDIRECTDRAWSURFACE7 target, DWORD flags) {
     LARGE_INTEGER a, b;
     BatchFlush();
+    if (self == g_primary) DDPaceWait();
     QueryPerformanceCounter(&a);
     HRESULT hr = g_origFlip(self, target, flags);
     QueryPerformanceCounter(&b);
-    if (hr >= 0 && self == g_primary && g_measureReady) FinishPresent(self, 1, a, b);
+    if (hr >= 0 && self == g_primary && g_measureReady) {
+        DDPaceUpdate(b, TicksToMs(b.QuadPart - a.QuadPart));
+        FinishPresent(self, 1, a, b);
+    }
     return hr;
 }
 
@@ -4791,12 +4851,7 @@ static void BatchTryInstall(void) {
     if (!svt || IsBadReadPtr(svt, 40 * sizeof(void*))) { g_batchFailed = 1; return; }
 
     g_devSelf = dev;
-    if (SmdD3D9EmuActive()) {
-        /* D3D9 emulation layer has its own batching/state tracking; don't hook its device. */
-        Log("Batch: skipped for D3D9 emulation device %p", dev);
-        g_batchFailed = 1;
-        return;
-    } else {
+    {
         nd = BatchStubSlots(vt, devSlots, (int)sizeof(devSlots));
     }
     ns = BatchStubSlots(svt, surfSlots, (int)sizeof(surfSlots));
@@ -5093,7 +5148,6 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         QueryPerformanceFrequency(&g_qpcFreq);
         Log("process attach (pid=%lu)", GetCurrentProcessId());
         LogWindowsVersion();
-        SmdD3D9CensusInit();
         InitFallbackInstance();
         PatchColorDepth32();
         PatchForceWindowMode();
@@ -5115,13 +5169,11 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         PatchSoundFix();
         PatchFrameWait();
         PatchFpsDisplay();
-        SmdD3D9PatchEnterMask();
         PatchKeepRunningInactive();
         SmdControllerInit();
         break;
     case DLL_PROCESS_DETACH:
         Log("process detach");
-        SmdD3D9CensusSummary();
         SeSummary();
         if (g_log) {
             FILE *f = g_log;

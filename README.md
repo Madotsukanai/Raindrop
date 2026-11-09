@@ -24,7 +24,7 @@ Wine/Protonではデフォルトの`DirectDraw`のままにすることを推奨
 
 [Releases](https://github.com/Madotsukanai/Raindrop/releases/latest)から`d3d9.dll`をダウンロードし、`RefRain.exe` (SHA-256: `db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78`)と同じディレクトリにコピーしてゲームを起動してください。
 
-「DIVE 2 M.R.S.」にカーソルを合わせ、コンセプトリアクターに割り当てたキーを入力するとプラクティスメニューが開きます。
+「DIVE 2 M.R.S.」にカーソルを合わせ、コンセプトリアクターを入力しながら決定するとプラクティスメニューが開きます。
 
 ## ビルド（Windows）
 
