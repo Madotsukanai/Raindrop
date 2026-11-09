@@ -10,14 +10,15 @@
 
 [公式サイト](https://www.rebrank.org/download.htm)からアップデートパッチをダウンロードしてゲームに適用し、[Releases](https://github.com/Madotsukanai/Raindrop/releases/latest)から`ddraw.dll`をダウンロードしてから`Rain.exe` (SHA-256: `ae35b0ad17094bd21f86bc464504ceeafc50941e5207d75a3065e44049138211`)と同じディレクトリにコピーしてゲームを起動してください。
 
-グラフィックスAPIは、`Rain.exe`と同じディレクトリに置く`raindrop.ini`で選択できます。Wine/Protonではデフォルトの`DirectDraw`のままにすることを推奨します。
+グラフィックスAPIは、`Rain.exe`と同じディレクトリに置く`raindrop.ini`で選択できます。
 
 ```ini
 [Graphics]
 API=DirectDraw
 ```
 
-`API=DirectDraw`はシステムのDirectDrawを使用します。利用できない場合はD3D9へフォールバックします。`API=D3D9`にすると、起動時から内蔵D3D9実装を使用します。ファイルまたは設定がない場合は`DirectDraw`を使用します。
+`API=DirectDraw`はシステムのDirectDrawを使用します。利用できない場合はD3D9へフォールバックします。`API=D3D9`にすると、起動時から内蔵D3D9実装を使用します。ファイルまたは設定がない場合は`DirectDraw`を使用します。<br>
+Wine/Protonではデフォルトの`DirectDraw`のままにすることを推奨します。
 
 ### RefRain
 
