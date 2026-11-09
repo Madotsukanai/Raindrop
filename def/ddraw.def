@@ -14,3 +14,19 @@ EXPORTS
     DllGetClassObject           = _DllGetClassObject@12
     DllRegisterServer           = _DllRegisterServer@0
     DllUnregisterServer         = _DllUnregisterServer@0
+
+    ; Private exports of the system DirectDraw DLL that d3d8.dll / d3d9.dll import.  Each one jumps to the
+    ; real system ddraw.dll function (see SMD_FWD_LIST in Smd_d3d9.c), so the argument list does not matter.
+    AcquireDDThreadLock         = _SmdFwdStub_AcquireDDThreadLock
+    ReleaseDDThreadLock         = _SmdFwdStub_ReleaseDDThreadLock
+    CompleteCreateSysmemSurface = _SmdFwdStub_CompleteCreateSysmemSurface
+    D3DParseUnknownCommand      = _SmdFwdStub_D3DParseUnknownCommand
+    DDGetAttachedSurfaceLcl     = _SmdFwdStub_DDGetAttachedSurfaceLcl
+    DDInternalLock              = _SmdFwdStub_DDInternalLock
+    DDInternalUnlock            = _SmdFwdStub_DDInternalUnlock
+    DSoundHelp                  = _SmdFwdStub_DSoundHelp
+    GetDDSurfaceLocal           = _SmdFwdStub_GetDDSurfaceLocal
+    GetOLEThunkData             = _SmdFwdStub_GetOLEThunkData
+    GetSurfaceFromDC            = _SmdFwdStub_GetSurfaceFromDC
+    RegisterSpecialCase         = _SmdFwdStub_RegisterSpecialCase
+    SetAppCompatData            = _SmdFwdStub_SetAppCompatData

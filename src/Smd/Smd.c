@@ -104,6 +104,16 @@ static void InitFallbackInstance(void) {
     Log("WindowFallback: this is the window mode fallback instance (parent pid=%lu)", (unsigned long)ppid);
 }
 
+static BOOL CALLBACK HideOwnWindowProc(HWND h, LPARAM lp) {
+    DWORD pid = 0;
+    (void)lp;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid == GetCurrentProcessId() && IsWindowVisible(h))
+        SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                                           SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    return TRUE;
+}
+
 void SmdTriggerWindowFallback(const char *why) {
     char exe[MAX_PATH], dir[MAX_PATH], pidbuf[32];
     char *cmd, *slash;
@@ -114,6 +124,9 @@ void SmdTriggerWindowFallback(const char *why) {
 
     if (!g_AutoWindowFallback || g_fallbackInstance) return;
     Log("WindowFallback: %s -> relaunching in window mode", why);
+    /* Hide this process's windows at once: starting the new process and shutting down can take a while and a
+       visible window that does not pump messages shows up as "not responding". */
+    EnumWindows(HideOwnWindowProc, 0);
     GetModuleFileNameA(NULL, exe, MAX_PATH);
     strcpy(dir, exe);
     slash = strrchr(dir, '\\');
@@ -135,6 +148,10 @@ void SmdTriggerWindowFallback(const char *why) {
         free(cmd);
         Log("WindowFallback: new process started (pid=%lu), exiting", (unsigned long)newPid);
         if (g_log) fflush(g_log);
+        /* TerminateProcess instead of ExitProcess: ExitProcess runs every DLL's detach code and waits for
+           other threads (audio, timing, controller threads) and DirectX cleanup, which can hang when one of
+           them holds a lock.  The new process only needs this one to be gone. */
+        TerminateProcess(GetCurrentProcess(), 0);
         ExitProcess(0);
     }
     Log("WindowFallback: CreateProcess failed (err=%08X)", (unsigned)GetLastError());
@@ -5157,6 +5174,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
         LogOpen();
+        /* No loader error dialogs ("entry point not found in the dynamic link library" etc.) for any DLL the game or
+           this proxy loads; a failed load is reported through the return value / the log instead. */
+        SetErrorMode(SetErrorMode(0) | SEM_FAILCRITICALERRORS);
         QueryPerformanceFrequency(&g_qpcFreq);
         Log("process attach (pid=%lu)", GetCurrentProcessId());
         LogWindowsVersion();

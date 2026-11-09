@@ -2075,12 +2075,38 @@ static int D7E_ConfigD3D9(void) {
     return useD3D9;
 }
 
+static void D7E_BindPrivateExports(HMODULE real);
+
+/* Private ddraw.dll exports that the system d3d9.dll / d3d8.dll import.  The proxy is loaded under the name
+   ddraw.dll, so such an import binds to it; when it was missing the loader reported "entry point
+   AcquireDDThreadLock not found" and failed to load d3d9.dll.  Each export is a jump through a pointer that is
+   bound to the real system ddraw.dll (D7E_BindPrivateExports), so any argument list passes through unchanged;
+   until it is bound (or when the real DLL lacks it) the pointer is a plain `ret`. */
+static void SmdFwdDefault(void) {}
+#define SMD_FWD_STUB(name) \
+    __attribute__((used)) static void *SmdFwdPtr_##name = (void*)SmdFwdDefault; \
+    __attribute__((naked)) void SmdFwdStub_##name(void) { __asm__ volatile("jmp *_SmdFwdPtr_" #name); }
+#define SMD_FWD_LIST(X) \
+    X(AcquireDDThreadLock) X(ReleaseDDThreadLock) X(CompleteCreateSysmemSurface) \
+    X(D3DParseUnknownCommand) X(DDGetAttachedSurfaceLcl) X(DDInternalLock) X(DDInternalUnlock) \
+    X(DSoundHelp) X(GetDDSurfaceLocal) X(GetOLEThunkData) X(GetSurfaceFromDC) X(RegisterSpecialCase) \
+    X(SetAppCompatData)
+SMD_FWD_LIST(SMD_FWD_STUB)
+
+static void D7E_BindPrivateExports(HMODULE real) {
+    int n = 0;
+#define SMD_FWD_BIND(name) { FARPROC p = GetProcAddress(real, #name); if (p) { SmdFwdPtr_##name = (void*)p; n++; } }
+    SMD_FWD_LIST(SMD_FWD_BIND)
+#undef SMD_FWD_BIND
+    SmdLog("Real ddraw: %d private export(s) bound", n);
+}
+
 static void D7E_SaveFallbackAPI(void) {
-    if (g_D7E_ConfigCreated) {
-        D7E_WriteConfigAPI("D3D9");
-        g_D7E_ConfigCreated = 0;
-        SmdLog("Saved D3D9 fallback to raindrop.ini");
-    }
+    /* Every fallback to the Direct3D9 emulation is written to raindrop.ini, not only when the file was just
+       created, so the next start goes straight to D3D9 instead of failing on DirectDraw again. */
+    D7E_WriteConfigAPI("D3D9");
+    g_D7E_ConfigCreated = 0;
+    SmdLog("Saved D3D9 fallback to raindrop.ini");
 }
 
 static HRESULT D7E_CreateDD7(void **out) {
@@ -2118,6 +2144,7 @@ static void LoadReal(void) {
         return;
     }
     SmdLog("Real ddraw: using %s", sys);
+    D7E_BindPrivateExports(g_real);
     p_DirectDrawCreate        = GetProcAddress(g_real, "DirectDrawCreate");
     p_DirectDrawCreateClipper = GetProcAddress(g_real, "DirectDrawCreateClipper");
     p_DirectDrawCreateEx      = GetProcAddress(g_real, "DirectDrawCreateEx");
