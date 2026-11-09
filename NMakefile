@@ -26,11 +26,11 @@ build\debug: build
 build\d3d9.dll: src\RefRain.c src\d3dx9_font_compat.h def\d3d9.def build
 	$(CLANG_CL) $(TARGET) $(CFLAGS) /LD src\RefRain.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\d3d9.def user32.lib winmm.lib
 
-build\ddraw.dll: src\Smd.c src\Smd_d3d9.c src\Smd_controller.c src\Smd_internal.h def\ddraw.def build
-	$(CLANG_CL) $(TARGET) $(CFLAGS) /LD src\Smd.c src\Smd_d3d9.c src\Smd_controller.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\ddraw.def /FORCE:MULTIPLE user32.lib gdi32.lib dxguid.lib
+build\ddraw.dll: src\Smd\Smd.c src\Smd\Smd_d3d9.c src\Smd\Smd_controller.c src\Smd\Smd_internal.h def\ddraw.def build
+	$(CLANG_CL) $(TARGET) $(CFLAGS) /LD src\Smd\Smd.c src\Smd\Smd_d3d9.c src\Smd\Smd_controller.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\ddraw.def /FORCE:MULTIPLE user32.lib gdi32.lib dxguid.lib
 
-build\debug\ddraw.dll: src\Smd.c src\Smd_d3d9.c src\Smd_controller.c src\Smd_internal.h def\ddraw.def build\debug
-	$(CLANG_CL) $(TARGET) $(CFLAGS) /DSMD_DEBUG_BUILD /LD src\Smd.c src\Smd_d3d9.c src\Smd_controller.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\ddraw.def /FORCE:MULTIPLE user32.lib gdi32.lib dxguid.lib
+build\debug\ddraw.dll: src\Smd\Smd.c src\Smd\Smd_d3d9.c src\Smd\Smd_controller.c src\Smd\Smd_internal.h def\ddraw.def build\debug
+	$(CLANG_CL) $(TARGET) $(CFLAGS) /DSMD_DEBUG_BUILD /LD src\Smd\Smd.c src\Smd\Smd_d3d9.c src\Smd\Smd_controller.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\ddraw.def /FORCE:MULTIPLE user32.lib gdi32.lib dxguid.lib
 
 clean:
 	@if exist build rmdir /S /Q build

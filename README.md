@@ -8,11 +8,9 @@
 
 ### 五月雨
 
-[Releases](https://github.com/Madotsukanai/Raindrop/releases/latest)から`ddraw.dll`をダウンロードし、`Rain.exe`と同じディレクトリにコピーしてゲームを起動してください。
+[公式サイト](https://www.rebrank.org/download.htm)からアップデートパッチをダウンロードしてゲームに適用し、[Releases](https://github.com/Madotsukanai/Raindrop/releases/latest)から`ddraw.dll`をダウンロードしてから`Rain.exe` (SHA-256: `ae35b0ad17094bd21f86bc464504ceeafc50941e5207d75a3065e44049138211`)と同じディレクトリにコピーしてゲームを起動してください。
 
-Rain.exeのSHA-256: `ae35b0ad17094bd21f86bc464504ceeafc50941e5207d75a3065e44049138211`
-
-グラフィックスAPIは、`Rain.exe`と同じディレクトリに置く`raindrop.ini`で選択できます。
+グラフィックスAPIは、`Rain.exe`と同じディレクトリに置く`raindrop.ini`で選択できます。Wine/Protonではデフォルトの`DirectDraw`のままにすることを推奨します。
 
 ```ini
 [Graphics]
@@ -23,9 +21,7 @@ API=DirectDraw
 
 ### RefRain
 
-[Releases](https://github.com/Madotsukanai/Raindrop/releases/latest)から`d3d9.dll`をダウンロードし、`RefRain.exe`と同じディレクトリにコピーしてゲームを起動してください。
-
-RefRain.exeのSHA-256: `db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78`
+[Releases](https://github.com/Madotsukanai/Raindrop/releases/latest)から`d3d9.dll`をダウンロードし、`RefRain.exe` (SHA-256: `db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78`)と同じディレクトリにコピーしてゲームを起動してください。
 
 「DIVE 2 M.R.S.」にカーソルを合わせ、コンセプトリアクターに割り当てたキーを入力するとプラクティスメニューが開きます。
 
@@ -58,9 +54,9 @@ nmake /f NMakefile smd-debug
 
 リザルト表示中にリトライするとスコアが引き継がれる、敵弾警告音など一部の効果音が鳴らない、リプレイメニューに見えない選択肢がある、といったゲーム内のバグを修正します。
 
-- 一部環境で発生するリプレイのずれを修正
+- Wine/Proton環境で発生するリプレイのずれを修正
 
-リプレイ中の弾や自機の座標を、24bit浮動小数点演算で処理します。
+リプレイ中の弾や自機の座標を、強制的に24bit浮動小数点演算で処理します。
 
 - ショートカットキー
   - **Dキー**：設定画面で押すと、設定をデフォルトに戻します。

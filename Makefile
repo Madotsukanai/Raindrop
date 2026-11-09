@@ -29,25 +29,25 @@ smd-debug: $(BUILD)/debug/ddraw.dll
 $(BUILD)/debug/ddraw.dll: $(BUILD)/Smd_debug.o $(BUILD)/Smd_d3d9_debug.o $(BUILD)/Smd_controller_debug.o | $(BUILD)/debug
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldxguid
 
-$(BUILD)/Smd_debug.o: src/Smd.c src/Smd_internal.h | $(BUILD)
+$(BUILD)/Smd_debug.o: src/Smd/Smd.c src/Smd/Smd_internal.h | $(BUILD)
 	$(CC) -c -o $@ $< $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS)
 
-$(BUILD)/Smd_d3d9_debug.o: src/Smd_d3d9.c src/Smd_internal.h | $(BUILD)
+$(BUILD)/Smd_d3d9_debug.o: src/Smd/Smd_d3d9.c src/Smd/Smd_internal.h | $(BUILD)
 	$(CC) -c -o $@ $< $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS)
 
-$(BUILD)/Smd_controller_debug.o: src/Smd_controller.c src/Smd_internal.h | $(BUILD)
+$(BUILD)/Smd_controller_debug.o: src/Smd/Smd_controller.c src/Smd/Smd_internal.h | $(BUILD)
 	$(CC) -c -o $@ $< $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS)
 
 $(BUILD)/ddraw.dll: $(BUILD)/Smd.o $(BUILD)/Smd_d3d9.o $(BUILD)/Smd_controller.o
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldxguid
 
-$(BUILD)/Smd.o: src/Smd.c src/Smd_internal.h | $(BUILD)
+$(BUILD)/Smd.o: src/Smd/Smd.c src/Smd/Smd_internal.h | $(BUILD)
 	$(CC) -c -o $@ $< $(SMD_CFLAGS) $(SMD_DEFS)
 
-$(BUILD)/Smd_d3d9.o: src/Smd_d3d9.c src/Smd_internal.h | $(BUILD)
+$(BUILD)/Smd_d3d9.o: src/Smd/Smd_d3d9.c src/Smd/Smd_internal.h | $(BUILD)
 	$(CC) -c -o $@ $< $(SMD_CFLAGS) $(SMD_DEFS)
 
-$(BUILD)/Smd_controller.o: src/Smd_controller.c src/Smd_internal.h | $(BUILD)
+$(BUILD)/Smd_controller.o: src/Smd/Smd_controller.c src/Smd/Smd_internal.h | $(BUILD)
 	$(CC) -c -o $@ $< $(SMD_CFLAGS) $(SMD_DEFS)
 
 $(BUILD):
