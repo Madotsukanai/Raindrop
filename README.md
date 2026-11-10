@@ -13,6 +13,8 @@
 グラフィックスAPIは、`Rain.exe`と同じディレクトリに置く`raindrop.ini`で選択できます。
 
 ```ini
+[General]
+PrEx=1
 [Graphics]
 API=DirectDraw
 ```

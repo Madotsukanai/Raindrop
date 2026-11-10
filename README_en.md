@@ -11,6 +11,8 @@ Download and apply the update patch from the [official site](https://www.rebrank
 Choose the graphics API in `raindrop.ini` in the same directory as `Rain.exe`:
 
 ```ini
+[General]
+PrEx=1
 [Graphics]
 API=DirectDraw
 ```
@@ -19,6 +21,8 @@ API=DirectDraw
 On Wine/Proton, keeping the default `DirectDraw` is recommended.
 
 ### RefRain
+
+Too broke to own the Steam version, so only the disc-version executable is supported.
 
 Download `d3d9.dll` from [Releases](https://github.com/Madotsukanai/Raindrop/releases/latest), copy it to the same directory as `RefRain.exe` (SHA-256: `db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78`), and start the game.
 
