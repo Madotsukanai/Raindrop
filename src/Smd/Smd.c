@@ -1437,7 +1437,7 @@ static void ApplyPracticePower(int stage, const char *what) {
     int p;
     if (stage == 1 && g_practiceBossActive && g_practiceBossStage == stage &&
         g_practiceBossTarget == 1) {
-        p = 5;
+        p = 3;
     } else if (stage == 1 && g_practiceBossActive && g_practiceBossStage == stage &&
                g_practiceBossTarget == 2) {
         p = 5;
