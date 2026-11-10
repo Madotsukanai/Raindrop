@@ -31,9 +31,8 @@ const int g_RetryDisplayMode = 1;
 #endif
 const int g_LowLatency = SMD_LOWLATENCY;
 const int g_UseDwmFlush = SMD_DWMFLUSH;
-static const int g_StatsIntervalMs = 5000;
 static const int g_KeyLatencyStats = 0;
-static const int g_WaitTimeoutMs = 50;
+static const int g_StatsIntervalMs = 5000;
 static const int g_ForceColorDepth32 = 1;
 static const int g_AutoWindowFallback = 1;
 static const int g_ForceWindowMode = 0;
@@ -73,6 +72,131 @@ void SmdLog(const char *fmt, ...) { (void)fmt; }
 
 void SmdLogOpen(void) { LogOpen(); }
 #define Log SmdLog
+
+/* [General] section of raindrop.ini.  PrEx controls the practice extensions (boss seek, the
+   rebuilt Practice menu behaviour, the EX practice flow); every other mod feature is unaffected. */
+static int g_PrEx = 1;
+
+/* finds the "[name]" section header case-insensitively; NULL when absent */
+static char *IniFindSection(char *buf, const char *name) {
+    size_t len = strlen(name);
+    char *p = buf;
+    while (p && (p = strchr(p, '[')) != NULL) {
+        if (_strnicmp(p + 1, name, len) == 0 && p[1 + len] == ']')
+            return p;
+        p++;
+    }
+    return NULL;
+}
+
+/* when the ini exists but has no [General] section yet, rewrite it with
+   "[General]\r\nPrEx=1\r\n\r\n" placed in front of [Graphics] (or at the very top), so the
+   sections read in [General] -> [Graphics] order */
+static void IniAddGeneralSection(const char *path) {
+    static const char prefix[] = "[General]\r\nPrEx=1\r\n\r\n";
+    size_t plen = sizeof(prefix) - 1;
+    FILE *f = fopen(path, "rb");
+    long fsize;
+    char *buf;
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    buf = (char*)malloc((size_t)fsize + 4);
+    if (!buf) { fclose(f); return; }
+    if (fread(buf, 1, (size_t)fsize, f) != (size_t)fsize) { free(buf); fclose(f); return; }
+    buf[fsize] = 0;
+    fclose(f);
+    if (!IniFindSection(buf, "general")) {
+        char *g = IniFindSection(buf, "graphics");
+        size_t gAt = g ? (size_t)(g - buf) : 0;
+        size_t nl = (g && gAt > 0 && buf[gAt - 1] != '\n') ? 2 : 0;  /* prepend CRLF when the
+                                                                       [Graphics] line is not
+                                                                       preceded by one */
+        char *out = (char*)malloc(gAt + plen + nl + (size_t)fsize - gAt + 1);
+        if (out) {
+            size_t at = 0;
+            if (g) {
+                memcpy(out, buf, gAt);
+                at = gAt;
+                if (nl) { memcpy(out + at, "\r\n", 2); at += 2; }
+            }
+            memcpy(out + at, prefix, plen);
+            at += plen;
+            if (g) {
+                memcpy(out + at, buf + gAt, (size_t)fsize - gAt);
+                at += (size_t)fsize - gAt;
+            } else {
+                memcpy(out + at, buf, (size_t)fsize);
+                at += (size_t)fsize;
+            }
+            out[at] = 0;
+            f = fopen(path, "wb");
+            if (f) {
+                fwrite(out, 1, at, f);
+                fclose(f);
+                Log("General: added the [General] section at the top of raindrop.ini");
+            }
+            free(out);
+        }
+    }
+    free(buf);
+}
+
+/* appends "[Graphics]\\r\\nAPI=DirectDraw\\r\\n" to the end when the ini exists without a
+   [Graphics] section (DirectDraw is the same default the API selector uses unconfigured) */
+static void IniAddGraphicsSection(const char *path) {
+    static const char block[] = "\r\n[Graphics]\r\nAPI=DirectDraw\r\n";
+    FILE *f = fopen(path, "rb");
+    long fsize;
+    char *buf;
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    buf = (char*)malloc((size_t)fsize + 4);
+    if (!buf) { fclose(f); return; }
+    if (fread(buf, 1, (size_t)fsize, f) != (size_t)fsize) { free(buf); fclose(f); return; }
+    buf[fsize] = 0;
+    fclose(f);
+    if (!IniFindSection(buf, "graphics")) {
+        size_t skip = ((fsize > 0) && buf[fsize - 1] == '\n') ? 2 : 0;  /* block starts with CRLF */
+        f = fopen(path, "ab");
+        if (f) {
+            fwrite(block + skip, 1, sizeof(block) - 1 - skip, f);
+            fclose(f);
+            Log("Graphics: added the missing [Graphics] section (API=DirectDraw)");
+        }
+    }
+    free(buf);
+}
+
+static void LoadGeneralConfig(void) {
+    char path[MAX_PATH];
+    char value[32];
+    ExeDirFile("raindrop.ini", path);
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+        HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
+                                  FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file != INVALID_HANDLE_VALUE) {
+            static const char defaults[] = "[General]\r\nPrEx=1\r\n\r\n[Graphics]\r\nAPI=DirectDraw\r\n";
+            DWORD written;
+            WriteFile(file, defaults, (DWORD)(sizeof(defaults) - 1), &written, NULL);
+            CloseHandle(file);
+            Log("Created raindrop.ini with default General/Graphics sections");
+        }
+    } else {
+        IniAddGeneralSection(path);
+        IniAddGraphicsSection(path);
+        if ((int)GetPrivateProfileIntA("General", "PrEx", -1, path) < 0) {
+            WritePrivateProfileStringA("General", "PrEx", "1", path);
+            Log("General: added the missing PrEx entry (PrEx=1)");
+        }
+    }
+    GetPrivateProfileStringA("General", "PrEx", "1", value, sizeof(value), path);
+    g_PrEx = _stricmp(value, "1") == 0 || _stricmp(value, "on") == 0 || _stricmp(value, "true") == 0;
+    Log("General: practice extensions %s (PrEx=%s from raindrop.ini)", g_PrEx ? "enabled" : "disabled", value);
+}
 
 static void LogWindowsVersion(void) {
     typedef LONG (WINAPI *PF_RtlGetVersion)(OSVERSIONINFOW*);
@@ -342,44 +466,59 @@ static void FlushStats(LONGLONG now) {
     g_presses = 0;
 }
 
+/* Press->present latency tracking shared by both present paths (real ddraw Blt/Flip and the
+   D3D7 emu Present): every observed key press is timestamped by KeyThread, and each frame
+   present consumes the pending presses.  latFirst = press -> the first present after the press
+   (assuming the press was captured by that frame's input read), latGuar = press -> the first
+   present started at least one full boundary after the press (press is guaranteed to be in
+   that frame's input sample). */
+static void PressShared(LONGLONG d) {
+    EnterCriticalSection(&g_cs);
+    {
+        LONGLONG frameStart = g_prevDone;
+        int done, i;
+        for (i = 0; i < g_pendN; i++) {
+            Press *p = &g_pend[i];
+            if (!p->counted && d > p->t) {
+                StatAdd(&g_stLatFirst, TicksToMs(d - p->t));
+                p->counted = 1;
+            }
+            done = (TicksToMs(d - p->t) > 1000.0);
+            if (frameStart && frameStart >= p->t) {
+                StatAdd(&g_stLatGuar, TicksToMs(d - p->t));
+                done = 1;
+            }
+            if (done) {
+                g_pend[i] = g_pend[g_pendN - 1];
+                g_pendN--;
+                i--;
+            }
+        }
+        if (frameStart)
+            StatAdd(&g_stInterval, TicksToMs(d - frameStart));
+        g_frames++;
+        g_prevDone = d;
+        if (!g_winStart) {
+            g_winStart = d;
+        } else if (TicksToMs(d - g_winStart) >= (double)g_StatsIntervalMs) {
+            FlushStats(d);
+            g_winStart = d;
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+}
+
 static void OnPresent(LONGLONG a, LONGLONG b, LONGLONG c, LONGLONG d, int flip, int timedOut) {
     EnterCriticalSection(&g_cs);
-    LONGLONG frameStart = g_prevDone;
-    if (frameStart) {
-        StatAdd(&g_stInterval, TicksToMs(d - frameStart));
-        StatAdd(&g_stGame, TicksToMs(a - frameStart));
-    }
+    if (g_prevDone)
+        StatAdd(&g_stGame, TicksToMs(a - g_prevDone));
     StatAdd(&g_stOrig, TicksToMs(b - a));
     StatAdd(&g_stWait, TicksToMs(c - b));
     StatAdd(&g_stDwm, TicksToMs(d - c));
-    g_frames++;
-    if (timedOut) g_timeouts++;
     g_lastFlip = flip;
-    for (int i = 0; i < g_pendN; i++) {
-        Press *p = &g_pend[i];
-        if (!p->counted && d > p->t) {
-            StatAdd(&g_stLatFirst, TicksToMs(d - p->t));
-            p->counted = 1;
-        }
-        int done = (TicksToMs(d - p->t) > 1000.0);
-        if (frameStart && frameStart >= p->t) {
-            StatAdd(&g_stLatGuar, TicksToMs(d - p->t));
-            done = 1;
-        }
-        if (done) {
-            g_pend[i] = g_pend[g_pendN - 1];
-            g_pendN--;
-            i--;
-        }
-    }
-    if (!g_winStart) {
-        g_winStart = d;
-    } else if (TicksToMs(d - g_winStart) >= (double)g_StatsIntervalMs) {
-        FlushStats(d);
-        g_winStart = d;
-    }
-    g_prevDone = d;
+    if (timedOut) g_timeouts++;
     LeaveCriticalSection(&g_cs);
+    PressShared(d);
 }
 
 static int SmdIsWine(void) {
@@ -392,25 +531,30 @@ static int SmdIsWine(void) {
 }
 
 static void FinishPresent(IDirectDrawSurface7 *s, int flip, LARGE_INTEGER a, LARGE_INTEGER b) {
-    LARGE_INTEGER c, d, t;
-    int timedOut = 0;
-    if (g_LowLatency) {
-        LONGLONG limit = g_qpcFreq.QuadPart * g_WaitTimeoutMs / 1000;
-        for (;;) {
-            HRESULT hr = flip ? IDirectDrawSurface7_GetFlipStatus(s, DDGFS_ISFLIPDONE)
-                              : IDirectDrawSurface7_GetBltStatus(s, DDGBS_ISBLTDONE);
-            if (hr != DDERR_WASSTILLDRAWING) break;
-            QueryPerformanceCounter(&t);
-            if (t.QuadPart - b.QuadPart > limit) {
-                timedOut = 1;
-                break;
-            }
-        }
-    }
+    LARGE_INTEGER c, d;
+    (void)s; (void)flip;
     QueryPerformanceCounter(&c);
-    if (g_LowLatency && !flip && g_UseDwmFlush && g_pDwmFlush && !SmdIsWine()) g_pDwmFlush();
     QueryPerformanceCounter(&d);
-    OnPresent(a.QuadPart, b.QuadPart, c.QuadPart, d.QuadPart, flip, timedOut);
+    OnPresent(a.QuadPart, b.QuadPart, c.QuadPart, d.QuadPart, flip, 0);
+}
+
+/* Key latency measurement: debug builds always observe presses (release builds require
+   SMD_KEYLAT=1).  Every observed key press is timestamped, and the stats line reports
+   press->present latency continuously. */
+#ifdef SMD_DEBUG_BUILD
+#define SMD_KEYLAT_AUTORUN 1
+#else
+#define SMD_KEYLAT_AUTORUN 0
+#endif
+static int KeyLatRequested(void) {
+    static int v = -1;
+    if (v < 0) {
+        char b[16];
+        DWORD n = GetEnvironmentVariableA("SMD_KEYLAT", b, sizeof(b));
+        if (!n) v = 0;
+        else v = !(n == 1 && b[0] == '0');
+    }
+    return v;
 }
 
 static void MeasureInit(void) {
@@ -426,7 +570,7 @@ static void MeasureInit(void) {
         PF_TBP2 tbp = mm ? (PF_TBP2)(void*)GetProcAddress(mm, "timeBeginPeriod") : NULL;
         if (tbp) tbp(1);
     }
-    if (g_KeyLatencyStats) {
+    if (g_KeyLatencyStats || SMD_KEYLAT_AUTORUN || KeyLatRequested()) {
         th = CreateThread(NULL, 0, KeyThread, NULL, 0, NULL);
         if (th) CloseHandle(th);
     }
@@ -434,6 +578,16 @@ static void MeasureInit(void) {
     Log("Measure: lowlatency=%d dwmflush=%d dwmapi=%s keythread=%s interval=%dms",
         g_LowLatency, g_UseDwmFlush, g_pDwmFlush ? "ok" : "none",
         th ? "ok" : (g_KeyLatencyStats ? "failed" : "off"), g_StatsIntervalMs);
+}
+
+void SmdKeyLatInit(void) {
+    if (!g_measureReady) MeasureInit();
+}
+
+void SmdKeyLatNote(long long presentDone) {
+    if (!presentDone) return;
+    if (!g_measureReady) MeasureInit();
+    if (g_measureReady) PressShared((LONGLONG)presentDone);
 }
 
 static void BatchFlush(void);
@@ -518,56 +672,9 @@ static void SmdWineStretchPrimary(IDirectDrawSurface7 *self, LPDIRECTDRAWSURFACE
     }
 }
 
-/* DirectDraw present pacing (real ddraw path): aligns frame presents to 16.667 ms boundaries to smooth
-   60 fps jitter.  Skips when present/vsync is already the bottleneck. */
-static LARGE_INTEGER g_ddLastPresent;
-static double g_ddCostEwmaMs;
-static int g_ddPaceTimerInit;
-static HANDLE g_ddPaceTimer;
-static int g_ddPaceHiRes;
-static const double SMD_PACE_INTERVAL_MS = 16.666667;
-
-static void DDPaceWait(void) {
-    LARGE_INTEGER now;
-    double rem, margin, wait;
-    if (!g_qpcFreq.QuadPart || !g_ddLastPresent.QuadPart) return;
-    if (g_ddCostEwmaMs > 4.0) return;
-    QueryPerformanceCounter(&now);
-    rem = SMD_PACE_INTERVAL_MS -
-        (double)(now.QuadPart - g_ddLastPresent.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
-    if (rem <= 0.3 || rem > 4.0) return;
-    if (!g_ddPaceTimerInit) {
-        typedef HANDLE (WINAPI *PF_CWTExW)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
-        HMODULE k = GetModuleHandleA("kernel32.dll");
-        PF_CWTExW cw = k ? (PF_CWTExW)(void*)GetProcAddress(k, "CreateWaitableTimerExW") : NULL;
-        g_ddPaceTimerInit = 1;
-        if (cw && !SmdIsWine()) {
-            g_ddPaceTimer = cw(NULL, NULL, 2, TIMER_ALL_ACCESS);
-            if (g_ddPaceTimer) g_ddPaceHiRes = 1;
-        }
-    }
-    margin = g_ddPaceHiRes ? 0.4 : 2.0;
-    wait = rem - margin;
-    if (g_ddPaceHiRes && g_ddPaceTimer && wait > 0.1) {
-        LARGE_INTEGER lt;
-        lt.QuadPart = -(LONGLONG)(wait * 10000.0);
-        if (SetWaitableTimer(g_ddPaceTimer, &lt, 0, NULL, NULL, FALSE))
-            MsgWaitForMultipleObjects(1, &g_ddPaceTimer, FALSE, INFINITE, QS_ALLINPUT);
-    } else if (wait > 1.0) {
-        MsgWaitForMultipleObjects(0, NULL, FALSE, (DWORD)wait, QS_ALLINPUT);
-    }
-    for (;;) {
-        LARGE_INTEGER cur;
-        QueryPerformanceCounter(&cur);
-        if ((double)(cur.QuadPart - g_ddLastPresent.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart
-            >= SMD_PACE_INTERVAL_MS - 0.05) break;
-    }
-}
-
-static void DDPaceUpdate(LARGE_INTEGER t1, double cost) {
-    g_ddLastPresent = t1;
-    g_ddCostEwmaMs = g_ddCostEwmaMs ? g_ddCostEwmaMs * 0.85 + cost * 0.15 : cost;
-}
+/* Real-ddraw present pacing was removed for minimum input latency: the previous pre-present
+   alignment wait (up to ~4 ms) delayed every present, so with a tick-aligned game loop the
+   blit/flip is submitted as soon as the frame is ready. */
 
 static HRESULT STDMETHODCALLTYPE Hook_Blt(IDirectDrawSurface7 *self, LPRECT dr, LPDIRECTDRAWSURFACE7 src,
                                           LPRECT sr, DWORD flags, LPDDBLTFX fx) {
@@ -591,30 +698,24 @@ static HRESULT STDMETHODCALLTYPE Hook_Blt(IDirectDrawSurface7 *self, LPRECT dr, 
            Run in a window (WndMode) + gamescope for stable fullscreen scaling. */
         useDr = dr; useSr = sr;
     }
-    /* Hook_Blt: pace before primary-present blits */
+    /* Hook_Blt: primary-present blits are measured, never paced */
     int isPresent = (self == g_primary && src);
-    if (isPresent) DDPaceWait();
     QueryPerformanceCounter(&a);
     HRESULT hr = g_origBlt(self, useDr, src, useSr, flags, fx);
     QueryPerformanceCounter(&b);
-    if (hr >= 0 && isPresent && g_measureReady) {
-        DDPaceUpdate(b, TicksToMs(b.QuadPart - a.QuadPart));
+    if (hr >= 0 && isPresent && g_measureReady)
         FinishPresent(self, 0, a, b);
-    }
     return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_Flip(IDirectDrawSurface7 *self, LPDIRECTDRAWSURFACE7 target, DWORD flags) {
     LARGE_INTEGER a, b;
     BatchFlush();
-    if (self == g_primary) DDPaceWait();
     QueryPerformanceCounter(&a);
     HRESULT hr = g_origFlip(self, target, flags);
     QueryPerformanceCounter(&b);
-    if (hr >= 0 && self == g_primary && g_measureReady) {
-        DDPaceUpdate(b, TicksToMs(b.QuadPart - a.QuadPart));
+    if (hr >= 0 && self == g_primary && g_measureReady)
         FinishPresent(self, 1, a, b);
-    }
     return hr;
 }
 
@@ -1532,10 +1633,20 @@ static void ExOnRetry(int stage) {
 }
 
 static int g_practiceReturn = 0;   /* the last game start was a practice run: the title opens the Practice menu */
+static int g_lastPracticeCursor = -2; /* Practice menu item of the last started run (-2 = none);
+   restored to the menu cursor on return so the selector lands where the player just played */
 
 static void __stdcall GameStartHook(int stage) {
     int practiceStart = g_practiceScorePending && stage == g_practiceScoreStage;
     g_practiceReturn = (*(volatile unsigned char*)(uintptr_t)0x4dade0 != 0);
+    {
+        /* the Practice menu passes [gamestate+0x10] = cursor+1 into the run (menu obj 0x420cc1) */
+        unsigned *gs = (unsigned*)(uintptr_t)0x4e93c8;
+        unsigned cursorPlus1 = gs ? *gs ? *(unsigned*)(*gs + 0x10) : 0 : 0;
+        if (cursorPlus1 >= 1 && cursorPlus1 <= 0x40)
+            g_lastPracticeCursor = (int)cursorPlus1 - 1;
+        Log("ReturnToPractice: run start cursor=%d (+1=%u)", g_lastPracticeCursor, cursorPlus1);
+    }
     g_practiceBgmSeekPending = 0;
     g_practiceBgmFadeInFrames = 0;
     g_practiceBgmStartedDuringSeek = 0;
@@ -1817,6 +1928,10 @@ static void PatchReplayLoadCapture(void) {
 static void PatchPracticePower(void) {
     int n = 0;
 
+    if (!g_PrEx) {
+        Log("General: practice extensions disabled (PrEx=off), PracticePower skipped");
+        return;
+    }
     if (g_PracticeStage2Power < 0 && g_PracticeStage3Power < 0) return;
     if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
         Log("PracticePower: unexpected image base, skipped");
@@ -3183,11 +3298,16 @@ static unsigned char __attribute__((fastcall)) ExReturnPracticeTitleUpdate(void 
         if (title && !IsBadReadPtr(title, 0x23300)) {
             g_exReturnPracticeMenuPending = 0;
             if (*(volatile int*)(uintptr_t)0x46bc10 != 0) {
-                ((void (__attribute__((thiscall)) *)(void*))(uintptr_t)0x420b40)(title + 0x22e90);
+                {   /* set the selection cursor before any menu update runs (menu+8) */
+                    char *menu = title + 0x22e90;
+                    ((void (__attribute__((thiscall)) *)(void*))(uintptr_t)0x420b40)(menu);
+                    if (g_lastPracticeCursor >= 0)
+                        *(unsigned char*)(menu + 8) = (unsigned char)g_lastPracticeCursor;
+                }
                 *(int*)(title + 0x2324c) = 2;
                 *(int*)(title + 0xc) = 0;
                 *(int*)(title + 8) = 0xc;
-                Log("ExArea: opened the Practice menu after the title update");
+                Log("ExArea: opened the Practice menu after the title update (cursor %d)", g_lastPracticeCursor);
             } else {
                 Log("ExArea: Practice is not unlocked, staying in the main menu");
             }
@@ -3247,6 +3367,11 @@ static int PracticeMenuOpen(char *t, const char *why) {
         return 0;
     }
     *(int*)(t + 0x2324c) = 2;
+    if (g_lastPracticeCursor >= 0) {
+        /* menu+8 is the selection cursor (0x420c80 clears, 0x420d55/0x420d88 maintain it) */
+        *(unsigned char*)(menu + 8) = (unsigned char)g_lastPracticeCursor;
+        Log("ReturnToPractice: cursor restored to item %d", g_lastPracticeCursor);
+    }
     *(int*)(t + 0xc) = 0;
     *(int*)(t + 8) = 0xc;
     g_practiceMenuWatch = 1;
@@ -4001,6 +4126,10 @@ static int __cdecl ExVmSpawnHook(void *a, void *b);
 static void PatchExAreaSelect(void) {
     int n = 0;
 
+    if (!g_PrEx) {
+        Log("General: practice extensions disabled (PrEx=off), ExArea/PracticeBoss skipped");
+        return;
+    }
     if (!g_ExAreaSelect) return;
     if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
         Log("ExArea: unexpected image base, skipped");
@@ -5181,6 +5310,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         Log("process attach (pid=%lu)", GetCurrentProcessId());
         LogWindowsVersion();
         InitFallbackInstance();
+        LoadGeneralConfig();
         PatchColorDepth32();
         PatchForceWindowMode();
         PatchTitleCancel();

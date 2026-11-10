@@ -860,6 +860,7 @@ static void D7_Present(void) {
     QueryPerformanceCounter(&t1);
     cost = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)g_paceFreq.QuadPart;
     D7PaceUpdate(t1, cost);
+    SmdKeyLatNote(t1.QuadPart);   /* press->present latency measurement feeds each D3D9 present */
     SmdLog("D7Present: hr=%08X elapsed=%.2f ms", (unsigned)hr, cost);
     if (hr == D3DERR_DEVICELOST || hr == D3DERR_DEVICENOTRESET) {
         hr = IDirect3DDevice9_TestCooperativeLevel(g_d7.dev);
@@ -2114,6 +2115,7 @@ static HRESULT D7E_CreateDD7(void **out) {
     g_d7.active = 1;
     g_d7DD.ref++;
     *out = &g_d7DD;
+    SmdKeyLatInit();   /* run the key-latency observer thread when SMD_KEYLAT is set */
     SmdLog("D3D7 emu: using the built-in DirectDraw7/Direct3D7 -> Direct3D9 layer");
     return DD_OK;
 }

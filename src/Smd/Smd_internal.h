@@ -14,6 +14,9 @@ void SmdControllerInit(void);
 void SmdControllerPoll(void);
 int SmdControllerIsConnected(unsigned id);
 
+void SmdKeyLatInit(void);
+void SmdKeyLatNote(long long presentDone);
+
 extern const int g_LogAll;
 extern const int g_StripAllowModeX;
 extern const int g_RetryCoopLevel;
