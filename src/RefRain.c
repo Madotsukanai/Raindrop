@@ -6,7 +6,7 @@
 
 /* ---------------------------------------------------------------------------
  * Game version / address table.
- * The mod supports the disk build and the Steam build of RefRain 1.03.7.
+ * The mod supports the disc build and the Steam build of RefRain 1.03.7.
  * Every address below is stored as the preferred (0x400000-based) VA for that
  * build; at load time DetectVersion() picks the table, then rebases every
  * entry by the actual image base delta (both exes are DYNAMIC_BASE, so the
@@ -39,12 +39,13 @@ typedef struct {
     DWORD EndSceneSite, EndSceneRet;
     DWORD PreTickSite, PreTickRet;
     DWORD SetMefaSite, SetCrSite, SetLivesSite, SetDiffSite;
-    DWORD DispatchEpilogue;      /* steam: shared case epilogue; disk: 0 (inline epilogue) */
+    DWORD DispatchEpilogue;      /* steam: shared case epilogue; disc: 0 (inline epilogue) */
     DWORD RefRainCfgSite, RefRainCfgRet;
     DWORD GameInfoRefRainSite;
     DWORD SaveReplayHdrSite, SaveReplayHdrRet;
     DWORD FreadWrapSite, FwriteWrapSite;
     DWORD Getter19Fn, Getter19Entry;
+    DWORD ViewIdxWriteSite;    /* mov [viewIdx], eax in the scene/view setter */
 } GameAddrs;
 
 typedef struct {
@@ -60,7 +61,7 @@ typedef struct {
     BYTE SaveReplayHdr[5];
 } VersionSigs;
 
-static const GameAddrs ADDRS_DISK = {
+static const GameAddrs ADDRS_DISC = {
     /* Scene, SceneNext, ScenePend, Script */
     0x005c073c, 0x005c0740, 0x005c0744, 0x005c0760,
     /* GameMode, ReplaySlot, GameModeNext, Var4d2370 */
@@ -104,7 +105,8 @@ static const GameAddrs ADDRS_DISK = {
     0x0043078e,
     0x00431d24, 0x00431d29,
     0x0046f33b, 0x0047038a,
-    0x00462c49, 0x00462dfc
+    0x00462c49, 0x00462dfc,
+    0x00441292
 };
 
 static const GameAddrs ADDRS_STEAM = {
@@ -135,10 +137,11 @@ static const GameAddrs ADDRS_STEAM = {
     0x0043078e,
     0x00431d24, 0x00431d29,
     0x00471a5b, 0x00472aaa,
-    0x004638d9, 0x00463a8c
+    0x004638d9, 0x00463a8c,
+    0x004412cc
 };
 
-static const VersionSigs SIGS_DISK = {
+static const VersionSigs SIGS_DISC = {
     { 0xA1, 0x3C, 0x07, 0x5C, 0x00 },                                   /* Trans: mov eax,[scene] */
     { 0x32, 0xC9, 0xC7, 0x05, 0xDC, 0xC4, 0x5A },                       /* LoadStart */
     { 0x8B, 0x15, 0x40, 0x07, 0x5C, 0x00 },                             /* SceneCheck */
@@ -167,7 +170,7 @@ static const VersionSigs SIGS_STEAM = {
 static DWORD  g_BaseDelta = 0;      /* actual image base - 0x400000 */
 static volatile int g_IsSteam = 0;
 static GameAddrs g_Addrs;           /* runtime copy, rebased */
-static const GameAddrs *g_A = &ADDRS_DISK;
+static const GameAddrs *g_A = &ADDRS_DISC;
 static VersionSigs g_Sigs;
 
 /* Accessors for game variables (g_A entries already carry the image delta). */
@@ -179,7 +182,7 @@ static VersionSigs g_Sigs;
  * register setup happens inside the asm block, after pushal-style saves). */
 static volatile DWORD g_A_SceneNext;
 static volatile DWORD g_A_LoadFlag;
-static volatile DWORD g_A_Mefa, g_A_Cr, g_A_Lives, g_A_Diff;
+static volatile DWORD g_A_Mefa, g_A_Cr, g_A_Lives, g_A_Diff, g_A_ViewIdx;
 static volatile DWORD g_A_GpuQueue;
 static volatile DWORD g_DispatchEpilogue;
 static volatile DWORD g_SaveGlobalRetAddr;
@@ -198,6 +201,10 @@ static volatile int g_PracticeStage = 0;
 static volatile int g_AutoAdvanceToDifficulty = 0;
 static volatile int g_AutoNavPhase = 0;
 static volatile int g_AutoNavTimer = 0;
+/* Where the simulated title navigation should stop:
+   0 = reopen the Practice (stage select) menu - used when the menu is cancelled,
+   1 = leave the player on the character's desktop - used by the pause-menu Q hotkey. */
+static volatile int g_AutoNavTarget = 0;
 #define SIMKEY_NONE   0
 #define SIMKEY_DECIDE 1
 #define SIMKEY_CANCEL 2
@@ -404,9 +411,27 @@ typedef struct {
 
 #define MENU_ITEM_COUNT 5
 
+/* visitCentral[%d] (1-based, %d = stage 1..5) lives in the global data struct. Its per-build
+   base VAs (index 1) are 0x5ac4e0 (disc) / 0x5b05b0 (steam); rebased by g_BaseDelta at runtime.
+   A non-zero value means the player has reached that Central in normal play. */
+static inline int IsStageReached(int stage) {
+    if (stage <= 1) return 1;
+    if (stage > MENU_ITEM_COUNT) return 0;
+    static const DWORD visitBase[2] = { 0x005ac4e0, 0x005b05b0 };  /* [0]=disc, [1]=steam */
+    DWORD *p = (DWORD*)((uintptr_t)(visitBase[g_IsSteam ? 1 : 0] + g_BaseDelta) + (DWORD)(stage - 1) * 4);
+    if (IsBadReadPtr(p, 4)) return 0;
+    return *p != 0;
+}
+
+/* Number of practice-menu stages selectable now: limited by difficulty (Easy = 1..4) and by
+   normal-play progress (a stage is hidden until reached, so stage N is selectable only when
+   visitCentral[N] is set). */
 static inline int GetSelectableStageCount(void) {
     DWORD diff = VD(Diff);
-    return (diff == 1) ? 4 : MENU_ITEM_COUNT;
+    int cap = (diff == 1) ? 4 : MENU_ITEM_COUNT;
+    int n = 1;  /* Central 01 is always available */
+    while (n < cap && IsStageReached(n + 1)) n++;
+    return n;
 }
 
 static const MenuItem g_MenuItems[MENU_ITEM_COUNT] = {
@@ -563,6 +588,10 @@ typedef unsigned char (__attribute__((thiscall)) *PFN_IsKey)(void *this, int key
 static PFN_IsKey orig_IsKeyPressed = NULL;
 static PFN_IsKey orig_IsKeyTriggered = NULL;
 static volatile int g_PauseMenuOpen = 0;
+/* Tick of the last game-native "pause opened" signal (ESC trigger seen by IsKeyTriggered, or an
+   ESC edge). Q/R act while the flag is open or within this grace window, so a heuristic glitch
+   can never silence the hotkeys right after the menu opens. */
+static volatile DWORD g_LastPauseOpenTick = 0;
 static void PauseDiagKey(int key);
 
 static inline int MatchSimulatedKey(int action, int key) {
@@ -839,6 +868,57 @@ static volatile DWORD g_LatFrameCount = 0;
 typedef BOOL (WINAPI *PFN_GetKeyboardState_t)(PBYTE);
 static PFN_GetKeyboardState_t orig_GetKeyboardState = NULL;
 
+/* "Is the game actually paused?" The frame counter does NOT freeze while the pause menu is up
+   (both builds keep advancing FrameCnt/Frame2 during pause - verified by PauseDiag freeze/resume
+   diffs and the hotkey logs), so this verdict is almost always 0. It stays as a harmless backup
+   signal; the reliable pause detection is the game's own ESC trigger, see Hook_IsKeyTriggered. */
+static int GameLooksPaused(void) {
+    static DWORD lastFrame = 0;
+    static DWORD lastScene = 0xFFFFFFFF;
+    static DWORD lastChange = 0;
+    static int primed = 0;
+    static DWORD lastThrottle = 0xFFFFFFFF;
+    static int framePaused = 0;
+    DWORD fr = VD(FrameCnt);
+    DWORD th = VD(Frame2);
+    DWORD sc = VD(Scene);
+    DWORD now = GetTickCount();
+    if (!primed || sc != lastScene) {
+        /* New scene: the counter is meaningless until the game has actually ticked once
+           (it is 0 during the stage intro and after a practice retry). */
+        primed = 1;
+        lastScene = sc;
+        lastFrame = fr;
+        lastThrottle = th;
+        lastChange = now;
+        framePaused = 0;
+        return 0;
+    }
+    if (fr != lastFrame) {
+        lastFrame = fr;
+        lastChange = now;
+        /* An opening/closing animation ticks the frame counter for a moment even though the
+           throttle keeps running; hold the old verdict briefly instead of flip-flopping. */
+        if (!framePaused) return 0;
+        if (now - lastChange < 300) return framePaused;
+        framePaused = 0;
+        return 0;
+    }
+    if (th != lastThrottle) {
+        /* The throttle only advances while the game runs, never while a pause is open
+           (PauseDiag freeze/resume diffs show it parked during pause). */
+        lastThrottle = th;
+        lastChange = now;
+        framePaused = 0;
+        return 0;
+    }
+    if (!framePaused && (now - lastChange) >= 120) {
+        framePaused = 1;
+        return 1;
+    }
+    return framePaused;
+}
+
 static BOOL WINAPI Mine_GetKeyboardState(PBYTE p) {
     BOOL r = orig_GetKeyboardState(p);
     if (r && p) {
@@ -851,39 +931,66 @@ static BOOL WINAPI Mine_GetKeyboardState(PBYTE p) {
         int rDown = (GetAsyncKeyState('R') & 0x8000) != 0;
         int escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
 
+        int paused = GameLooksPaused();
+        DWORD now = GetTickCount();
+        /* Q/R act while the pause flag is set or within the grace window after the last
+           game-native "pause opened" signal. */
+        int hotkeyArmed = g_PauseMenuOpen ||
+                          (g_LastPauseOpenTick != 0 && now - g_LastPauseOpenTick < 10000);
         if (inStage) {
             if (escDown && !escWasDown) {
-                g_PauseMenuOpen = !g_PauseMenuOpen;
-                LogMessage("Pause menu state: %s (ESC)", g_PauseMenuOpen ? "open" : "closed");
+                /* The game does not close the pause menu on ESC (the stage script polls ESC via
+                   IsKeyTriggered only while unpaused - pressing ESC with the menu open is a
+                   no-op for the game), so an ESC edge always means "the menu just opened". */
+                g_PauseMenuOpen = 1;
+                g_LastPauseOpenTick = now;
+                LogMessage("Pause menu state: open (ESC edge, scene %lu)", scene);
             }
-            if (g_PauseMenuOpen) {
+            if (paused) {
+                g_PauseMenuOpen = 1;
+                g_LastPauseOpenTick = now;
+            }
+            if (hotkeyArmed) {
                 if (qDown && !qWasDown) {
                     g_PauseMenuOpen = 0;
+                    g_LastPauseOpenTick = 0;
                     VD(SceneNext) = 1;
-                    LogMessage("Pause hotkey Q: direct Return to Title (next scene=1)");
+                    LogMessage("Pause hotkey Q: Return to Title (next scene=1)");
                 } else if (rDown && !rWasDown) {
                     g_PauseRetryAll = 1;
                     g_PauseMenuOpen = 0;
+                    g_LastPauseOpenTick = 0;
                     DWORD retryScene = (g_PracticeMode && g_PracticeStage >= 1 &&
                                         g_PracticeStage <= 5)
-                                           ? 2 + (DWORD)g_PracticeStage
-                                           : 3;
+                                       ? 2 + (DWORD)g_PracticeStage
+                                       : 3;
                     VD(SceneNext) = retryScene;
                     LogMessage("Pause hotkey R: direct Retry All (next scene=%lu)", retryScene);
                 }
             }
+#ifdef REFRAIN_DEBUG_BUILD
+            if ((qDown && !qWasDown) || (rDown && !rWasDown)) {
+                LogMessage("Pause hotkey seen: q=%d r=%d armed=%d flag=%d sinceOpen=%lums paused=%d frame=%lu scene=%lu",
+                           qDown && !qWasDown, rDown && !rWasDown, hotkeyArmed, g_PauseMenuOpen,
+                           g_LastPauseOpenTick ? now - g_LastPauseOpenTick : 0, paused,
+                           VD(FrameCnt), scene);
+            }
+#endif
             qWasDown = qDown;
             rWasDown = rDown;
             escWasDown = escDown;
         } else {
+            if (g_PauseMenuOpen)
+                LogMessage("Pause menu state: reset (scene %lu left the stage range)", scene);
             g_PauseMenuOpen = 0;
+            g_LastPauseOpenTick = 0;
             qWasDown = rWasDown = escWasDown = 0;
         }
 
         if (g_PauseMenuOpen &&
-            ((p['Z'] | p[VK_RETURN] | p[VK_SPACE]) & 0x80)) {
+            ((p['Z'] | p[VK_RETURN] | p[VK_SPACE] | p['X'] | p[VK_ESCAPE]) & 0x80)) {
             g_PauseMenuOpen = 0;
-            LogMessage("Pause menu state: closed (decide)");
+            LogMessage("Pause menu state: closed (decide/cancel)");
         }
     }
     if (g_LatQpcFreq) {
@@ -1209,6 +1316,9 @@ void __attribute__((naked)) Hook_SaveGlobalData(void) {
 
 int __cdecl HandleSetGameInfoIntHook(const char *key, int format, int value) {
     if (!key || IsBadReadPtr(key, 1)) return 0;
+#ifdef REFRAIN_DEBUG_BUILD
+    LogMessage("SetGameInfoInt raw: key='%s' value=%d format=%d practice=%d", key, value, format, g_PracticeMode);
+#endif
 
     if (g_PracticeMode) {
         if (strcmp(key, "GameInfo_RefRain") == 0 || strcmp(key, "lastRefRain") == 0 ||
@@ -1291,8 +1401,20 @@ unsigned char __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key)
 
     unsigned char res = orig_IsKeyTriggered(this, key);
     if (res) PauseDiagKey(key);
+    /* The stage script polls ESC (0x1B) via IsKeyTriggered every frame it runs and opens the
+       pause menu on the trigger; the menu itself then consumes all further ESC presses (no more
+       0x1B triggers until the menu is gone), and the menu polls Z/X/up/down through this same
+       hook. So a 0x1B trigger in a stage scene is the game's own "pause menu opened" event -
+       log evidence: exactly one key=0x1B per session, coinciding with the menu opening. */
+    if (res && key == 0x1B &&
+        ((currentScene >= 2 && currentScene <= 7) || currentScene == 10)) {
+        if (!g_PauseMenuOpen)
+            LogMessage("Pause menu state: open (ESC trigger, scene %lu)", currentScene);
+        g_PauseMenuOpen = 1;
+        g_LastPauseOpenTick = GetTickCount();
+    }
     if (g_PauseMenuOpen && res &&
-        (key == 'Z' || key == VK_RETURN || key == VK_SPACE)) {
+        (key == 'Z' || key == VK_RETURN || key == VK_SPACE || key == 'X' || key == 0x58)) {
         g_PauseMenuOpen = 0;
         LogMessage("Pause menu state: closed (decide)");
     }
@@ -1359,6 +1481,10 @@ unsigned char __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key)
 }
 
 DWORD __cdecl HandleSetLives(DWORD origLives) {
+#ifdef REFRAIN_DEBUG_BUILD
+    LogMessage("SetLives (Native 77) raw: arg=%lu (0x%08X) steam=%d pending=%d replay=%d",
+               (unsigned long)origLives, (unsigned long)origLives, g_IsSteam, g_PendingStageInitStats, IsReplayOrDemo());
+#endif
     if (g_PendingStageInitStats && !IsReplayOrDemo()) {
         LogMessage("SetLives (Native 77): intercepted script call (%lu) -> overriding to %d",
                    origLives, g_SelectedLives);
@@ -1378,8 +1504,10 @@ void __attribute__((naked)) Hook_SetLives(void) {
         "2:\n\t"
         "call _HandleSetLives\n\t"
         "addl $4, %%esp\n\t"
+        "pushl %%edx\n\t"
         "movl _g_A_Lives, %%edx\n\t"
         "movl %%eax, (%%edx)\n\t"
+        "popl %%edx\n\t"
         "cmpl $0, _g_IsSteam\n\t"
         "jne 3f\n\t"
         "popl %%edi\n\t"
@@ -1396,6 +1524,10 @@ void __attribute__((naked)) Hook_SetLives(void) {
 }
 
 DWORD __cdecl HandleSetMefa(DWORD origDword) {
+#ifdef REFRAIN_DEBUG_BUILD
+    LogMessage("SetMefa (Native 54) raw: arg=%lu (0x%08X) steam=%d pending=%d replay=%d",
+               (unsigned long)origDword, (unsigned long)origDword, g_IsSteam, g_PendingStageInitStats, IsReplayOrDemo());
+#endif
     if (g_PendingStageInitStats && !IsReplayOrDemo()) {
         union { DWORD dw; float f; } uOrig, uSel;
         uOrig.dw = origDword;
@@ -1418,8 +1550,10 @@ void __attribute__((naked)) Hook_SetMefa(void) {
         "2:\n\t"
         "call _HandleSetMefa\n\t"
         "addl $4, %%esp\n\t"
+        "pushl %%edx\n\t"
         "movl _g_A_Mefa, %%edx\n\t"
         "movl %%eax, (%%edx)\n\t"
+        "popl %%edx\n\t"
         "cmpl $0, _g_IsSteam\n\t"
         "jne 3f\n\t"
         "popl %%edi\n\t"
@@ -1436,6 +1570,10 @@ void __attribute__((naked)) Hook_SetMefa(void) {
 }
 
 DWORD __cdecl HandleSetCR(DWORD origDword) {
+#ifdef REFRAIN_DEBUG_BUILD
+    LogMessage("SetCR (Native 55) raw: arg=%lu (0x%08X) steam=%d pending=%d replay=%d",
+               (unsigned long)origDword, (unsigned long)origDword, g_IsSteam, g_PendingStageInitStats, IsReplayOrDemo());
+#endif
     if (g_PendingStageInitStats && !IsReplayOrDemo()) {
         union { DWORD dw; float f; } uOrig, uSel;
         uOrig.dw = origDword;
@@ -1458,8 +1596,10 @@ void __attribute__((naked)) Hook_SetCR(void) {
         "2:\n\t"
         "call _HandleSetCR\n\t"
         "addl $4, %%esp\n\t"
+        "pushl %%edx\n\t"
         "movl _g_A_Cr, %%edx\n\t"
         "movl %%eax, (%%edx)\n\t"
+        "popl %%edx\n\t"
         "cmpl $0, _g_IsSteam\n\t"
         "jne 3f\n\t"
         "popl %%edi\n\t"
@@ -1476,6 +1616,10 @@ void __attribute__((naked)) Hook_SetCR(void) {
 }
 
 DWORD __cdecl HandleSetDifficulty(DWORD diff) {
+#ifdef REFRAIN_DEBUG_BUILD
+    LogMessage("SetDifficulty (Native 79) raw: arg=%lu (0x%08X) steam=%d pending=%d replay=%d",
+               (unsigned long)diff, (unsigned long)diff, g_IsSteam, g_PendingStageInitStats, IsReplayOrDemo());
+#endif
     g_RefrainWindowState = 1;
     g_DifficultyConfirmed = 1;
     DWORD isUnlocked = (!IsBadReadPtr((void*)g_A->Unlock, 4) && VD(Unlock)) ? 1 : 0;
@@ -1505,8 +1649,10 @@ void __attribute__((naked)) Hook_SetDifficulty(void) {
         "2:\n\t"
         "call _HandleSetDifficulty\n\t"
         "addl $4, %%esp\n\t"
+        "pushl %%edx\n\t"
         "movl _g_A_Diff, %%edx\n\t"
         "movl %%eax, (%%edx)\n\t"
+        "popl %%edx\n\t"
         "cmpl $0, _g_IsSteam\n\t"
         "jne 3f\n\t"
         "popl %%edi\n\t"
@@ -1637,6 +1783,11 @@ void __attribute__((naked)) Hook_GetGameInfoRefRain(void) {
 DWORD __cdecl HandleGetRefRainConfig(DWORD *pVal) {
     DWORD diff = VD(Diff);
     DWORD isUnlocked = (!IsBadReadPtr((void*)g_A->Unlock, 4) && VD(Unlock)) ? 1 : 0;
+#ifdef REFRAIN_DEBUG_BUILD
+    LogMessage("GetRefRainConfig: pVal=%p raw=%08X practice=%d reMode=%d diff=%lu unlocked=%lu",
+               pVal, (pVal && !IsBadReadPtr(pVal, 4)) ? *(DWORD*)pVal : 0xFFFFFFFFu,
+               g_PracticeMode, g_SelectedReMode, diff, isUnlocked);
+#endif
     if (g_PracticeMode) {
         if (g_SelectedReMode && diff >= 2 && isUnlocked) {
             LogMessage("HandleGetRefRainConfig (0x00441229): Practice Re:MODE -> overriding to 1 (diff=%lu)", diff);
@@ -1661,8 +1812,7 @@ void __attribute__((naked)) Hook_GetRefRainConfig(void) {
         "movl %%eax, 28(%%esp)\n\t"
         "popal\n\t"
         "movl $0xffffffff, -0x4(%%ebp)\n\t"
-        "movl _g_RefRainCfgRetAddr, %%eax\n\t"
-        "pushl %%eax\n\t"
+        "pushl _g_RefRainCfgRetAddr\n\t"
         "ret\n\t"
         :
         :
@@ -1751,7 +1901,6 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
 
     if (isHD) {
         totalW = 1200.0f;
-        stageBoxH = 175.0f;
         paramBoxH = 325.0f;
         footerH = 56.0f;
         rowGap = 8.0f;
@@ -1764,7 +1913,6 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         paramHighlightH = 22.0f;
     } else {
         totalW = 616.0f;
-        stageBoxH = 115.0f;
         paramBoxH = 195.0f;
         footerH = 38.0f;
         rowGap = 5.0f;
@@ -1776,6 +1924,11 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
         stageHighlightH = 15.0f;
         paramHighlightH = 14.0f;
     }
+
+    int visibleStages = GetSelectableStageCount();
+    if (g_MenuCursor >= visibleStages) g_MenuCursor = visibleStages - 1;
+    if (g_MenuCursor < 0) g_MenuCursor = 0;
+    stageBoxH = (isHD ? 40.0f : 30.0f) + (float)visibleStages * stageLineSpacing;
 
     float totalH = stageBoxH + rowGap + paramBoxH + rowGap + footerH;
     startX = ((float)vp.Width - totalW) * 0.5f;
@@ -1833,14 +1986,10 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     DrawShadowText(g_pTitleFont, titleBuf, (int)startX + (isHD ? 14 : 10), (int)stageBoxY + (isHD ? 8 : 5), titleCol);
 
     int stageStartY = (int)stageBoxY + (isHD ? 36 : 24);
-    int maxStages = GetSelectableStageCount();
-    for (int i = 0; i < MENU_ITEM_COUNT; i++) {
+    for (int i = 0; i < visibleStages; i++) {
         int itemY = stageStartY + (int)(i * stageLineSpacing);
         char buf[128];
-        if (i >= maxStages) {
-            snprintf(buf, sizeof(buf), "   %s", g_MenuItems[i].label);
-            DrawShadowText(g_pStageFont ? g_pStageFont : g_pFont, buf, (int)startX + (isHD ? 12 : 8), itemY, theme->lockText);
-        } else if (i == g_MenuCursor) {
+        if (i == g_MenuCursor) {
             if (g_ActiveColumn == 0) {
                 DrawSolidRect(pDevice, startX + 4.0f, (float)itemY - 1.0f, totalW - 8.0f, stageHighlightH, theme->hiOn);
                 snprintf(buf, sizeof(buf), ">> %s", g_MenuItems[i].label);
@@ -1969,10 +2118,14 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     DrawFrame(pDevice, startX, footerY, totalW, footerH, 2.0f, theme->footerBorder);
     DrawSolidRect(pDevice, startX, footerY, totalW, footerH, theme->panel);
 
+    char help1Buf[128];
     const char *help1 = "";
     const char *help2 = "";
     if (g_ActiveColumn == 0) {
-        help1 = "[UP/DOWN] Select Stage    [Z/ENTER/RIGHT] Next    [1-5] Quick Select";
+        snprintf(help1Buf, sizeof(help1Buf),
+                 "[UP/DOWN] Select Stage    [Z/ENTER/RIGHT] Next    [1-%d] Quick Select",
+                 visibleStages);
+        help1 = help1Buf;
         help2 = "[X/ESC] Return to Title";
     } else if (g_ActiveColumn == 1) {
         help1 = "[UP/DOWN] Select Lives    [Z/ENTER/RIGHT] Next    [0-5] Quick Select";
@@ -2275,7 +2428,23 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     pDevice->lpVtbl->SetRenderState(pDevice, D3DRS_CULLMODE, cullMode);
 }
 
+#ifdef REFRAIN_DEBUG_BUILD
+static void PeriodicVarDump(void) {
+    static DWORD ctr = 0;
+    if ((++ctr % 240) != 0) return;
+    LogMessage("VARDUMP: Scene=%lu next=%lu Diff=%lu Char=%lu Lives=%lu Mefa=%08X Cr=%08X ViewIdx=%lu FrameCnt=%lu GameMode=%lu IsRefRain=%lu Unlock=%lu practice=%d reMode=%d pending=%d",
+               VD(Scene), VD(SceneNext), VD(Diff), VD(Char), VD(Lives), VD(Mefa), VD(Cr), VD(ViewIdx),
+               VD(FrameCnt), VD(GameMode), VD(IsRefRain), VD(Unlock), g_PracticeMode, g_SelectedReMode,
+               g_PendingStageInitStats);
+    LogMessage("VARDUMP: cfg(GameInfo_RefRain)=%d cfg(lastRefRain)=%d",
+               OrigGetGameInfoInt("GameInfo_RefRain", -1), OrigGetGameInfoInt("lastRefRain", -1));
+}
+#endif
+
 void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
+#ifdef REFRAIN_DEBUG_BUILD
+    PeriodicVarDump();
+#endif
     if (g_LatQpcFreq) {
         LARGE_INTEGER li;
         QueryPerformanceCounter(&li);
@@ -2347,6 +2516,10 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
         DWORD curChar = VD(Char);
         if (curChar < 1 || curChar > 3) curChar = 1;
         VD(ViewIdx) = (curChar - 1) + 3 * ((diff - 1) + 4 * isRefRain);
+#ifdef REFRAIN_DEBUG_BUILD
+        LogMessage("StageInit wrote ViewIdx=%lu (Char=%lu Diff=%lu isRefRain=%lu frame=%lu)",
+                   VD(ViewIdx), curChar, diff, isRefRain, VD(FrameCnt));
+#endif
         VD(GameMode) = 1;
         VD(IsRefRain) = isRefRain;
 
@@ -2416,16 +2589,33 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
             }
             if (g_AutoNavTimer >= 3 && IsRefrainWindowOpen()) {
                 LogMessage("AutoNav: Phase 0 complete! RefRain window opened at timer=%d", g_AutoNavTimer);
-                g_AutoNavPhase = 1;
-                g_AutoNavTimer = 0;
-                g_DifficultyConfirmed = 0;
-                g_SimulatedKeyAction = SIMKEY_NONE;
+                if (g_AutoNavTarget == 1) {
+                    g_AutoAdvanceToDifficulty = 0;
+                    g_AutoNavPhase = 0;
+                    g_AutoNavTimer = 0;
+                    g_SimulatedKeyAction = SIMKEY_NONE;
+                    g_RefrainWindowState = 1;
+                    LogMessage("AutoNav: stopping on the character desktop (Q hotkey)");
+                } else {
+                    g_AutoNavPhase = 1;
+                    g_AutoNavTimer = 0;
+                    g_DifficultyConfirmed = 0;
+                    g_SimulatedKeyAction = SIMKEY_NONE;
+                }
             } else if (g_AutoNavTimer >= 80) {
-                LogMessage("AutoNav: Phase 0 fallback timeout (%d frames) -> advancing to Phase 1", g_AutoNavTimer);
-                g_AutoNavPhase = 1;
-                g_AutoNavTimer = 0;
-                g_DifficultyConfirmed = 0;
-                g_SimulatedKeyAction = SIMKEY_NONE;
+                if (g_AutoNavTarget == 1) {
+                    g_AutoAdvanceToDifficulty = 0;
+                    g_AutoNavPhase = 0;
+                    g_AutoNavTimer = 0;
+                    g_SimulatedKeyAction = SIMKEY_NONE;
+                    LogMessage("AutoNav: Phase 0 timeout with desktop target -> releasing input, staying where we are");
+                } else {
+                    LogMessage("AutoNav: Phase 0 fallback timeout (%d frames) -> advancing to Phase 1", g_AutoNavTimer);
+                    g_AutoNavPhase = 1;
+                    g_AutoNavTimer = 0;
+                    g_DifficultyConfirmed = 0;
+                    g_SimulatedKeyAction = SIMKEY_NONE;
+                }
             }
         } else if (g_AutoNavPhase == 1) {
             if (g_AutoNavTimer >= 2 && (g_AutoNavTimer % 2 == 0) && !g_DifficultyConfirmed) {
@@ -2626,11 +2816,20 @@ DWORD __cdecl HandleTrans(void) {
         LogMessage("Practice stage end (prev=%lu next=%lu) -> redirecting to Title with fast AutoNav (char=%lu, ReMode=%d)",
                    prevScene, nextScene, g_PracticeChar, effectiveRe);
         g_AutoAdvanceToDifficulty = 1;
+        g_AutoNavTarget = 0;
         g_AutoNavPhase = 0;
         g_AutoNavTimer = 0;
         g_DifficultyConfirmed = 0;
         g_SimulatedKeyAction = SIMKEY_NONE;
         g_StageSelected = 0;
+        VD(SceneNext) = 1;
+        return prevScene;
+    }
+
+    /* A stray DECIDE during the pause-Q navigation must never start a DIVE. */
+    if (g_AutoAdvanceToDifficulty && g_AutoNavTarget == 1 && nextScene >= 3 && nextScene <= 8) {
+        LogMessage("Trans: blocking stage load while auto-navigating to the desktop (prev=%lu next=%lu)",
+                   prevScene, nextScene);
         VD(SceneNext) = 1;
         return prevScene;
     }
@@ -2821,6 +3020,10 @@ static void ResetStageScore(void) {
     DWORD curChar = VD(Char);
     if (curChar < 1 || curChar > 3) curChar = 1;
     VD(ViewIdx) = (curChar - 1) + 3 * ((diff - 1) + 4 * isRefRain);
+#ifdef REFRAIN_DEBUG_BUILD
+    LogMessage("ResetStageScore wrote ViewIdx=%lu (Char=%lu Diff=%lu isRefRain=%lu)",
+               VD(ViewIdx), curChar, diff, isRefRain);
+#endif
     VD(GameMode) = 1;
     VD(IsRefRain) = isRefRain;
     SetGameInfoInt("GameInfo_RefRain", isRefRain);
@@ -2974,6 +3177,8 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
                         DWORD diff = VD(Diff);
                         if (stage == 5 && diff == 1) {
                             LogMessage("Hotkey F%d -> Stage %d blocked on Easy difficulty", stage, stage);
+                        } else if (!IsStageReached(stage)) {
+                            LogMessage("Hotkey F%d -> Stage %d not yet reached in normal play, skipped", stage, stage);
                         } else {
                         LogMessage("Hotkey F%d -> Warping to Stage %d (currentScene=%lu)", stage, stage, currentScene);
                         g_PracticeStage = stage;
@@ -2995,6 +3200,89 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
     }
     return 0;
 }
+
+#ifdef REFRAIN_DEBUG_BUILD
+/* ---- Practice-start diagnostics (debug build only) --------------------------
+ * The stage-init code uses the "view index" global (disc 0x5abb80 / steam
+ * 0x5afc50) to index an 8-byte-per-entry table.  It is written by exactly one
+ * game instruction (mov [viewIdx], eax) inside the view setter, from
+ *   (Char - 1) + 3 * ((Diff - 1) + 4 * <Re:MODE config value>)
+ * where the config value is the eax our Hook_GetRefRainConfig leaves behind.
+ * The hook below logs those three inputs every time the game writes the index,
+ * which pinpoints which input went out of range.
+ */
+static volatile DWORD g_WvIdx, g_WvEbx, g_WvEsi, g_WvRet;
+static volatile DWORD g_ViewIdxWriteRet = 0;
+static volatile DWORD g_LastLoggedIdx = 0xFFFFFFFF;
+static volatile DWORD g_CfgHookValue = 0xFFFFFFFF;
+static volatile DWORD g_CfgHookCount = 0;
+
+__attribute__((used)) static void __cdecl HandleViewIdxWatch(void) {
+    DWORD idx = g_WvIdx;
+    if (idx != g_LastLoggedIdx) {
+        g_LastLoggedIdx = idx;
+        LogMessage("ViewIdxWatch: write %lu (idx=%lu) <- Char=%lu Diff=%lu cfgRet=%lu | caller=%08X esi=%08X ebx=%08X | Scene=%lu next=%lu practice=%d reMode=%d pending=%d",
+                   idx, idx, g_WvEsi, g_WvEbx, g_CfgHookValue, g_WvRet, g_WvEsi, g_WvEbx,
+                   VD(Scene), VD(SceneNext), g_PracticeMode, g_SelectedReMode, g_PendingStageInitStats);
+        LogMessage("ViewIdxWatch: game vars Char=%lu Diff=%lu Lives=%lu Mefa=%08X Cr=%08X IsRefRain=%lu Unlock=%lu GameMode=%lu",
+                   VD(Char), VD(Diff), VD(Lives), VD(Mefa), VD(Cr), VD(IsRefRain), VD(Unlock), VD(GameMode));
+    }
+}
+
+void __attribute__((naked)) Hook_ViewIdxWatch(void) {
+    __asm__ __volatile__(
+        "pushal\n\t"
+        "movl 28(%%esp), %%eax\n\t"
+        "movl %%eax, _g_WvIdx\n\t"
+        "movl 16(%%esp), %%eax\n\t"
+        "movl %%eax, _g_WvEbx\n\t"
+        "movl 4(%%esp), %%eax\n\t"
+        "movl %%eax, _g_WvEsi\n\t"
+        "movl 32(%%esp), %%eax\n\t"
+        "movl %%eax, _g_WvRet\n\t"
+        "call _HandleViewIdxWatch\n\t"
+        "popal\n\t"
+        "pushl %%edx\n\t"
+        "movl _g_A_ViewIdx, %%edx\n\t"
+        "movl %%eax, (%%edx)\n\t"
+        "popl %%edx\n\t"
+        "pushl _g_ViewIdxWriteRet\n\t"
+        "ret\n\t"
+        :
+        :
+    );
+}
+
+static void InstallViewIdxWatch(void) {
+    DWORD oldProtect;
+    void *site = (void*)g_A->ViewIdxWriteSite;
+    unsigned char expected[5];
+    expected[0] = 0xA3;
+    DWORD vi = g_A->ViewIdx;
+    memcpy(&expected[1], &vi, 4);
+    if (memcmp(site, expected, 5) != 0) {
+        LogMessage("[Diag] ViewIdx write site at 0x%08X did not match (found %02X %02X %02X %02X %02X)",
+                   site, *(unsigned char*)site, *(unsigned char*)((DWORD)site + 1),
+                   *(unsigned char*)((DWORD)site + 2), *(unsigned char*)((DWORD)site + 3),
+                   *(unsigned char*)((DWORD)site + 4));
+        return;
+    }
+    g_ViewIdxWriteRet = g_A->ViewIdxWriteSite + 5;
+    if (VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        unsigned char patch[5];
+        patch[0] = 0xE9;
+        DWORD rel = (DWORD)Hook_ViewIdxWatch - ((DWORD)site + 5);
+        memcpy(&patch[1], &rel, 4);
+        memcpy(site, patch, 5);
+        VirtualProtect(site, 5, oldProtect, &oldProtect);
+        FlushInstructionCache(GetCurrentProcess(), site, 5);
+        LogMessage("[Diag] ViewIdx write watch installed at 0x%08X", site);
+    }
+}
+#else
+static void InstallViewIdxWatch(void) {
+}
+#endif
 
 static void InstallHooks(void) {
     DWORD oldProtect;
@@ -3314,6 +3602,8 @@ static void InstallHooks(void) {
     } else {
         LogMessage("[Error] SaveReplayHeader signature at 0x%08X did not match!", saveReplayHdrAddr);
     }
+
+    InstallViewIdxWatch();
 }
 
 static void DetectVersion(void) {
@@ -3323,20 +3613,20 @@ static void DetectVersion(void) {
 
     int isSteam = memcmp(base + (ADDRS_STEAM.TransSite - 0x400000), SIGS_STEAM.Trans, 5) == 0 &&
                   memcmp(base + (ADDRS_STEAM.LoadStartSite - 0x400000), SIGS_STEAM.LoadStart, 7) == 0;
-    int isDisk = memcmp(base + (ADDRS_DISK.TransSite - 0x400000), SIGS_DISK.Trans, 5) == 0 &&
-                 memcmp(base + (ADDRS_DISK.LoadStartSite - 0x400000), SIGS_DISK.LoadStart, 7) == 0;
+    int isDisc = memcmp(base + (ADDRS_DISC.TransSite - 0x400000), SIGS_DISC.Trans, 5) == 0 &&
+                 memcmp(base + (ADDRS_DISC.LoadStartSite - 0x400000), SIGS_DISC.LoadStart, 7) == 0;
     if (isSteam) {
         g_IsSteam = 1;
-    } else if (isDisk) {
+    } else if (isDisc) {
         g_IsSteam = 0;
     } else {
         g_IsSteam = 0;
-        LogMessage("[Error] Unknown RefRain.exe build (neither disk nor Steam signature matched); assuming disk version");
+        LogMessage("[Error] Unknown RefRain.exe build (neither disc nor Steam signature matched); assuming disc version");
     }
 
-    const GameAddrs *tmpl = g_IsSteam ? &ADDRS_STEAM : &ADDRS_DISK;
+    const GameAddrs *tmpl = g_IsSteam ? &ADDRS_STEAM : &ADDRS_DISC;
     memcpy(&g_Addrs, tmpl, sizeof(g_Addrs));
-    memcpy(&g_Sigs, g_IsSteam ? &SIGS_STEAM : &SIGS_DISK, sizeof(g_Sigs));
+    memcpy(&g_Sigs, g_IsSteam ? &SIGS_STEAM : &SIGS_DISC, sizeof(g_Sigs));
 
     /* rebase every DWORD address field (0 means "not used by this version") */
     DWORD *p = (DWORD*)&g_Addrs;
@@ -3354,6 +3644,7 @@ static void DetectVersion(void) {
     g_A_Cr = g_A->Cr;
     g_A_Lives = g_A->Lives;
     g_A_Diff = g_A->Diff;
+    g_A_ViewIdx = g_A->ViewIdx;
     g_A_GpuQueue = g_A->GpuQueue;
     g_DispatchEpilogue = g_A->DispatchEpilogue;
     g_SaveGlobalRetAddr = g_A->fnSaveGlobalRet;

@@ -95,7 +95,7 @@ Stage 2 starts with power level 6, and Stage 3 starts at maximum power.
 ### RefRain
 
 - Keyboard shortcuts
-  - **Q**: Return to the title screen from the pause menu.
+  - **Q**: Return to that character's desktop screen from the pause menu.
   - **R**: Retry from the pause menu.
 
 - Practice mode
