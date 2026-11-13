@@ -3667,7 +3667,7 @@ static void DetectVersion(void) {
     orig_IsKeyTriggered = (PFN_IsKey)g_A->fnIsKeyTriggered;
 
     LogMessage("Version detect: %s build, image base 0x%08X (delta=%+ld)",
-               g_IsSteam ? "Steam" : "Disk", (DWORD)(DWORD_PTR)base, (long)g_BaseDelta);
+               g_IsSteam ? "Steam" : "Disc", (DWORD)(DWORD_PTR)base, (long)g_BaseDelta);
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) {
@@ -3677,7 +3677,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) {
         DisableThreadLibraryCalls(hinstDLL);
         DetectVersion();
         LogMessage("RefRain stage select mod loaded (%s build, image base 0x%08X).",
-                   g_IsSteam ? "Steam" : "Disk", (DWORD)(DWORD_PTR)GetModuleHandleA(NULL));
+                   g_IsSteam ? "Steam" : "Disc", (DWORD)(DWORD_PTR)GetModuleHandleA(NULL));
         InstallHooks();
         CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
         if (g_PauseDiag) CreateThread(NULL, 0, PauseDiagThread, NULL, 0, NULL);
