@@ -22,9 +22,7 @@ On Wine/Proton, keeping the default `DirectDraw` is recommended.
 
 ### RefRain
 
-Too broke to own the Steam version, so only the disc-version executable is supported.
-
-Download `d3d9.dll` from [Releases](https://github.com/Madotsukanai/Raindrop/releases/latest), copy it to the same directory as `RefRain.exe` (SHA-256: `db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78`), and start the game.
+Download `d3d9.dll` from [Releases](https://github.com/Madotsukanai/Raindrop/releases/latest), copy it to the same directory as the disc-version `RefRain.exe` (SHA-256: `db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78`) or the Steam-version `RefRain.exe` (SHA-256: `1941799d114dacbbd83a3d40c69ad4f5063ee4a175c591dc155d5deca4a6e959`), and start the game. The DLL detects which build is running at load time.
 
 To open the Practice menu, move the cursor to “DIVE 2 M.R.S.” and press the key assigned to Concept Reactor.
 

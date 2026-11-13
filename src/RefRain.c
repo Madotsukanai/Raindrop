@@ -1263,7 +1263,7 @@ static int OrigGetGameInfoInt(const char *key, int format) {
         "pushl %%ebp\n\t"
         "movl %%esp, %%ebp\n\t"
         "pushl $-1\n\t"
-        "movl %2, %%eax\n\t"
+        "movl %3, %%eax\n\t"
         "jmp *%%eax\n\t"
         "2:\n\t"
         : "=r"(res)
