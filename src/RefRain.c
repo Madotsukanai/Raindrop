@@ -4,6 +4,193 @@
 #include <stdio.h>
 #include "d3dx9_font_compat.h"
 
+/* ---------------------------------------------------------------------------
+ * Game version / address table.
+ * The mod supports the disk build and the Steam build of RefRain 1.03.7.
+ * Every address below is stored as the preferred (0x400000-based) VA for that
+ * build; at load time DetectVersion() picks the table, then rebases every
+ * entry by the actual image base delta (both exes are DYNAMIC_BASE, so the
+ * image is not guaranteed to load at 0x400000).
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    /* game variables */
+    DWORD Scene, SceneNext, ScenePend, Script;
+    DWORD GameMode, ReplaySlot, GameModeNext, Var4d2370;
+    DWORD FrameCnt;
+    DWORD Unlock, LoadFlag, IsRefRain, Config, InputMgr;
+    DWORD Lives, St10, St14, St18, St1c, St20, St24, Diff;
+    DWORD In1, In2, In3, Obj;
+    DWORD Var5b975d, Cr, Mefa, Char, Player;
+    DWORD Tasks, GpuQueue;
+    DWORD Frame1, Frame2, ViewIdx;
+    DWORD pdRange[6][2];
+    /* functions */
+    DWORD fnSE, fnTick, fnLoadGlobal, fnSaveGlobal, fnSaveGlobalRet;
+    DWORD fnGetGameInfoInt, fnGetGameInfoIntRet;
+    DWORD fnSetGameInfoInt, fnSetGameInfoIntRet;
+    DWORD fnIsKeyPressed, fnIsKeyTriggered;
+    /* vtables / IAT */
+    DWORD vtInput, vtJoyA, vtJoyB, vtTask;
+    DWORD iatGetKeyboardState, iatXInputGetCaps, iatXInputGetState;
+    /* hook sites and continuation addresses */
+    DWORD TransSite;
+    DWORD LoadStartSite, LoadStartRet, LoadStartSkip;
+    DWORD SceneCheckSite, SceneCheckRet;
+    DWORD EndSceneSite, EndSceneRet;
+    DWORD PreTickSite, PreTickRet;
+    DWORD SetMefaSite, SetCrSite, SetLivesSite, SetDiffSite;
+    DWORD DispatchEpilogue;      /* steam: shared case epilogue; disk: 0 (inline epilogue) */
+    DWORD RefRainCfgSite, RefRainCfgRet;
+    DWORD GameInfoRefRainSite;
+    DWORD SaveReplayHdrSite, SaveReplayHdrRet;
+    DWORD FreadWrapSite, FwriteWrapSite;
+    DWORD Getter19Fn, Getter19Entry;
+} GameAddrs;
+
+typedef struct {
+    BYTE Trans[5];
+    BYTE LoadStart[7];
+    BYTE SceneCheck[6];
+    BYTE EndScene[6];
+    BYTE SetMefa[13];
+    BYTE SetCr[13];
+    BYTE SetLives[8];
+    BYTE SetDiff[8];
+    BYTE RefRainCfg[9];
+    BYTE SaveReplayHdr[5];
+} VersionSigs;
+
+static const GameAddrs ADDRS_DISK = {
+    /* Scene, SceneNext, ScenePend, Script */
+    0x005c073c, 0x005c0740, 0x005c0744, 0x005c0760,
+    /* GameMode, ReplaySlot, GameModeNext, Var4d2370 */
+    0x004d2378, 0x004d237c, 0x004d2380, 0x004d2370,
+    /* FrameCnt */
+    0x005abb78,
+    /* Unlock, LoadFlag, IsRefRain, Config, InputMgr */
+    0x005ac4d4, 0x005ac4dc, 0x005ac674, 0x005ac9b0, 0x005ac9b4,
+    /* Lives, St10, St14, St18, St1c, St20, St24, Diff */
+    0x005b8e08, 0x005b8e10, 0x005b8e14, 0x005b8e18, 0x005b8e1c, 0x005b8e20, 0x005b8e24, 0x005b8e28,
+    /* In1, In2, In3, Obj */
+    0x005b8e54, 0x005b8e58, 0x005b8e5c, 0x005b8e68,
+    /* Var5b975d, Cr, Mefa, Char, Player */
+    0x005b975d, 0x005b976c, 0x005b9770, 0x005b9774, 0x5b9778,
+    /* Tasks, GpuQueue */
+    0x005ba0a8, 0x004df338,
+    /* Frame1, Frame2, ViewIdx */
+    0x005abb70, 0x005abb74, 0x005abb80,
+    /* pdRange (PauseDiag snapshot ranges) */
+    { { 0x005abb60, 0x005abbc0 }, { 0x005b8e00, 0x005b8e70 }, { 0x005ac4c0, 0x005ac4f0 },
+      { 0x005ac670, 0x005ac680 }, { 0x004d2370, 0x004d2380 }, { 0x005c0730, 0x005c0760 } },
+    /* fnSE, fnTick, fnLoadGlobal, fnSaveGlobal, fnSaveGlobalRet */
+    0x0043bf40, 0x0042a7c0, 0x0042a8e0, 0x0042c330, 0x0042c335,
+    /* fnGetGameInfoInt, ret, fnSetGameInfoInt, ret */
+    0x0044fb80, 0x0044fb85, 0x0044fca0, 0x0044fca5,
+    /* fnIsKeyPressed, fnIsKeyTriggered */
+    0x00431760, 0x004317a0,
+    /* vtInput, vtJoyA, vtJoyB, vtTask */
+    0x004b80c4, 0x004b83f8, 0x004b807c, 0x004b9a20,
+    /* iatGetKeyboardState, iatXInputGetCaps, iatXInputGetState */
+    0x0048c248, 0x0048c294, 0x0048c298,
+    /* hook sites */
+    0x00440deb,
+    0x00441097, 0x004410a3, 0x004410ba,
+    0x00440ff8, 0x00440ffe,
+    0x0046726d, 0x00467273,
+    0x0046710d, 0x00467112,
+    0x00462430, 0x00462443, 0x00462535, 0x004625dc,
+    0x00000000,
+    0x00441229, 0x00441232,
+    0x0043078e,
+    0x00431d24, 0x00431d29,
+    0x0046f33b, 0x0047038a,
+    0x00462c49, 0x00462dfc
+};
+
+static const GameAddrs ADDRS_STEAM = {
+    0x005c480c, 0x005c4810, 0x005c4814, 0x005c4830,
+    0x004d6378, 0x004d637c, 0x004d6380, 0x004d6370,
+    0x005afc48,
+    0x005b05a4, 0x005b05ac, 0x005b0744, 0x005b0a80, 0x005b0a84,
+    0x005bced8, 0x005bcee0, 0x005bcee4, 0x005bcee8, 0x005bceec, 0x005bcef0, 0x005bcef4, 0x005bcef8,
+    0x005bcf24, 0x005bcf28, 0x005bcf2c, 0x005bcf38,
+    0x005bd82d, 0x005bd83c, 0x005bd840, 0x005bd844, 0x005bd848,
+    0x005be178, 0x004e3408,
+    0x005afc40, 0x005afc44, 0x005afc50,
+    { { 0x005afc30, 0x005afc90 }, { 0x005bced0, 0x005bcf40 }, { 0x005b0590, 0x005b05c0 },
+      { 0x005b0740, 0x005b0750 }, { 0x004d6370, 0x004d6380 }, { 0x005c4800, 0x005c4830 } },
+    0x0043bf40, 0x0042a7c0, 0x0042a8e0, 0x0042c330, 0x0042c335,
+    0x0044fd30, 0x0044fd35, 0x0044fe50, 0x0044fe55,
+    0x00431760, 0x004317a0,
+    0x004bc524, 0x004bc858, 0x004bc4dc, 0x004be488,
+    0x0049024c, 0x00490298, 0x0049029c,
+    0x00440e0b,
+    0x004410d1, 0x004410dd, 0x004410f4,
+    0x00441032, 0x00441038,
+    0x00467f1d, 0x00467f23,
+    0x00467dbd, 0x00467dc2,
+    0x00462fb3, 0x00462fc5, 0x004631c7, 0x00463262,
+    0x004632d0,
+    0x00441263, 0x0044126c,
+    0x0043078e,
+    0x00431d24, 0x00431d29,
+    0x00471a5b, 0x00472aaa,
+    0x004638d9, 0x00463a8c
+};
+
+static const VersionSigs SIGS_DISK = {
+    { 0xA1, 0x3C, 0x07, 0x5C, 0x00 },                                   /* Trans: mov eax,[scene] */
+    { 0x32, 0xC9, 0xC7, 0x05, 0xDC, 0xC4, 0x5A },                       /* LoadStart */
+    { 0x8B, 0x15, 0x40, 0x07, 0x5C, 0x00 },                             /* SceneCheck */
+    { 0xFF, 0x90, 0xA8, 0x00, 0x00, 0x00 },                             /* EndScene: call [eax+0xa8] */
+    { 0xF3, 0x0F, 0x10, 0x45, 0x08, 0xF3, 0x0F, 0x11, 0x05, 0x70, 0x97, 0x5B, 0x00 },  /* SetMefa */
+    { 0xF3, 0x0F, 0x10, 0x45, 0x08, 0xF3, 0x0F, 0x11, 0x05, 0x6C, 0x97, 0x5B, 0x00 },  /* SetCR */
+    { 0x8B, 0x45, 0x08, 0xA3, 0x08, 0x8E, 0x5B, 0x00 },                 /* SetLives */
+    { 0x8B, 0x45, 0x08, 0xA3, 0x28, 0x8E, 0x5B, 0x00 },                 /* SetDifficulty */
+    { 0x8B, 0x00, 0xC7, 0x45, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF },           /* GetRefRainConfig */
+    { 0x56, 0x6A, 0x01, 0x6A, 0x0C }                                    /* SaveReplayHeader */
+};
+
+static const VersionSigs SIGS_STEAM = {
+    { 0xA1, 0x0C, 0x48, 0x5C, 0x00 },
+    { 0x32, 0xC9, 0xC7, 0x05, 0xAC, 0x05, 0x5B },
+    { 0x8B, 0x15, 0x10, 0x48, 0x5C, 0x00 },
+    { 0xFF, 0x90, 0xA8, 0x00, 0x00, 0x00 },
+    { 0xF3, 0x0F, 0x10, 0x43, 0x08, 0xF3, 0x0F, 0x11, 0x05, 0x40, 0xD8, 0x5B, 0x00 },
+    { 0xF3, 0x0F, 0x10, 0x43, 0x08, 0xF3, 0x0F, 0x11, 0x05, 0x3C, 0xD8, 0x5B, 0x00 },
+    { 0x8B, 0x43, 0x08, 0xA3, 0xD8, 0xCE, 0x5B, 0x00 },
+    { 0x8B, 0x43, 0x08, 0xA3, 0xF8, 0xCE, 0x5B, 0x00 },
+    { 0x8B, 0x00, 0xC7, 0x45, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF },
+    { 0x56, 0x6A, 0x01, 0x6A, 0x0C }
+};
+
+static DWORD  g_BaseDelta = 0;      /* actual image base - 0x400000 */
+static volatile int g_IsSteam = 0;
+static GameAddrs g_Addrs;           /* runtime copy, rebased */
+static const GameAddrs *g_A = &ADDRS_DISK;
+static VersionSigs g_Sigs;
+
+/* Accessors for game variables (g_A entries already carry the image delta). */
+#define VA(x)  (g_A->x)
+#define VD(x)  (*(volatile DWORD*)(g_A->x))
+#define VB(x)  (*(volatile BYTE*)(g_A->x))
+
+/* Addresses consumed by naked-hook inline asm (symbol-referenced, so the
+ * register setup happens inside the asm block, after pushal-style saves). */
+static volatile DWORD g_A_SceneNext;
+static volatile DWORD g_A_LoadFlag;
+static volatile DWORD g_A_Mefa, g_A_Cr, g_A_Lives, g_A_Diff;
+static volatile DWORD g_A_GpuQueue;
+static volatile DWORD g_DispatchEpilogue;
+static volatile DWORD g_SaveGlobalRetAddr;
+static volatile DWORD g_GetGameInfoIntRetAddr;
+static volatile DWORD g_SetGameInfoIntRetAddr;
+static volatile DWORD g_GetGameInfoIntFn;
+static volatile DWORD g_RefRainCfgRetAddr;
+
+static void DetectVersion(void);
+
+
 static volatile int g_ShowStageMenu = 0;
 static volatile int g_StageSelected = 0;
 static volatile int g_PracticeMode = 0;
@@ -35,10 +222,10 @@ static volatile int g_StageInitRenderFrames = 0;
 static void ResetStageScore(void);
 static volatile long g_PendingReset = 0;
 
-static const DWORD g_ReturnAddr = 0x00440ffe;
-static const DWORD g_EndSceneRetAddr = 0x00467273;
-static const DWORD g_LoadStartRetAddr  = 0x004410a3;
-static const DWORD g_LoadStartSkipAddr = 0x004410ba;
+static volatile DWORD g_ReturnAddr;
+static volatile DWORD g_EndSceneRetAddr;
+static volatile DWORD g_LoadStartRetAddr;
+static volatile DWORD g_LoadStartSkipAddr;
 
 static IDirect3DQuery9 *g_pEventQuery = NULL;
 static int g_LowLatencyMode = 1;
@@ -218,7 +405,7 @@ typedef struct {
 #define MENU_ITEM_COUNT 5
 
 static inline int GetSelectableStageCount(void) {
-    DWORD diff = *(volatile DWORD*)0x5b8e28;
+    DWORD diff = VD(Diff);
     return (diff == 1) ? 4 : MENU_ITEM_COUNT;
 }
 
@@ -354,7 +541,7 @@ static void PlayGameSE(int seIndex) {
         "call *%2\n\t"
         "movl %%eax, %0\n\t"
         : "=r"(pSoundObj)
-        : "r"((DWORD)seIndex), "r"((DWORD)0x43bf40)
+        : "r"((DWORD)seIndex), "r"(g_A->fnSE)
         : "eax", "ecx", "edx", "memory"
     );
 
@@ -365,7 +552,7 @@ static void PlayGameSE(int seIndex) {
 }
 
 static inline int IsReplayOrDemo(void) {
-    DWORD gameMode = *(volatile DWORD*)0x4d2378;
+    DWORD gameMode = VD(GameMode);
     if (gameMode == 2 || gameMode == 3) {
         return 1;
     }
@@ -373,8 +560,8 @@ static inline int IsReplayOrDemo(void) {
 }
 
 typedef unsigned char (__attribute__((thiscall)) *PFN_IsKey)(void *this, int key);
-static PFN_IsKey orig_IsKeyPressed = (PFN_IsKey)0x00431760;
-static PFN_IsKey orig_IsKeyTriggered = (PFN_IsKey)0x004317a0;
+static PFN_IsKey orig_IsKeyPressed = NULL;
+static PFN_IsKey orig_IsKeyTriggered = NULL;
 static volatile int g_PauseMenuOpen = 0;
 static void PauseDiagKey(int key);
 
@@ -655,7 +842,7 @@ static PFN_GetKeyboardState_t orig_GetKeyboardState = NULL;
 static BOOL WINAPI Mine_GetKeyboardState(PBYTE p) {
     BOOL r = orig_GetKeyboardState(p);
     if (r && p) {
-        DWORD scene = *(volatile DWORD*)0x5c073c;
+        DWORD scene = VD(Scene);
         int inStage = ((scene >= 2 && scene <= 7) || scene == 10);
         static int qWasDown = 0;
         static int rWasDown = 0;
@@ -672,7 +859,7 @@ static BOOL WINAPI Mine_GetKeyboardState(PBYTE p) {
             if (g_PauseMenuOpen) {
                 if (qDown && !qWasDown) {
                     g_PauseMenuOpen = 0;
-                    *(volatile DWORD*)0x5c0740 = 1;
+                    VD(SceneNext) = 1;
                     LogMessage("Pause hotkey Q: direct Return to Title (next scene=1)");
                 } else if (rDown && !rWasDown) {
                     g_PauseRetryAll = 1;
@@ -681,7 +868,7 @@ static BOOL WINAPI Mine_GetKeyboardState(PBYTE p) {
                                         g_PracticeStage <= 5)
                                            ? 2 + (DWORD)g_PracticeStage
                                            : 3;
-                    *(volatile DWORD*)0x5c0740 = retryScene;
+                    VD(SceneNext) = retryScene;
                     LogMessage("Pause hotkey R: direct Retry All (next scene=%lu)", retryScene);
                 }
             }
@@ -769,26 +956,26 @@ __attribute__((used)) static void PreTickInputPoll(void) {
         g_LatPollAgeCount++;
     }
 
-    DWORD o = *(volatile DWORD*)0x5b8e68;
+    DWORD o = VD(Obj);
     if (o) {
         if (!ThiscallCallInput(o, 0x0C)) return;
     }
-    o = *(volatile DWORD*)0x5b8e5c;
+    o = VD(In3);
     if (o && *(volatile BYTE*)(o + 0x1E)) {
         if (!ThiscallCallInput(o, 0x10)) return;
     }
-    o = *(volatile DWORD*)0x5b8e58;
+    o = VD(In2);
     if (o && *(volatile BYTE*)(o + 0x1E)) {
         if (!ThiscallCallInput(o, 0x10)) return;
     }
-    o = *(volatile DWORD*)0x5b8e54;
+    o = VD(In1);
     if (o) {
         ThiscallCallInput(o, 0x10);
     }
 }
 
-static const DWORD g_PreTickRetAddr = 0x00467112;
-static const DWORD g_PreTickTarget = 0x0042a7c0;
+static volatile DWORD g_PreTickRetAddr;
+static volatile DWORD g_PreTickTarget;
 
 void __attribute__((naked)) Hook_PreTickPollCall(void) {
     __asm__ __volatile__(
@@ -804,7 +991,7 @@ void __attribute__((naked)) Hook_PreTickPollCall(void) {
     );
 }
 
-static DWORD g_SaveReplayHdrRetAddr = 0x00431d29;
+static volatile DWORD g_SaveReplayHdrRetAddr;
 
 void __attribute__((naked)) Hook_SaveReplayHeader(void) {
     __asm__ __volatile__(
@@ -840,7 +1027,7 @@ unsigned char __attribute__((thiscall)) Hook_IsKeyPressed(void *this, int key) {
 }
 
 static inline int GetConceptReactorKey(void) {
-    DWORD pConfig = *(volatile DWORD*)0x5ac9b0;
+    DWORD pConfig = VD(Config);
     if (pConfig && !IsBadReadPtr((void*)pConfig, 0x800)) {
         DWORD crIdx = *(DWORD*)(pConfig + 0x434);
         if (crIdx < 32) {
@@ -854,15 +1041,15 @@ static inline int GetConceptReactorKey(void) {
 }
 
 static inline int GetConceptReactorJoyButton(int crKey) {
-    void *pInputMgr = *(void**)0x5ac9b4;
+    void *pInputMgr = *(void**)g_A->InputMgr;
     if (pInputMgr && !IsBadReadPtr(pInputMgr, 16)) {
         void *pJ = *(void**)((DWORD)pInputMgr + 0xc);
         if (pJ && !IsBadReadPtr(pJ, 0x400)) {
             DWORD vtbl = *(DWORD*)pJ;
-            if (vtbl == 0x4b83f8 && crKey >= 0 && crKey < 256) {
+            if (vtbl == g_A->vtJoyA && crKey >= 0 && crKey < 256) {
                 int btn = *(int*)((DWORD)pJ + 0x34 + crKey * 4);
                 if (btn >= 0 && btn < 32) return btn;
-            } else if (vtbl == 0x4b807c && crKey >= 0 && crKey < 256) {
+            } else if (vtbl == g_A->vtJoyB && crKey >= 0 && crKey < 256) {
                 int btn = *(int*)((DWORD)pJ + 0x1f4 + crKey * 4);
                 if (btn >= 0 && btn < 32) return btn;
             }
@@ -874,7 +1061,7 @@ static inline int GetConceptReactorJoyButton(int crKey) {
 static int IsConceptReactorHeld(void) {
     int crKey = GetConceptReactorKey();
 
-    void *pInputMgr = *(void**)0x5ac9b4;
+    void *pInputMgr = *(void**)g_A->InputMgr;
     if (pInputMgr && !IsBadReadPtr(pInputMgr, 16)) {
         if (orig_IsKeyPressed(pInputMgr, crKey)) {
             return 1;
@@ -910,7 +1097,7 @@ static volatile int g_DifficultyConfirmed = 0;
 
 static int IsCancelHeld(void) {
     if ((GetAsyncKeyState('X') & 0x8000) || (GetAsyncKeyState(VK_ESCAPE) & 0x8000)) return 1;
-    void *pInputMgr = *(void**)0x5ac9b4;
+    void *pInputMgr = *(void**)g_A->InputMgr;
     if (pInputMgr && !IsBadReadPtr(pInputMgr, 16)) {
         if (orig_IsKeyPressed(pInputMgr, 'X') || orig_IsKeyPressed(pInputMgr, VK_ESCAPE) ||
             orig_IsKeyPressed(pInputMgr, 0x1B) || orig_IsKeyPressed(pInputMgr, 0x2D)) {
@@ -929,11 +1116,11 @@ static int IsCancelHeld(void) {
 }
 
 static int IsRefrainWindowOpen(void) {
-    DWORD *pTasks = (DWORD*)0x5ba0a8;
+    DWORD *pTasks = (DWORD*)g_A->Tasks;
     for (DWORD i = 0; i < 6000; i++) {
         DWORD pTask = pTasks[i];
-        if (pTask >= 0x00400000 && pTask < 0x7FFF0000 && ((uintptr_t)pTask & 3) == 0) {
-            if (*(DWORD*)pTask == 0x004B9A20) {
+        if (pTask >= 0x10000 && pTask < 0x7FFF0000 && ((uintptr_t)pTask & 3) == 0) {
+            if (*(DWORD*)pTask == g_A->vtTask) {
                 DWORD fn = *(DWORD*)(pTask + 0x1C);
                 DWORD active = *(DWORD*)(pTask + 0x20);
                 if (fn >= 82 && fn <= 112 && active > 0) {
@@ -947,20 +1134,19 @@ static int IsRefrainWindowOpen(void) {
 
 static void SetGameInfoInt(const char *key, int value) {
     if (!key) return;
-    DWORD oldMode = *(volatile DWORD*)0x4d2378;
-    *(volatile DWORD*)0x4d2378 = 1;
+    DWORD oldMode = VD(GameMode);
+    VD(GameMode) = 1;
     __asm__ __volatile__(
         "pushl %0\n\t"
         "movl $0xffffffff, %%edx\n\t"
         "movl %1, %%ecx\n\t"
-        "movl $0x0044fca0, %%eax\n\t"
-        "call *%%eax\n\t"
+        "call *%2\n\t"
         "addl $4, %%esp\n\t"
         :
-        : "r"((DWORD)value), "r"(key)
+        : "r"((DWORD)value), "r"(key), "r"(g_A->fnSetGameInfoInt)
         : "eax", "ecx", "edx", "memory"
     );
-    *(volatile DWORD*)0x4d2378 = oldMode;
+    VD(GameMode) = oldMode;
     LogMessage("SetGameInfoInt (0x0044fca0): key='%s' -> set to %d", key, value);
 }
 
@@ -987,7 +1173,7 @@ static void RestoreGlobalData(void) {
         g_GlobalDatBackupLen = 0;
     }
     typedef void (__cdecl *PFN_LoadGlobalData)(void);
-    PFN_LoadGlobalData pfnLoadGlobalData = (PFN_LoadGlobalData)0x0042a8e0;
+    PFN_LoadGlobalData pfnLoadGlobalData = (PFN_LoadGlobalData)g_A->fnLoadGlobal;
     pfnLoadGlobalData();
     LogMessage("RestoreGlobalData: reloaded clean global data via LoadGlobalData (0x0042a8e0)");
 }
@@ -1010,7 +1196,7 @@ void __attribute__((naked)) Hook_SaveGlobalData(void) {
         "pushl %%ebp\n\t"
         "movl %%esp, %%ebp\n\t"
         "pushl $-1\n\t"
-        "movl $0x0042c335, %%eax\n\t"
+        "movl _g_SaveGlobalRetAddr, %%eax\n\t"
         "jmp *%%eax\n\t"
         "1:\n\t"
         "popal\n\t"
@@ -1051,7 +1237,7 @@ void __attribute__((naked)) Hook_SetGameInfoInt(void) {
         "pushl %%ebp\n\t"
         "movl %%esp, %%ebp\n\t"
         "pushl $-1\n\t"
-        "movl $0x0044fca5, %%eax\n\t"
+        "movl _g_SetGameInfoIntRetAddr, %%eax\n\t"
         "jmp *%%eax\n\t"
         "1:\n\t"
         "popal\n\t"
@@ -1077,18 +1263,18 @@ static int OrigGetGameInfoInt(const char *key, int format) {
         "pushl %%ebp\n\t"
         "movl %%esp, %%ebp\n\t"
         "pushl $-1\n\t"
-        "movl $0x0044fb85, %%eax\n\t"
+        "movl %2, %%eax\n\t"
         "jmp *%%eax\n\t"
         "2:\n\t"
         : "=r"(res)
-        : "r"(key), "r"(format)
+        : "r"(key), "r"(format), "r"(g_A->fnGetGameInfoIntRet)
         : "eax", "ecx", "edx", "memory"
     );
     return res;
 }
 
 unsigned char __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key) {
-    DWORD currentScene = *(volatile DWORD*)0x5c073c;
+    DWORD currentScene = VD(Scene);
     if (g_ShowStageMenu) return 0;
 
     if (g_CancelDebounceActive && MatchSimulatedKey(SIMKEY_CANCEL, key)) {
@@ -1113,16 +1299,16 @@ unsigned char __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key)
 
     if (currentScene == 1 && g_RefrainWindowState == 1 && IsRefrainWindowOpen() && !g_ShowStageMenu && !g_AutoAdvanceToDifficulty && !IsReplayOrDemo() && res) {
         if (key == VK_UP || key == 'W' || key == 'w' || key == 0x26 || key == 0xC8) {
-            DWORD diff = *(volatile DWORD*)0x5b8e28;
-            DWORD isUnlocked = (!IsBadReadPtr((void*)0x5ac4d4, 4) && *(volatile DWORD*)0x5ac4d4) ? 1 : 0;
+            DWORD diff = VD(Diff);
+            DWORD isUnlocked = (!IsBadReadPtr((void*)g_A->Unlock, 4) && VD(Unlock)) ? 1 : 0;
             if (g_RefrainSubMenuCursor > 0) g_RefrainSubMenuCursor--;
             if (g_RefrainSubMenuCursor == 1 && !(diff >= 2 && isUnlocked)) g_RefrainSubMenuCursor = 0;
             g_SelectedReMode = (g_RefrainSubMenuCursor == 1 && diff >= 2 && isUnlocked) ? 1 : 0;
             SetGameInfoInt("lastRefRain", g_SelectedReMode);
             LogMessage("Hook_IsKeyTriggered: UP triggered -> subCursor=%d, SelectedReMode=%d", g_RefrainSubMenuCursor, g_SelectedReMode);
         } else if (key == VK_DOWN || key == 'S' || key == 's' || key == 0x28 || key == 0xD0) {
-            DWORD diff = *(volatile DWORD*)0x5b8e28;
-            DWORD isUnlocked = (!IsBadReadPtr((void*)0x5ac4d4, 4) && *(volatile DWORD*)0x5ac4d4) ? 1 : 0;
+            DWORD diff = VD(Diff);
+            DWORD isUnlocked = (!IsBadReadPtr((void*)g_A->Unlock, 4) && VD(Unlock)) ? 1 : 0;
             if (g_RefrainSubMenuCursor == 0 && diff >= 2 && isUnlocked) {
                 g_RefrainSubMenuCursor = 1;
                 g_SelectedReMode = 1;
@@ -1151,8 +1337,8 @@ unsigned char __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key)
         if (IsRefrainWindowOpen() && g_RefrainWindowState == 1 && g_RePromptFrames >= 2 &&
             g_RefrainSubMenuCursor != 2 &&
             freshEdge && IsConceptReactorHeld()) {
-            DWORD diff = *(volatile DWORD*)0x5b8e28;
-            DWORD isUnlocked = (!IsBadReadPtr((void*)0x5ac4d4, 4) && *(volatile DWORD*)0x5ac4d4) ? 1 : 0;
+            DWORD diff = VD(Diff);
+            DWORD isUnlocked = (!IsBadReadPtr((void*)g_A->Unlock, 4) && VD(Unlock)) ? 1 : 0;
             g_RefrainSubMenuCursor = (g_RefrainSubMenuCursor == 1 && diff >= 2 && isUnlocked) ? 1 : 0;
             g_SelectedReMode = g_RefrainSubMenuCursor;
             g_ShowStageMenu = 1;
@@ -1160,7 +1346,7 @@ unsigned char __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key)
             g_ActiveColumn = 0;
             g_StageSelected = 0;
             g_PracticeMode = 1;
-            DWORD curChar = *(volatile DWORD*)0x5b9774;
+            DWORD curChar = VD(Char);
             if (curChar <= 2) g_PracticeChar = curChar;
             PlayGameSE(1040);
             LogMessage("DECIDE key=0x%02X with Concept Reactor hold on Re-mode prompt -> swallowing confirm, Stage Menu opens NOW (char=%lu, diff=%lu, subCursor=%d, ReMode=%d)",
@@ -1183,15 +1369,27 @@ DWORD __cdecl HandleSetLives(DWORD origLives) {
 
 void __attribute__((naked)) Hook_SetLives(void) {
     __asm__ __volatile__(
+        "cmpl $0, _g_IsSteam\n\t"
+        "jne 1f\n\t"
         "pushl 0x8(%%ebp)\n\t"
+        "jmp 2f\n\t"
+        "1:\n\t"
+        "pushl 0x8(%%ebx)\n\t"
+        "2:\n\t"
         "call _HandleSetLives\n\t"
         "addl $4, %%esp\n\t"
-        "movl %%eax, 0x5b8e08\n\t"
+        "movl _g_A_Lives, %%edx\n\t"
+        "movl %%eax, (%%edx)\n\t"
+        "cmpl $0, _g_IsSteam\n\t"
+        "jne 3f\n\t"
         "popl %%edi\n\t"
         "popl %%esi\n\t"
         "movl %%ebp, %%esp\n\t"
         "popl %%ebp\n\t"
         "ret\n\t"
+        "3:\n\t"
+        "movl _g_DispatchEpilogue, %%eax\n\t"
+        "jmp *%%eax\n\t"
         :
         :
     );
@@ -1211,15 +1409,27 @@ DWORD __cdecl HandleSetMefa(DWORD origDword) {
 
 void __attribute__((naked)) Hook_SetMefa(void) {
     __asm__ __volatile__(
+        "cmpl $0, _g_IsSteam\n\t"
+        "jne 1f\n\t"
         "pushl 0x8(%%ebp)\n\t"
+        "jmp 2f\n\t"
+        "1:\n\t"
+        "pushl 0x8(%%ebx)\n\t"
+        "2:\n\t"
         "call _HandleSetMefa\n\t"
         "addl $4, %%esp\n\t"
-        "movl %%eax, 0x5b9770\n\t"
+        "movl _g_A_Mefa, %%edx\n\t"
+        "movl %%eax, (%%edx)\n\t"
+        "cmpl $0, _g_IsSteam\n\t"
+        "jne 3f\n\t"
         "popl %%edi\n\t"
         "popl %%esi\n\t"
         "movl %%ebp, %%esp\n\t"
         "popl %%ebp\n\t"
         "ret\n\t"
+        "3:\n\t"
+        "movl _g_DispatchEpilogue, %%eax\n\t"
+        "jmp *%%eax\n\t"
         :
         :
     );
@@ -1239,15 +1449,27 @@ DWORD __cdecl HandleSetCR(DWORD origDword) {
 
 void __attribute__((naked)) Hook_SetCR(void) {
     __asm__ __volatile__(
+        "cmpl $0, _g_IsSteam\n\t"
+        "jne 1f\n\t"
         "pushl 0x8(%%ebp)\n\t"
+        "jmp 2f\n\t"
+        "1:\n\t"
+        "pushl 0x8(%%ebx)\n\t"
+        "2:\n\t"
         "call _HandleSetCR\n\t"
         "addl $4, %%esp\n\t"
-        "movl %%eax, 0x5b976c\n\t"
+        "movl _g_A_Cr, %%edx\n\t"
+        "movl %%eax, (%%edx)\n\t"
+        "cmpl $0, _g_IsSteam\n\t"
+        "jne 3f\n\t"
         "popl %%edi\n\t"
         "popl %%esi\n\t"
         "movl %%ebp, %%esp\n\t"
         "popl %%ebp\n\t"
         "ret\n\t"
+        "3:\n\t"
+        "movl _g_DispatchEpilogue, %%eax\n\t"
+        "jmp *%%eax\n\t"
         :
         :
     );
@@ -1256,7 +1478,7 @@ void __attribute__((naked)) Hook_SetCR(void) {
 DWORD __cdecl HandleSetDifficulty(DWORD diff) {
     g_RefrainWindowState = 1;
     g_DifficultyConfirmed = 1;
-    DWORD isUnlocked = (!IsBadReadPtr((void*)0x5ac4d4, 4) && *(volatile DWORD*)0x5ac4d4) ? 1 : 0;
+    DWORD isUnlocked = (!IsBadReadPtr((void*)g_A->Unlock, 4) && VD(Unlock)) ? 1 : 0;
     if (!g_AutoAdvanceToDifficulty) {
         int nativeVal = OrigGetGameInfoInt("lastRefRain", -1);
         int effectiveRe = (nativeVal == 1 && diff >= 2 && isUnlocked) ? 1 : 0;
@@ -1274,15 +1496,27 @@ DWORD __cdecl HandleSetDifficulty(DWORD diff) {
 
 void __attribute__((naked)) Hook_SetDifficulty(void) {
     __asm__ __volatile__(
+        "cmpl $0, _g_IsSteam\n\t"
+        "jne 1f\n\t"
         "pushl 0x8(%%ebp)\n\t"
+        "jmp 2f\n\t"
+        "1:\n\t"
+        "pushl 0x8(%%ebx)\n\t"
+        "2:\n\t"
         "call _HandleSetDifficulty\n\t"
         "addl $4, %%esp\n\t"
-        "movl %%eax, 0x5b8e28\n\t"
+        "movl _g_A_Diff, %%edx\n\t"
+        "movl %%eax, (%%edx)\n\t"
+        "cmpl $0, _g_IsSteam\n\t"
+        "jne 3f\n\t"
         "popl %%edi\n\t"
         "popl %%esi\n\t"
         "movl %%ebp, %%esp\n\t"
         "popl %%ebp\n\t"
         "ret\n\t"
+        "3:\n\t"
+        "movl _g_DispatchEpilogue, %%eax\n\t"
+        "jmp *%%eax\n\t"
         :
         :
     );
@@ -1291,8 +1525,8 @@ void __attribute__((naked)) Hook_SetDifficulty(void) {
 int __cdecl HandleGetGameInfoInt(const char *key, int format) {
     if (!key || IsBadReadPtr(key, 1)) return -1;
 
-    DWORD diff = *(volatile DWORD*)0x5b8e28;
-    DWORD isUnlocked = (!IsBadReadPtr((void*)0x5ac4d4, 4) && *(volatile DWORD*)0x5ac4d4) ? 1 : 0;
+    DWORD diff = VD(Diff);
+    DWORD isUnlocked = (!IsBadReadPtr((void*)g_A->Unlock, 4) && VD(Unlock)) ? 1 : 0;
     int isRe = (g_SelectedReMode && diff >= 2 && isUnlocked) ? 1 : 0;
 
     if (strcmp(key, "GameInfo_RefRain") == 0) {
@@ -1328,14 +1562,14 @@ int __cdecl HandleGetGameInfoInt(const char *key, int format) {
         return val;
     }
 
-    if (g_PracticeMode && *(volatile DWORD*)0x5c073c == 2) {
+    if (g_PracticeMode && VD(Scene) == 2) {
         if (strcmp(key, "GameInfo_NoMiss") == 0 ||
             strncmp(key, "stageClear2", 11) == 0 ||
             strncmp(key, "stageClear", 10) == 0) {
-            if (*(volatile DWORD*)0x5c0740 != 1) {
+            if (VD(SceneNext) != 1) {
                 LogMessage("GetGameInfoInt (0x0044fb80): Stage 5 clear detected (key='%s', format=%d, stage=%d) in Practice Mode -> redirecting to Title immediately to skip flavor text",
                            key, format, g_PracticeStage);
-                *(volatile DWORD*)0x5c0740 = 1;
+                VD(SceneNext) = 1;
             }
         }
     }
@@ -1360,7 +1594,7 @@ void __attribute__((naked)) Hook_GetGameInfoInt(void) {
         "pushl %%ebp\n\t"
         "movl %%esp, %%ebp\n\t"
         "pushl $-1\n\t"
-        "movl $0x0044fb85, %%eax\n\t"
+        "movl _g_GetGameInfoIntRetAddr, %%eax\n\t"
         "jmp *%%eax\n\t"
         "1:\n\t"
         "movl %%eax, 28(%%esp)\n\t"
@@ -1372,8 +1606,8 @@ void __attribute__((naked)) Hook_GetGameInfoInt(void) {
 }
 
 DWORD __cdecl HandleGetGameInfoRefRainPractice(void) {
-    DWORD diff = *(volatile DWORD*)0x5b8e28;
-    DWORD isUnlocked = (!IsBadReadPtr((void*)0x5ac4d4, 4) && *(volatile DWORD*)0x5ac4d4) ? 1 : 0;
+    DWORD diff = VD(Diff);
+    DWORD isUnlocked = (!IsBadReadPtr((void*)g_A->Unlock, 4) && VD(Unlock)) ? 1 : 0;
     if (g_SelectedReMode && diff >= 2 && isUnlocked) {
         LogMessage("HandleGetGameInfoRefRain (0x0043078E): Practice Re:MODE -> returning 1 (diff=%lu)", diff);
         return 1;
@@ -1393,7 +1627,7 @@ void __attribute__((naked)) Hook_GetGameInfoRefRain(void) {
         "popal\n\t"
         "ret\n\t"
         "1:\n\t"
-        "movl $0x0044fb80, %%eax\n\t"
+        "movl _g_GetGameInfoIntFn, %%eax\n\t"
         "jmp *%%eax\n\t"
         :
         :
@@ -1401,8 +1635,8 @@ void __attribute__((naked)) Hook_GetGameInfoRefRain(void) {
 }
 
 DWORD __cdecl HandleGetRefRainConfig(DWORD *pVal) {
-    DWORD diff = *(volatile DWORD*)0x5b8e28;
-    DWORD isUnlocked = (!IsBadReadPtr((void*)0x5ac4d4, 4) && *(volatile DWORD*)0x5ac4d4) ? 1 : 0;
+    DWORD diff = VD(Diff);
+    DWORD isUnlocked = (!IsBadReadPtr((void*)g_A->Unlock, 4) && VD(Unlock)) ? 1 : 0;
     if (g_PracticeMode) {
         if (g_SelectedReMode && diff >= 2 && isUnlocked) {
             LogMessage("HandleGetRefRainConfig (0x00441229): Practice Re:MODE -> overriding to 1 (diff=%lu)", diff);
@@ -1427,7 +1661,8 @@ void __attribute__((naked)) Hook_GetRefRainConfig(void) {
         "movl %%eax, 28(%%esp)\n\t"
         "popal\n\t"
         "movl $0xffffffff, -0x4(%%ebp)\n\t"
-        "pushl $0x00441232\n\t"
+        "movl _g_RefRainCfgRetAddr, %%eax\n\t"
+        "pushl %%eax\n\t"
         "ret\n\t"
         :
         :
@@ -1435,15 +1670,15 @@ void __attribute__((naked)) Hook_GetRefRainConfig(void) {
 }
 
 DWORD __cdecl HandleGetterReMode(void) {
-    DWORD currentScene = *(volatile DWORD*)0x5c073c;
+    DWORD currentScene = VD(Scene);
     if (currentScene == 1) {
-        if (!IsBadReadPtr((void*)0x5ac4d4, 4)) {
-            return *(volatile DWORD*)0x5ac4d4 ? 1 : 0;
+        if (!IsBadReadPtr((void*)g_A->Unlock, 4)) {
+            return VD(Unlock) ? 1 : 0;
         }
         return 0;
     }
 
-    DWORD diff = *(volatile DWORD*)0x5b8e28;
+    DWORD diff = VD(Diff);
     if (g_PracticeMode) {
         int res = (g_SelectedReMode && diff >= 2) ? 1 : 0;
         LogMessage("HandleGetterReMode (Stage Practice): diff=%lu, g_SelectedReMode=%d -> returning %d",
@@ -1451,14 +1686,14 @@ DWORD __cdecl HandleGetterReMode(void) {
         return (DWORD)res;
     }
 
-    char *pInputMgr = *(char**)0x5ac9b4;
+    char *pInputMgr = *(char**)g_A->InputMgr;
     if (pInputMgr && (DWORD)pInputMgr > 0x10000 && !IsBadReadPtr(pInputMgr, 16)) {
         char *pGS = *(char**)(pInputMgr + 8);
         if (pGS && (DWORD)pGS > 0x10000 && !IsBadReadPtr(pGS, 0x60)) {
             return *(BYTE*)(pGS + 0x52) ? 1 : 0;
         }
     }
-    return (*(volatile DWORD*)0x5ac674 == 1) ? 1 : 0;
+    return (VD(IsRefRain) == 1) ? 1 : 0;
 }
 
 void __attribute__((naked)) Hook_GetterReMode(void) {
@@ -1559,7 +1794,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     float xCrGauge = xCrStock + colW + colGap;
 
     DWORD curChar = g_PracticeChar;
-    if (!IsBadReadPtr((void*)0x5b9774, 4)) curChar = *(volatile DWORD*)0x5b9774;
+    if (!IsBadReadPtr((void*)g_A->Char, 4)) curChar = VD(Char);
     const PracticeMenuTheme *theme = GetPracticeMenuTheme(curChar);
 
     DWORD borderCol0 = (g_ActiveColumn == 0) ? theme->borderOn : theme->borderOff;
@@ -1580,7 +1815,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
     DWORD titleCol3  = (g_ActiveColumn == 3) ? theme->titleOn : theme->titleOff;
     DWORD titleCol4  = (g_ActiveColumn == 4) ? theme->titleOn : theme->titleOff;
 
-    DWORD diff = *(volatile DWORD*)0x5b8e28;
+    DWORD diff = VD(Diff);
     const char *diffLabel = "NORMAL";
     if (diff == 1) diffLabel = "EASY";
     else if (diff == 2) diffLabel = (g_SelectedReMode ? "Re:NORMAL" : "NORMAL");
@@ -1755,7 +1990,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
 
     ID3DXFont *pFootFont = g_pFooterFont ? g_pFooterFont : g_pFont;
     char help2Buf[256];
-    DWORD isUnlocked = (!IsBadReadPtr((void*)0x5ac4d4, 4) && *(volatile DWORD*)0x5ac4d4) ? 1 : 0;
+    DWORD isUnlocked = (!IsBadReadPtr((void*)g_A->Unlock, 4) && VD(Unlock)) ? 1 : 0;
     if (diff >= 2 && isUnlocked) {
         const char *modeLabel;
         if (diff == 3)      modeLabel = (g_SelectedReMode ? "Re:ADVANCED" : "ADVANCED");
@@ -1920,10 +2155,10 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             UpdateSelectedCr();
             int stage = g_MenuItems[g_MenuCursor].stage;
 
-            DWORD curChar = *(volatile DWORD*)0x5b9774;
+            DWORD curChar = VD(Char);
             if (curChar <= 2) g_PracticeChar = curChar;
 
-            DWORD diff = *(volatile DWORD*)0x5b8e28;
+            DWORD diff = VD(Diff);
             if (diff < 1 || diff > 4) diff = 2;
 
             if (g_SelectedReMode && diff >= 2) {
@@ -1937,8 +2172,8 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             }
 
             DWORD isRefRain = (g_SelectedReMode && diff >= 2) ? 1 : 0;
-            *(volatile DWORD*)0x4d2378 = 1;
-            *(volatile DWORD*)0x5ac674 = isRefRain;
+            VD(GameMode) = 1;
+            VD(IsRefRain) = isRefRain;
             SetGameInfoInt("GameInfo_RefRain", isRefRain);
             SetGameInfoInt("lastRefRain", isRefRain);
             g_ShowStageMenu = 0;
@@ -1952,7 +2187,7 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             InterlockedExchange(&g_PendingReset, 1);
             ResetStageScore();
             BackupGlobalData();
-            *(volatile DWORD*)0x5c0740 = 2 + stage;
+            VD(SceneNext) = 2 + stage;
             PlayGameSE(1040);
             LogMessage("All confirmed -> Starting Stage %d (char=%lu, Lives=%d, MEFA stocks=%d, dw=0x%08X, CR Stock=%d, CR Gauge=%s, CR Total=0x%08X)",
                        stage, g_PracticeChar, g_SelectedLives, g_MefaItems[g_MefaCursor].value, g_SelectedMefaDword,
@@ -2005,10 +2240,10 @@ void __cdecl OnRenderMenu(IDirect3DDevice9 *pDevice) {
             g_SimulatedKeyAction = SIMKEY_NONE;
             g_ActiveColumn = 0;
             PlayGameSE(1048);
-            DWORD prevScene = *(volatile DWORD*)0x5c073c;
+            DWORD prevScene = VD(Scene);
             if (prevScene != 1) {
                 g_CancelToTitle = 1;
-                *(volatile DWORD*)0x5c0740 = 1;
+                VD(SceneNext) = 1;
                 LogMessage("Stage Menu Cancel -> Redirecting to Title (prevScene=%lu)", prevScene);
             } else {
                 g_CancelToTitle = 0;
@@ -2063,7 +2298,7 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
     }
 
     {
-        DWORD curScene = *(volatile DWORD*)0x5c073c;
+        DWORD curScene = VD(Scene);
         int promptUp = (curScene == 1 && !g_ShowStageMenu && !g_AutoAdvanceToDifficulty &&
                         !IsReplayOrDemo() && IsRefrainWindowOpen() && g_RefrainWindowState == 1);
         if (promptUp) {
@@ -2078,46 +2313,46 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
         uMefa.dw = g_SelectedMefaDword;
         uCr.dw = g_SelectedCrDword;
 
-        *(volatile DWORD*)0x5b8e08 = (DWORD)g_SelectedLives;
-        *(volatile DWORD*)0x5b9770 = g_SelectedMefaDword;
-        *(volatile DWORD*)0x5b976c = g_SelectedCrDword;
+        VD(Lives) = (DWORD)g_SelectedLives;
+        VD(Mefa) = g_SelectedMefaDword;
+        VD(Cr) = g_SelectedCrDword;
 
-        char *pGameState = *(char**)0x5ac9b0;
+        char *pGameState = *(char**)g_A->Config;
         if (pGameState && (DWORD)pGameState > 0x10000 && !IsBadReadPtr(pGameState, 0x200)) {
             for (int s = 1; s <= 6; s++) {
                 *(DWORD*)(pGameState + s * 4 + 0x115) = (DWORD)g_SelectedLives;
                 *(DWORD*)(pGameState + s * 4 + 0x12d) = g_SelectedMefaDword;
                 *(DWORD*)(pGameState + s * 4 + 0x145) = g_SelectedCrDword;
             }
-            DWORD diff = *(volatile DWORD*)0x5b8e28;
+            DWORD diff = VD(Diff);
             if (diff < 1 || diff > 4) diff = 2;
             BYTE isRe = (g_SelectedReMode && diff >= 2) ? 1 : 0;
             *(BYTE*)(pGameState + 0x52) = isRe;
         }
 
-        char *pInputMgr = *(char**)0x5ac9b4;
+        char *pInputMgr = *(char**)g_A->InputMgr;
         if (pInputMgr && (DWORD)pInputMgr > 0x10000 && !IsBadReadPtr(pInputMgr, 16)) {
             char *pGS = *(char**)(pInputMgr + 8);
             if (pGS && (DWORD)pGS > 0x10000 && !IsBadReadPtr(pGS, 0x60)) {
-                DWORD diff = *(volatile DWORD*)0x5b8e28;
+                DWORD diff = VD(Diff);
                 if (diff < 1 || diff > 4) diff = 2;
                 BYTE isRe = (g_SelectedReMode && diff >= 2) ? 1 : 0;
                 *(BYTE*)(pGS + 0x52) = isRe;
             }
         }
 
-        DWORD diff = *(volatile DWORD*)0x5b8e28;
+        DWORD diff = VD(Diff);
         if (diff < 1 || diff > 4) diff = 2;
         DWORD isRefRain = (g_SelectedReMode && diff >= 2) ? 1 : 0;
-        DWORD curChar = *(volatile DWORD*)0x5b9774;
+        DWORD curChar = VD(Char);
         if (curChar < 1 || curChar > 3) curChar = 1;
-        *(volatile DWORD*)0x5abb80 = (curChar - 1) + 3 * ((diff - 1) + 4 * isRefRain);
-        *(volatile DWORD*)0x4d2378 = 1;
-        *(volatile DWORD*)0x5ac674 = isRefRain;
+        VD(ViewIdx) = (curChar - 1) + 3 * ((diff - 1) + 4 * isRefRain);
+        VD(GameMode) = 1;
+        VD(IsRefRain) = isRefRain;
 
-        DWORD pPlayer = *(volatile DWORD*)0x5b9778;
-        DWORD frameCount = *(volatile DWORD*)0x5abb78;
-        DWORD currentScene = *(volatile DWORD*)0x5c073c;
+        DWORD pPlayer = VD(Player);
+        DWORD frameCount = VD(FrameCnt);
+        DWORD currentScene = VD(Scene);
 
         g_StageInitRenderFrames++;
 
@@ -2131,11 +2366,11 @@ void __cdecl OnRenderHook(IDirect3DDevice9 *pDevice) {
         }
     }
 
-    DWORD currentScene = *(volatile DWORD*)0x5c073c;
+    DWORD currentScene = VD(Scene);
 
     static int scriptDumped = 0;
     if (!scriptDumped && currentScene == 1) {
-        char *pScript = *(char**)0x5c0760;
+        char *pScript = *(char**)g_A->Script;
         if (pScript && (DWORD)pScript > 0x10000 && !IsBadReadPtr(pScript, 0x100)) {
             DWORD size = *(DWORD*)(pScript + 8);
             if (size > 0 && size < 0x200000 && !IsBadReadPtr(pScript, size)) {
@@ -2256,7 +2491,8 @@ void __attribute__((naked)) Hook_EndScene(void) {
         "movl (%%ecx), %%eax\n\t"
         "call *0xa8(%%eax)\n\t"
         "pushal\n\t"
-        "movl 0x4df338, %%eax\n\t"
+        "movl _g_A_GpuQueue, %%eax\n\t"
+        "movl (%%eax), %%eax\n\t"
         "pushl %%eax\n\t"
         "call _FlushGPUQueue\n\t"
         "addl $4, %%esp\n\t"
@@ -2284,7 +2520,7 @@ void __cdecl HandleSceneCheck(DWORD *pEdx) {
 }
 
 static char *GetReplayGameState(void) {
-    char *pInputMgr = *(char**)0x5ac9b4;
+    char *pInputMgr = *(char**)g_A->InputMgr;
     if (pInputMgr && (DWORD)pInputMgr > 0x10000 && !IsBadReadPtr(pInputMgr, 0x20)) {
         if (*(DWORD*)(pInputMgr + 4) == 4) {
             char *pReplayGS = *(char**)(pInputMgr + 8);
@@ -2293,7 +2529,7 @@ static char *GetReplayGameState(void) {
             }
         }
     }
-    char *pGS = *(char**)0x5ac9b0;
+    char *pGS = *(char**)g_A->Config;
     if (pGS && (DWORD)pGS > 0x10000 && !IsBadReadPtr(pGS, 0x200)) {
         return pGS;
     }
@@ -2321,8 +2557,8 @@ static int ReplayHasStage(int stage) {
 }
 
 DWORD __cdecl HandleTrans(void) {
-    DWORD prevScene = *(volatile DWORD*)0x5c073c;
-    DWORD nextScene = *(volatile DWORD*)0x5c0740;
+    DWORD prevScene = VD(Scene);
+    DWORD nextScene = VD(SceneNext);
 
     if (g_PauseRetryAll && prevScene != nextScene &&
         (prevScene == 2 || (prevScene >= 3 && prevScene <= 10))) {
@@ -2340,7 +2576,7 @@ DWORD __cdecl HandleTrans(void) {
             g_StageInitRenderFrames = 0;
             InterlockedExchange(&g_PendingReset, 1);
             ResetStageScore();
-            *(volatile DWORD*)0x5c0740 = retryScene;
+            VD(SceneNext) = retryScene;
             LogMessage("Pause hotkey R: restarting current Practice stage %d (scene=%lu), skipping Practice menu",
                        g_PracticeStage, retryScene);
             return prevScene;
@@ -2370,7 +2606,7 @@ DWORD __cdecl HandleTrans(void) {
 
     if (IsReplayOrDemo()) {
         LogMessage("Trans: Replay/Demo playback detected (replaySlot=%ld, mode=%lu) -> passing through without menu",
-                   (long)*(volatile DWORD*)0x4d237c, *(volatile DWORD*)0x4d2378);
+                   (long)VD(ReplaySlot), VD(GameMode));
         return prevScene;
     }
 
@@ -2380,10 +2616,10 @@ DWORD __cdecl HandleTrans(void) {
 
         RestoreGlobalData();
 
-        DWORD curChar = *(volatile DWORD*)0x5b9774;
+        DWORD curChar = VD(Char);
         if (curChar <= 2) g_PracticeChar = curChar;
-        DWORD diff = *(volatile DWORD*)0x5b8e28;
-        DWORD isUnlocked = (!IsBadReadPtr((void*)0x5ac4d4, 4) && *(volatile DWORD*)0x5ac4d4) ? 1 : 0;
+        DWORD diff = VD(Diff);
+        DWORD isUnlocked = (!IsBadReadPtr((void*)g_A->Unlock, 4) && VD(Unlock)) ? 1 : 0;
         int effectiveRe = (g_SelectedReMode && diff >= 2 && isUnlocked) ? 1 : 0;
         SetGameInfoInt("lastRefRain", effectiveRe);
 
@@ -2395,7 +2631,7 @@ DWORD __cdecl HandleTrans(void) {
         g_DifficultyConfirmed = 0;
         g_SimulatedKeyAction = SIMKEY_NONE;
         g_StageSelected = 0;
-        *(volatile DWORD*)0x5c0740 = 1;
+        VD(SceneNext) = 1;
         return prevScene;
     }
 
@@ -2403,7 +2639,7 @@ DWORD __cdecl HandleTrans(void) {
         if (g_ShowStageMenu) {
             if (prevScene == 1 && !g_AutoAdvanceToDifficulty) {
                 LogMessage("Trans: suppressing game-initiated stage load while Stage Menu open (prev=%lu next=%lu)", prevScene, nextScene);
-                *(volatile DWORD*)0x5c0740 = 1;
+                VD(SceneNext) = 1;
             }
             return prevScene;
         }
@@ -2446,7 +2682,8 @@ void __attribute__((naked)) Hook_Trans(void) {
 
 void __attribute__((naked)) Hook_SceneCheck(void) {
     __asm__ __volatile__(
-        "movl 0x5c0740, %%edx\n\t"
+        "movl _g_A_SceneNext, %%edx\n\t"
+        "movl (%%edx), %%edx\n\t"
         "pushl %%edx\n\t"
         "pushl %%ecx\n\t"
         "pushl %%eax\n\t"
@@ -2505,7 +2742,10 @@ void __attribute__((naked)) Hook_LoadStart(void) {
         "popal\n\t"
         "jnz 1f\n\t"
         "xorl %%ecx, %%ecx\n\t"
-        "movl $1, 0x5ac4dc\n\t"
+        "pushl %%eax\n\t"
+        "movl _g_A_LoadFlag, %%eax\n\t"
+        "movl $1, (%%eax)\n\t"
+        "popl %%eax\n\t"
         "jmp *%0\n\t"
         "1:\n\t"
         "jmp *%1\n\t"
@@ -2560,33 +2800,33 @@ static void ResetStageScore(void) {
     uMefa.dw = g_SelectedMefaDword;
     uCr.dw = g_SelectedCrDword;
 
-    *(volatile DWORD*)0x5abb78 = 0;
-    *(volatile DWORD*)0x5abb74 = 0;
-    *(volatile DWORD*)0x5abb70 = 0x3c;
+    VD(FrameCnt) = 0;
+    VD(Frame2) = 0;
+    VD(Frame1) = 0x3c;
 
-    *(volatile DWORD*)0x5b8e20 = 0;
-    *(volatile DWORD*)0x5b8e24 = 0;
-    *(volatile DWORD*)0x5b8e08 = (DWORD)g_SelectedLives;
-    *(volatile DWORD*)0x5b8e1c = 0;
-    *(volatile DWORD*)0x5b8e14 = 0;
-    *(volatile DWORD*)0x5b8e10 = 0;
-    *(volatile DWORD*)0x5b8e18 = 0;
-    *(volatile DWORD*)0x5b9770 = g_SelectedMefaDword;
-    *(volatile DWORD*)0x5b976c = g_SelectedCrDword;
-    *(volatile BYTE*)0x5b975d = 0;
+    VD(St20) = 0;
+    VD(St24) = 0;
+    VD(Lives) = (DWORD)g_SelectedLives;
+    VD(St1c) = 0;
+    VD(St14) = 0;
+    VD(St10) = 0;
+    VD(St18) = 0;
+    VD(Mefa) = g_SelectedMefaDword;
+    VD(Cr) = g_SelectedCrDword;
+    VB(Var5b975d) = 0;
 
-    DWORD diff = *(volatile DWORD*)0x5b8e28;
+    DWORD diff = VD(Diff);
     if (diff < 1 || diff > 4) diff = 2;
     DWORD isRefRain = (g_SelectedReMode && diff >= 2) ? 1 : 0;
-    DWORD curChar = *(volatile DWORD*)0x5b9774;
+    DWORD curChar = VD(Char);
     if (curChar < 1 || curChar > 3) curChar = 1;
-    *(volatile DWORD*)0x5abb80 = (curChar - 1) + 3 * ((diff - 1) + 4 * isRefRain);
-    *(volatile DWORD*)0x4d2378 = 1;
-    *(volatile DWORD*)0x5ac674 = isRefRain;
+    VD(ViewIdx) = (curChar - 1) + 3 * ((diff - 1) + 4 * isRefRain);
+    VD(GameMode) = 1;
+    VD(IsRefRain) = isRefRain;
     SetGameInfoInt("GameInfo_RefRain", isRefRain);
     SetGameInfoInt("lastRefRain", isRefRain);
 
-    char *pGameState = *(char**)0x5ac9b0;
+    char *pGameState = *(char**)g_A->Config;
     if (pGameState && (DWORD)pGameState > 0x10000) {
         *(BYTE*)(pGameState + 0x52) = (BYTE)isRefRain;
         for (int s = 1; s <= 6; s++) {
@@ -2620,23 +2860,19 @@ static void ResetStageScore(void) {
 static const int g_PauseDiag = 1;
 #define PD_NRANGE 6
 #define PD_MAXDW 128
-static const DWORD g_pdRange[PD_NRANGE][2] = {
-    { 0x5abb60, 0x5abbc0 }, { 0x5b8e00, 0x5b8e70 }, { 0x5ac4c0, 0x5ac4f0 },
-    { 0x5ac670, 0x5ac680 }, { 0x4d2370, 0x4d2380 }, { 0x5c0730, 0x5c0760 }
-};
 static volatile int g_pdFrozen = 0;
 
 static void PauseDiagKey(int key) {
     if (!g_PauseDiag) return;
     LogMessage("PauseDiag: IsKeyTriggered key=0x%02X scene=%lu next=%lu frame=%lu frozen=%d", key,
-               *(volatile DWORD*)0x5c073c, *(volatile DWORD*)0x5c0740,
-               *(volatile DWORD*)0x5abb78, g_pdFrozen);
+               VD(Scene), VD(SceneNext),
+               VD(FrameCnt), g_pdFrozen);
 }
 
 static int PauseDiagSnap(DWORD *dst, DWORD *addrs) {
     int n = 0;
     for (int r = 0; r < PD_NRANGE; r++) {
-        for (DWORD a = g_pdRange[r][0]; a < g_pdRange[r][1] && n < PD_MAXDW; a += 4) {
+        for (DWORD a = g_A->pdRange[r][0]; a < g_A->pdRange[r][1] && n < PD_MAXDW; a += 4) {
             addrs[n] = a;
             dst[n] = IsBadReadPtr((void*)a, 4) ? 0 : *(volatile DWORD*)a;
             n++;
@@ -2667,14 +2903,14 @@ static DWORD WINAPI PauseDiagThread(LPVOID param) {
     for (;;) {
         DWORD sc, nx, pd, slot, obj, fr;
         Sleep(1);
-        sc = *(volatile DWORD*)0x5c073c;
-        nx = *(volatile DWORD*)0x5c0740;
-        pd = *(volatile DWORD*)0x5c0744;
-        slot = *(volatile DWORD*)0x4d237c;
-        obj = *(volatile DWORD*)0x5b8e68;
+        sc = VD(Scene);
+        nx = VD(SceneNext);
+        pd = VD(ScenePend);
+        slot = VD(ReplaySlot);
+        obj = VD(Obj);
         if (sc != prevScene || nx != prevNext || pd != prevPend || slot != prevSlot || obj != prevObj) {
             LogMessage("PauseDiag: scene cur=%lu next=%lu pend=%lu replaySlot=%ld sceneObj=%08lX frame=%lu mode=%lu",
-                       sc, nx, pd, (long)slot, obj, *(volatile DWORD*)0x5abb78, *(volatile DWORD*)0x4d2378);
+                       sc, nx, pd, (long)slot, obj, VD(FrameCnt), VD(GameMode));
             prevScene = sc; prevNext = nx; prevPend = pd; prevSlot = slot; prevObj = obj;
         }
         if (!((sc >= 2 && sc <= 7) || sc == 10)) {
@@ -2683,7 +2919,7 @@ static DWORD WINAPI PauseDiagThread(LPVOID param) {
             lastFrame = 0xffffffff;
             continue;
         }
-        fr = *(volatile DWORD*)0x5abb78;
+        fr = VD(FrameCnt);
         if (fr != lastFrame) {
             lastFrame = fr;
             lastMove = GetTickCount();
@@ -2718,7 +2954,7 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
             continue;
         }
 
-        DWORD currentScene = *(volatile DWORD*)0x5c073c;
+        DWORD currentScene = VD(Scene);
 
         for (int i = 0; i < 5; i++) {
             int is_down = (GetAsyncKeyState(VK_F1 + i) & 0x8000) != 0;
@@ -2731,11 +2967,11 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
                         } else {
                             LogMessage("Hotkey F%d -> Replay seeking to Stage %d", stage, stage);
                             g_StageSelected = 1;
-                            *(volatile DWORD*)0x5c0740 = 2 + stage;
+                            VD(SceneNext) = 2 + stage;
                             PlayGameSE(1040);
                         }
                     } else if (g_PracticeMode) {
-                        DWORD diff = *(volatile DWORD*)0x5b8e28;
+                        DWORD diff = VD(Diff);
                         if (stage == 5 && diff == 1) {
                             LogMessage("Hotkey F%d -> Stage %d blocked on Easy difficulty", stage, stage);
                         } else {
@@ -2748,7 +2984,7 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
                         InterlockedExchange(&g_PendingReset, 1);
                         ResetStageScore();
                         BackupGlobalData();
-                        *(volatile DWORD*)0x5c0740 = 2 + stage;
+                        VD(SceneNext) = 2 + stage;
                         PlayGameSE(1040);
                         }
                     }
@@ -2763,9 +2999,8 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
 static void InstallHooks(void) {
     DWORD oldProtect;
 
-    void *transAddr = (void*)0x00440deb;
-    unsigned char expectedTrans[5] = { 0xA1, 0x3C, 0x07, 0x5C, 0x00 };
-    if (memcmp(transAddr, expectedTrans, 5) == 0) {
+    void *transAddr = (void*)g_A->TransSite;
+    if (memcmp(transAddr, g_Sigs.Trans, 5) == 0) {
         if (VirtualProtect(transAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[5];
             patch[0] = 0xE8;
@@ -2780,9 +3015,8 @@ static void InstallHooks(void) {
         LogMessage("[Error] Trans signature at 0x%08X did not match!", transAddr);
     }
 
-    void *loadStartAddr = (void*)0x00441097;
-    unsigned char expectedLoadStart[7] = { 0x32, 0xC9, 0xC7, 0x05, 0xDC, 0xC4, 0x5A };
-    if (memcmp(loadStartAddr, expectedLoadStart, 7) == 0) {
+    void *loadStartAddr = (void*)g_A->LoadStartSite;
+    if (memcmp(loadStartAddr, g_Sigs.LoadStart, 7) == 0) {
         if (VirtualProtect(loadStartAddr, 7, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[7];
             patch[0] = 0xE9;
@@ -2799,9 +3033,8 @@ static void InstallHooks(void) {
         LogMessage("[Error] LoadStart signature at 0x%08X did not match!", loadStartAddr);
     }
 
-    void *sceneAddr = (void*)0x00440ff8;
-    unsigned char expectedScene[6] = { 0x8B, 0x15, 0x40, 0x07, 0x5C, 0x00 };
-    if (memcmp(sceneAddr, expectedScene, 6) == 0) {
+    void *sceneAddr = (void*)g_A->SceneCheckSite;
+    if (memcmp(sceneAddr, g_Sigs.SceneCheck, 6) == 0) {
         if (VirtualProtect(sceneAddr, 6, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[6];
             patch[0] = 0xE9;
@@ -2817,9 +3050,8 @@ static void InstallHooks(void) {
         LogMessage("[Error] Memory signature at 0x%08X did not match!", sceneAddr);
     }
 
-    void *endSceneAddr = (void*)0x0046726d;
-    unsigned char expectedEndScene[6] = { 0xFF, 0x90, 0xA8, 0x00, 0x00, 0x00 };
-    if (memcmp(endSceneAddr, expectedEndScene, 6) == 0) {
+    void *endSceneAddr = (void*)g_A->EndSceneSite;
+    if (memcmp(endSceneAddr, g_Sigs.EndScene, 6) == 0) {
         if (VirtualProtect(endSceneAddr, 6, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[6];
             patch[0] = 0xE9;
@@ -2835,34 +3067,38 @@ static void InstallHooks(void) {
         LogMessage("[Error] EndScene signature at 0x%08X did not match!", endSceneAddr);
     }
 
-    void *preTickAddr = (void*)0x0046710d;
-    unsigned char expectedPreTick[5] = { 0xE8, 0xAE, 0x36, 0xFC, 0xFF };
-    if (memcmp(preTickAddr, expectedPreTick, 5) == 0) {
-        if (VirtualProtect(preTickAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            unsigned char patchP[5];
-            patchP[0] = 0xE9;
-            DWORD relOffsetP = (DWORD)Hook_PreTickPollCall - ((DWORD)preTickAddr + 5);
-            memcpy(&patchP[1], &relOffsetP, 4);
-            memcpy(preTickAddr, patchP, 5);
-            VirtualProtect(preTickAddr, 5, oldProtect, &oldProtect);
-            FlushInstructionCache(GetCurrentProcess(), preTickAddr, 5);
-            LogMessage("PreTick input poll hook installed successfully at 0x%08X", preTickAddr);
+    void *preTickAddr = (void*)g_A->PreTickSite;
+    {
+        unsigned char expectedPreTick[5] = { 0xE8, 0, 0, 0, 0 };
+        DWORD relTick = g_A->fnTick - (g_A->PreTickSite + 5);
+        memcpy(&expectedPreTick[1], &relTick, 4);
+        if (memcmp(preTickAddr, expectedPreTick, 5) == 0) {
+            if (VirtualProtect(preTickAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                unsigned char patchP[5];
+                patchP[0] = 0xE9;
+                DWORD relOffsetP = (DWORD)Hook_PreTickPollCall - ((DWORD)preTickAddr + 5);
+                memcpy(&patchP[1], &relOffsetP, 4);
+                memcpy(preTickAddr, patchP, 5);
+                VirtualProtect(preTickAddr, 5, oldProtect, &oldProtect);
+                FlushInstructionCache(GetCurrentProcess(), preTickAddr, 5);
+                LogMessage("PreTick input poll hook installed successfully at 0x%08X", preTickAddr);
+            }
+        } else {
+            LogMessage("[Error] PreTick signature at 0x%08X did not match! (found %02X %02X %02X %02X %02X)",
+                       preTickAddr,
+                       *(unsigned char*)preTickAddr, *(unsigned char*)((DWORD)preTickAddr + 1),
+                       *(unsigned char*)((DWORD)preTickAddr + 2), *(unsigned char*)((DWORD)preTickAddr + 3),
+                       *(unsigned char*)((DWORD)preTickAddr + 4));
         }
-    } else {
-        LogMessage("[Error] PreTick signature at 0x%08X did not match! (found %02X %02X %02X %02X %02X)",
-                   preTickAddr,
-                   *(unsigned char*)preTickAddr, *(unsigned char*)((DWORD)preTickAddr + 1),
-                   *(unsigned char*)((DWORD)preTickAddr + 2), *(unsigned char*)((DWORD)preTickAddr + 3),
-                   *(unsigned char*)((DWORD)preTickAddr + 4));
     }
 
     LARGE_INTEGER liFreq;
     if (QueryPerformanceFrequency(&liFreq)) {
         g_LatQpcFreq = liFreq.QuadPart;
     }
-    PatchIATPtr(0x0048c248, (void*)Mine_GetKeyboardState, (void**)&orig_GetKeyboardState);
-    PatchIATPtr(0x0048c294, (void*)Mine_XInputGetCaps, (void**)&orig_XInputGetCaps);
-    PatchIATPtr(0x0048c298, (void*)Mine_XInputGetState, (void**)&orig_XInputGetState);
+    PatchIATPtr(g_A->iatGetKeyboardState, (void*)Mine_GetKeyboardState, (void**)&orig_GetKeyboardState);
+    PatchIATPtr(g_A->iatXInputGetCaps, (void*)Mine_XInputGetCaps, (void**)&orig_XInputGetCaps);
+    PatchIATPtr(g_A->iatXInputGetState, (void*)Mine_XInputGetState, (void**)&orig_XInputGetState);
     if (!orig_XInputGetState || !orig_XInputGetCaps || !orig_GetKeyboardState) {
         LogMessage("[Error] IAT hook partial: kb=%08X getState=%08X getCaps=%08X",
                    (DWORD)(DWORD_PTR)orig_GetKeyboardState, (DWORD)(DWORD_PTR)orig_XInputGetState,
@@ -2872,12 +3108,8 @@ static void InstallHooks(void) {
                (DWORD)(DWORD_PTR)orig_GetKeyboardState, (DWORD)(DWORD_PTR)orig_XInputGetState,
                (DWORD)(g_LatQpcFreq >> 32), (DWORD)g_LatQpcFreq);
 
-    void *setMefaAddr = (void*)0x00462430;
-    unsigned char expectedSetMefa[13] = {
-        0xF3, 0x0F, 0x10, 0x45, 0x08,
-        0xF3, 0x0F, 0x11, 0x05, 0x70, 0x97, 0x5B, 0x00
-    };
-    if (memcmp(setMefaAddr, expectedSetMefa, 13) == 0) {
+    void *setMefaAddr = (void*)g_A->SetMefaSite;
+    if (memcmp(setMefaAddr, g_Sigs.SetMefa, 13) == 0) {
         if (VirtualProtect(setMefaAddr, 13, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[13];
             patch[0] = 0xE9;
@@ -2893,12 +3125,8 @@ static void InstallHooks(void) {
         LogMessage("[Error] SetMefa signature at 0x%08X did not match!", setMefaAddr);
     }
 
-    void *setCrAddr = (void*)0x00462443;
-    unsigned char expectedSetCr[13] = {
-        0xF3, 0x0F, 0x10, 0x45, 0x08,
-        0xF3, 0x0F, 0x11, 0x05, 0x6C, 0x97, 0x5B, 0x00
-    };
-    if (memcmp(setCrAddr, expectedSetCr, 13) == 0) {
+    void *setCrAddr = (void*)g_A->SetCrSite;
+    if (memcmp(setCrAddr, g_Sigs.SetCr, 13) == 0) {
         if (VirtualProtect(setCrAddr, 13, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[13];
             patch[0] = 0xE9;
@@ -2914,12 +3142,8 @@ static void InstallHooks(void) {
         LogMessage("[Error] SetCR signature at 0x%08X did not match!", setCrAddr);
     }
 
-    void *setLivesAddr = (void*)0x00462535;
-    unsigned char expectedSetLives[8] = {
-        0x8B, 0x45, 0x08,
-        0xA3, 0x08, 0x8E, 0x5B, 0x00
-    };
-    if (memcmp(setLivesAddr, expectedSetLives, 8) == 0) {
+    void *setLivesAddr = (void*)g_A->SetLivesSite;
+    if (memcmp(setLivesAddr, g_Sigs.SetLives, 8) == 0) {
         if (VirtualProtect(setLivesAddr, 8, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[8];
             patch[0] = 0xE9;
@@ -2937,12 +3161,8 @@ static void InstallHooks(void) {
         LogMessage("[Error] SetLives signature at 0x%08X did not match!", setLivesAddr);
     }
 
-    void *setDiffAddr = (void*)0x004625dc;
-    unsigned char expectedSetDiff[8] = {
-        0x8B, 0x45, 0x08,
-        0xA3, 0x28, 0x8E, 0x5B, 0x00
-    };
-    if (memcmp(setDiffAddr, expectedSetDiff, 8) == 0) {
+    void *setDiffAddr = (void*)g_A->SetDiffSite;
+    if (memcmp(setDiffAddr, g_Sigs.SetDiff, 8) == 0) {
         if (VirtualProtect(setDiffAddr, 8, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[8];
             patch[0] = 0xE9;
@@ -2960,9 +3180,8 @@ static void InstallHooks(void) {
         LogMessage("[Error] SetDifficulty signature at 0x%08X did not match!", setDiffAddr);
     }
 
-    void *refRainCfgAddr = (void*)0x00441229;
-    unsigned char expectedRefRainCfg[9] = { 0x8B, 0x00, 0xC7, 0x45, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF };
-    if (memcmp(refRainCfgAddr, expectedRefRainCfg, 9) == 0) {
+    void *refRainCfgAddr = (void*)g_A->RefRainCfgSite;
+    if (memcmp(refRainCfgAddr, g_Sigs.RefRainCfg, 9) == 0) {
         if (VirtualProtect(refRainCfgAddr, 9, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[9];
             patch[0] = 0xE9;
@@ -2978,26 +3197,30 @@ static void InstallHooks(void) {
         LogMessage("[Error] GetRefRainConfig signature at 0x%08X did not match!", refRainCfgAddr);
     }
 
-    void *refRainGameInfoAddr = (void*)0x0043078e;
-    unsigned char expectedRefRainGameInfo[5] = { 0xE8, 0xED, 0xF3, 0x01, 0x00 };
-    if (memcmp(refRainGameInfoAddr, expectedRefRainGameInfo, 5) == 0) {
-        if (VirtualProtect(refRainGameInfoAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            unsigned char patch[5];
-            patch[0] = 0xE8;
-            DWORD relOffset = (DWORD)Hook_GetGameInfoRefRain - ((DWORD)refRainGameInfoAddr + 5);
-            memcpy(&patch[1], &relOffset, 4);
-            memcpy(refRainGameInfoAddr, patch, 5);
-            VirtualProtect(refRainGameInfoAddr, 5, oldProtect, &oldProtect);
-            FlushInstructionCache(GetCurrentProcess(), refRainGameInfoAddr, 5);
-            LogMessage("GetGameInfoRefRain hook installed successfully at 0x%08X", refRainGameInfoAddr);
+    void *refRainGameInfoAddr = (void*)g_A->GameInfoRefRainSite;
+    {
+        unsigned char expectedRefRainGameInfo[5] = { 0xE8, 0, 0, 0, 0 };
+        DWORD relGII = g_A->fnGetGameInfoInt - (g_A->GameInfoRefRainSite + 5);
+        memcpy(&expectedRefRainGameInfo[1], &relGII, 4);
+        if (memcmp(refRainGameInfoAddr, expectedRefRainGameInfo, 5) == 0) {
+            if (VirtualProtect(refRainGameInfoAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                unsigned char patch[5];
+                patch[0] = 0xE8;
+                DWORD relOffset = (DWORD)Hook_GetGameInfoRefRain - ((DWORD)refRainGameInfoAddr + 5);
+                memcpy(&patch[1], &relOffset, 4);
+                memcpy(refRainGameInfoAddr, patch, 5);
+                VirtualProtect(refRainGameInfoAddr, 5, oldProtect, &oldProtect);
+                FlushInstructionCache(GetCurrentProcess(), refRainGameInfoAddr, 5);
+                LogMessage("GetGameInfoRefRain hook installed successfully at 0x%08X", refRainGameInfoAddr);
+            }
+        } else {
+            LogMessage("[Error] GetGameInfoRefRain signature at 0x%08X did not match!", refRainGameInfoAddr);
         }
-    } else {
-        LogMessage("[Error] GetGameInfoRefRain signature at 0x%08X did not match!", refRainGameInfoAddr);
     }
 
-    void *gameInfoIntAddr = (void*)0x0044fb80;
-    unsigned char expectedGameInfoInt[5] = { 0x55, 0x8B, 0xEC, 0x6A, 0xFF };
-    if (memcmp(gameInfoIntAddr, expectedGameInfoInt, 5) == 0) {
+    void *gameInfoIntAddr = (void*)g_A->fnGetGameInfoInt;
+    unsigned char expectedPrologue[5] = { 0x55, 0x8B, 0xEC, 0x6A, 0xFF };
+    if (memcmp(gameInfoIntAddr, expectedPrologue, 5) == 0) {
         if (VirtualProtect(gameInfoIntAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[5];
             patch[0] = 0xE9;
@@ -3006,14 +3229,14 @@ static void InstallHooks(void) {
             memcpy(gameInfoIntAddr, patch, 5);
             VirtualProtect(gameInfoIntAddr, 5, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), gameInfoIntAddr, 5);
-            LogMessage("GetGameInfoInt (0x0044fb80) global hook installed successfully");
+            LogMessage("GetGameInfoInt (0x%08X) global hook installed successfully", gameInfoIntAddr);
         }
     } else {
         LogMessage("[Error] GetGameInfoInt signature at 0x%08X did not match!", gameInfoIntAddr);
     }
 
-    void *getterTableEntry19 = (void*)0x00462dfc;
-    DWORD origGetter19 = 0x00462c49;
+    void *getterTableEntry19 = (void*)g_A->Getter19Entry;
+    DWORD origGetter19 = g_A->Getter19Fn;
     if (memcmp(getterTableEntry19, &origGetter19, 4) == 0) {
         if (VirtualProtect(getterTableEntry19, 4, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             *(DWORD*)getterTableEntry19 = (DWORD)Hook_GetterReMode;
@@ -3026,24 +3249,23 @@ static void InstallHooks(void) {
                    getterTableEntry19, *(DWORD*)getterTableEntry19);
     }
 
-    void *inputVtableAddr = (void*)0x004b80c4;
-    DWORD origIsKey[2] = { 0x00431760, 0x004317a0 };
+    void *inputVtableAddr = (void*)g_A->vtInput;
+    DWORD origIsKey[2] = { g_A->fnIsKeyPressed, g_A->fnIsKeyTriggered };
     if (memcmp(inputVtableAddr, origIsKey, 8) == 0) {
         if (VirtualProtect(inputVtableAddr, 8, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            *(DWORD*)0x004b80c4 = (DWORD)Hook_IsKeyPressed;
-            *(DWORD*)0x004b80c8 = (DWORD)Hook_IsKeyTriggered;
+            *(DWORD*)inputVtableAddr = (DWORD)Hook_IsKeyPressed;
+            *((DWORD*)inputVtableAddr + 1) = (DWORD)Hook_IsKeyTriggered;
             VirtualProtect(inputVtableAddr, 8, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), inputVtableAddr, 8);
             LogMessage("InputMgr vtable hooked successfully at 0x%08X", inputVtableAddr);
         }
     } else {
         LogMessage("[Error] InputMgr vtable signature at 0x%08X did not match! (found 0x%08X, 0x%08X)",
-                   inputVtableAddr, *(DWORD*)0x004b80c4, *(DWORD*)0x004b80c8);
+                   inputVtableAddr, *(DWORD*)inputVtableAddr, *((DWORD*)inputVtableAddr + 1));
     }
 
-    void *saveGlobalAddr = (void*)0x0042c330;
-    unsigned char expectedSaveGlobal[5] = { 0x55, 0x8B, 0xEC, 0x6A, 0xFF };
-    if (memcmp(saveGlobalAddr, expectedSaveGlobal, 5) == 0) {
+    void *saveGlobalAddr = (void*)g_A->fnSaveGlobal;
+    if (memcmp(saveGlobalAddr, expectedPrologue, 5) == 0) {
         if (VirtualProtect(saveGlobalAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[5];
             patch[0] = 0xE9;
@@ -3052,15 +3274,14 @@ static void InstallHooks(void) {
             memcpy(saveGlobalAddr, patch, 5);
             VirtualProtect(saveGlobalAddr, 5, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), saveGlobalAddr, 5);
-            LogMessage("SaveGlobalData (0x0042c330) hook installed successfully");
+            LogMessage("SaveGlobalData (0x%08X) hook installed successfully", saveGlobalAddr);
         }
     } else {
-        LogMessage("[Error] SaveGlobalData signature at 0x0042c330 did not match!");
+        LogMessage("[Error] SaveGlobalData signature at 0x%08X did not match!", saveGlobalAddr);
     }
 
-    void *setGameInfoAddr = (void*)0x0044fca0;
-    unsigned char expectedSetGameInfo[5] = { 0x55, 0x8B, 0xEC, 0x6A, 0xFF };
-    if (memcmp(setGameInfoAddr, expectedSetGameInfo, 5) == 0) {
+    void *setGameInfoAddr = (void*)g_A->fnSetGameInfoInt;
+    if (memcmp(setGameInfoAddr, expectedPrologue, 5) == 0) {
         if (VirtualProtect(setGameInfoAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[5];
             patch[0] = 0xE9;
@@ -3069,18 +3290,17 @@ static void InstallHooks(void) {
             memcpy(setGameInfoAddr, patch, 5);
             VirtualProtect(setGameInfoAddr, 5, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), setGameInfoAddr, 5);
-            LogMessage("SetGameInfoInt (0x0044fca0) hook installed successfully");
+            LogMessage("SetGameInfoInt (0x%08X) hook installed successfully", setGameInfoAddr);
         }
     } else {
-        LogMessage("[Error] SetGameInfoInt signature at 0x0044fca0 did not match!");
+        LogMessage("[Error] SetGameInfoInt signature at 0x%08X did not match!", setGameInfoAddr);
     }
 
-    InstallWrapperDetour(0x0047038a, (DWORD)Hook_FwriteWrapper, (DWORD)&g_FwriteTramp);
-    InstallWrapperDetour(0x0046f33b, (DWORD)Hook_FreadWrapper, (DWORD)&g_FreadTramp);
+    InstallWrapperDetour(g_A->FwriteWrapSite, (DWORD)Hook_FwriteWrapper, (DWORD)&g_FwriteTramp);
+    InstallWrapperDetour(g_A->FreadWrapSite, (DWORD)Hook_FreadWrapper, (DWORD)&g_FreadTramp);
 
-    void *saveReplayHdrAddr = (void*)0x00431d24;
-    unsigned char expectedSaveReplayHdr[5] = { 0x56, 0x6A, 0x01, 0x6A, 0x0C };
-    if (memcmp(saveReplayHdrAddr, expectedSaveReplayHdr, 5) == 0) {
+    void *saveReplayHdrAddr = (void*)g_A->SaveReplayHdrSite;
+    if (memcmp(saveReplayHdrAddr, g_Sigs.SaveReplayHdr, 5) == 0) {
         if (VirtualProtect(saveReplayHdrAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             unsigned char patch[5];
             patch[0] = 0xE9;
@@ -3096,12 +3316,77 @@ static void InstallHooks(void) {
     }
 }
 
+static void DetectVersion(void) {
+    BYTE *base = (BYTE*)GetModuleHandleA(NULL);
+    if (!base) base = (BYTE*)0x400000;
+    g_BaseDelta = (DWORD)(DWORD_PTR)base - 0x400000;
+
+    int isSteam = memcmp(base + (ADDRS_STEAM.TransSite - 0x400000), SIGS_STEAM.Trans, 5) == 0 &&
+                  memcmp(base + (ADDRS_STEAM.LoadStartSite - 0x400000), SIGS_STEAM.LoadStart, 7) == 0;
+    int isDisk = memcmp(base + (ADDRS_DISK.TransSite - 0x400000), SIGS_DISK.Trans, 5) == 0 &&
+                 memcmp(base + (ADDRS_DISK.LoadStartSite - 0x400000), SIGS_DISK.LoadStart, 7) == 0;
+    if (isSteam) {
+        g_IsSteam = 1;
+    } else if (isDisk) {
+        g_IsSteam = 0;
+    } else {
+        g_IsSteam = 0;
+        LogMessage("[Error] Unknown RefRain.exe build (neither disk nor Steam signature matched); assuming disk version");
+    }
+
+    const GameAddrs *tmpl = g_IsSteam ? &ADDRS_STEAM : &ADDRS_DISK;
+    memcpy(&g_Addrs, tmpl, sizeof(g_Addrs));
+    memcpy(&g_Sigs, g_IsSteam ? &SIGS_STEAM : &SIGS_DISK, sizeof(g_Sigs));
+
+    /* rebase every DWORD address field (0 means "not used by this version") */
+    DWORD *p = (DWORD*)&g_Addrs;
+    for (size_t i = 0; i < sizeof(g_Addrs) / sizeof(DWORD); i++) {
+        if (p[i] != 0) p[i] += g_BaseDelta;
+    }
+
+    g_A = &g_Addrs;
+
+    /* addresses used by naked-hook inline asm (referenced by symbol, so the
+       register setup runs inside the asm block, after pushal-style saves) */
+    g_A_SceneNext = g_A->SceneNext;
+    g_A_LoadFlag = g_A->LoadFlag;
+    g_A_Mefa = g_A->Mefa;
+    g_A_Cr = g_A->Cr;
+    g_A_Lives = g_A->Lives;
+    g_A_Diff = g_A->Diff;
+    g_A_GpuQueue = g_A->GpuQueue;
+    g_DispatchEpilogue = g_A->DispatchEpilogue;
+    g_SaveGlobalRetAddr = g_A->fnSaveGlobalRet;
+    g_GetGameInfoIntRetAddr = g_A->fnGetGameInfoIntRet;
+    g_SetGameInfoIntRetAddr = g_A->fnSetGameInfoIntRet;
+    g_GetGameInfoIntFn = g_A->fnGetGameInfoInt;
+    g_RefRainCfgRetAddr = g_A->RefRainCfgRet;
+
+    /* hook continuation addresses */
+    g_ReturnAddr = g_A->SceneCheckRet;
+    g_EndSceneRetAddr = g_A->EndSceneRet;
+    g_LoadStartRetAddr = g_A->LoadStartRet;
+    g_LoadStartSkipAddr = g_A->LoadStartSkip;
+    g_PreTickRetAddr = g_A->PreTickRet;
+    g_PreTickTarget = g_A->fnTick;
+    g_SaveReplayHdrRetAddr = g_A->SaveReplayHdrRet;
+
+    /* original functions */
+    orig_IsKeyPressed = (PFN_IsKey)g_A->fnIsKeyPressed;
+    orig_IsKeyTriggered = (PFN_IsKey)g_A->fnIsKeyTriggered;
+
+    LogMessage("Version detect: %s build, image base 0x%08X (delta=%+ld)",
+               g_IsSteam ? "Steam" : "Disk", (DWORD)(DWORD_PTR)base, (long)g_BaseDelta);
+}
+
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) {
     (void)lpReserved;
     if (fdwReason == DLL_PROCESS_ATTACH) {
         g_hOurDll = hinstDLL;
         DisableThreadLibraryCalls(hinstDLL);
-        LogMessage("RefRain stage select mod loaded.");
+        DetectVersion();
+        LogMessage("RefRain stage select mod loaded (%s build, image base 0x%08X).",
+                   g_IsSteam ? "Steam" : "Disk", (DWORD)(DWORD_PTR)GetModuleHandleA(NULL));
         InstallHooks();
         CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
         if (g_PauseDiag) CreateThread(NULL, 0, PauseDiagThread, NULL, 0, NULL);

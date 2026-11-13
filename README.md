@@ -24,9 +24,7 @@ Wine/Protonではデフォルトの`DirectDraw`のままにすることを推奨
 
 ### RefRain
 
-金無さすぎてSteam版持ってないので、ディスク版実行ファイルにのみ対応しています。
-
-[Releases](https://github.com/Madotsukanai/Raindrop/releases/latest)から`d3d9.dll`をダウンロードし、`RefRain.exe` (SHA-256: `db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78`)と同じディレクトリにコピーしてゲームを起動してください。
+[Releases](https://github.com/Madotsukanai/Raindrop/releases/latest)から`d3d9.dll`をダウンロードし、ディスク版`RefRain.exe` (SHA-256: `db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78`)またはSteam版`RefRain.exe` (SHA-256: 1941799d114dacbbd83a3d40c69ad4f5063ee4a175c591dc155d5deca4a6e959)と同じディレクトリにコピーしてゲームを起動してください。
 
 「DIVE 2 M.R.S.」にカーソルを合わせ、コンセプトリアクターを入力しながら決定するとプラクティスメニューが開きます。
 
