@@ -831,19 +831,23 @@ static void D7PaceWait(void) {
     }
     margin = g_paceHiRes ? 0.4 : 2.0;
     wait = rem - margin;
+    /* All waits are bounded: a lost wake must never freeze the frame loop. */
     if (g_paceHiRes && g_paceTimer && wait > 0.1) {
         LARGE_INTEGER lt;
         lt.QuadPart = -(LONGLONG)(wait * 10000.0);
         if (SetWaitableTimer(g_paceTimer, &lt, 0, NULL, NULL, FALSE))
-            MsgWaitForMultipleObjects(1, &g_paceTimer, FALSE, INFINITE, QS_ALLINPUT);
+            MsgWaitForMultipleObjects(1, &g_paceTimer, FALSE, (DWORD)(wait + 30.0), QS_ALLINPUT);
     } else if (wait > 1.0) {
         MsgWaitForMultipleObjects(0, NULL, FALSE, (DWORD)wait, QS_ALLINPUT);
     }
-    for (;;) {  /* fine-align the final fraction of a millisecond */
-        LARGE_INTEGER cur;
-        QueryPerformanceCounter(&cur);
-        if ((double)(cur.QuadPart - g_lastPresent.QuadPart) * 1000.0 / (double)g_paceFreq.QuadPart
-            >= D7_PACE_INTERVAL_MS - 0.05) break;
+    {
+        int spins = 0;  /* fine-align the final fraction of a millisecond (bounded) */
+        while (spins++ < (1 << 20)) {
+            LARGE_INTEGER cur;
+            QueryPerformanceCounter(&cur);
+            if ((double)(cur.QuadPart - g_lastPresent.QuadPart) * 1000.0 / (double)g_paceFreq.QuadPart
+                >= D7_PACE_INTERVAL_MS - 0.05) break;
+        }
     }
 }
 

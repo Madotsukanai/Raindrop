@@ -1690,12 +1690,19 @@ static void __stdcall GameStartHook(int stage) {
 }
 
 static void __stdcall RetryHook(int stage) {
+    Log("Retry: enter stage=%d (replayPause=%d practiceBoss=%d practiceScore=%d bossRun=%d)", stage,
+        g_pauseReplay, g_practiceBossActive, g_practiceScoreActive, g_exBossRun);
     if (g_pauseReplay) {
         void *input = *(void**)(uintptr_t)0x46bbec;
         if (input && g_replayFileIdCaptured) {
             int ok = ((PF_ReplayLoad)(uintptr_t)0x431fe0)(input, g_replayFileId, g_replayStage);
             Log("ReplayPause: retry reloaded replay id=%d from stage %d (ok=%d)",
                 g_replayFileId, g_replayStage, ok);
+            if (!ok) {
+                Log("ReplayPause: reload failed, falling back to the game retry");
+                g_pauseReplay = 0;
+                ((PF_GameStart)(uintptr_t)0x419d10)(stage);
+            }
         } else {
             Log("ReplayPause: retry could not reload replay (input=%p file_id=%d)",
                 input, g_replayFileIdCaptured);
@@ -1728,6 +1735,7 @@ static void __stdcall RetryHook(int stage) {
         *(volatile int*)(uintptr_t)0x4dadd8 = *(volatile int*)(uintptr_t)0x46c7c4;
     ExOnRetry(stage);
     ApplyPracticePower(stage, "retry");
+    Log("Retry: exit stage=%d", stage);
 }
 
 static int HookCall(DWORD callAddr, DWORD target, void *hook) {
@@ -2522,26 +2530,32 @@ static void ExQueueClear(int layer) {
     }
 }
 
-static int ExLayerObjectReset(int layer) {
+static void ExLayerObjectFill(int layer, const unsigned *texObjs, int n) {
     unsigned *node;
-    int found = 0;
-
+    if (n <= 0) return;
     for (node = *(unsigned**)(uintptr_t)0x4ea1ac; node; node = (unsigned*)node[1]) {
         unsigned *obj = (unsigned*)node[4];
         if (!obj || IsBadReadPtr(obj, 0x824)) continue;
         if ((obj[0x808 / 4] == 0x427e60 || obj[0x81c / 4] == 0x427e60) && (int)obj[2] == layer) {
-            Log("ExArea: layer %d object %p: offset %08X slots %08X %08X %08X -> cleared", layer,
-                (void*)obj, obj[3], obj[4], obj[5], obj[6]);
-            obj[3] = 0;
-            obj[4] = obj[5] = obj[6] = 0;
-            found++;
+            if (n == 1) {
+                obj[4] = texObjs[0];
+                obj[5] = texObjs[0];
+                obj[6] = texObjs[0];
+            } else {
+                obj[4] = texObjs[0];
+                obj[5] = texObjs[1 % n];
+                obj[6] = texObjs[2 % n];
+            }
+            Log("ExArea: layer %d object %p: slots seeded (%08X, %08X, %08X)", layer,
+                (void*)obj, obj[4], obj[5], obj[6]);
         }
     }
-    return found;
 }
 
 static void ExBgSeed(const ExBgGroup *g) {
     int layers[4], nl = 0, i, j, ok, L;
+    unsigned texObjs[4][4];
+    int texCount[4] = { 0 };
 
     for (i = 0; i < g->n; i++) {
         if (g->ev[i].type != 2) continue;
@@ -2552,10 +2566,7 @@ static void ExBgSeed(const ExBgGroup *g) {
         if (j == nl) layers[nl++] = L;
     }
     for (i = 0; i < nl; i++) {
-        int objs;
         ExQueueClear(layers[i]);
-        objs = ExLayerObjectReset(layers[i]);
-        if (!objs) Log("ExArea: layer %d: update object not found, tile slots left as they are", layers[i]);
     }
     for (i = 0; i < g->n; i++) {
         const ExBgEv *e = &g->ev[i];
@@ -2565,8 +2576,10 @@ static void ExBgSeed(const ExBgGroup *g) {
         if (e->type == 2) {
             int tex = ExValInt(e->w[4], e->w[5], &ok);
             if (ok) {
+                unsigned texObj = ((PF_TexById)(uintptr_t)0x409960)((unsigned)tex);
+                if (texCount[L] < 4) texObjs[L][texCount[L]++] = texObj;
                 ((PF_LayerSetU)(uintptr_t)0x427d40)(L, (unsigned)tex);
-                Log("ExArea: layer %d: queued texture %02X", L, tex);
+                Log("ExArea: layer %d: queued texture %02X (texObj=%08X)", L, tex, texObj);
             }
         } else if (e->type == 3 || e->type == 4) {
             unsigned bits = ExValFloatBits(e->w[4], e->w[5], &ok);
@@ -2576,8 +2589,11 @@ static void ExBgSeed(const ExBgGroup *g) {
             if (ok) ((PF_LayerSetU)(uintptr_t)0x428050)(L, (unsigned)v);
         }
     }
-    for (i = 0; i < nl; i++)
-        Log("ExArea: layer %d queue now holds %d tile(s)", layers[i], *(int*)(uintptr_t)(0x4e9a98 + layers[i] * 12));
+    for (i = 0; i < nl; i++) {
+        int lyr = layers[i];
+        ExLayerObjectFill(lyr, texObjs[lyr], texCount[lyr]);
+        Log("ExArea: layer %d queue now holds %d tile(s)", lyr, *(int*)(uintptr_t)(0x4e9a98 + lyr * 12));
+    }
 }
 
 #define EX_BG_GROUPS 8
@@ -3943,8 +3959,9 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         if (target > 0) {
             int startFrame = frame;
             int sel = isBoss ? 3 : ((g_exArea >= 0 && g_exArea < EX_AREA_N) ? g_exAreaBgGroup[g_exArea] : 0);
-            /* EX area practice: use settle mode so background tiles match normal play */
-            int areaBgMode = (!isBoss && g_exRun) ? 2 : g_ExBgMode;
+            /* EX area practice: use mode 1 (ExFastForward) so frames 1..target simulate naturally
+               and background transitions/scroll match normal gameplay exactly without over-settling. */
+            int areaBgMode = g_ExBgMode;
             /* The fast-forward runs the real stage update with no input, so the player is hit over and
                over while the frames are simulated. Keep the state the run started with (lives, game-over
                countdown, game-over/continue flags) and put it back after the jump. */
@@ -3968,6 +3985,15 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
                     ExSimulateSettled(startFrame, target, g_exBgGroups[sel].time);
                 else
                     ExFastForward(startFrame, target);
+                if (!isBoss && g_exRun && g_exArea == 1 && sel >= 0 && sel < g_exBgGroupN) {
+                    /* Area 2: The background transition event in Script4.dat was scheduled at frame 6462
+                       (only 150 frames before Area 2's start frame 6612). In normal play, Area 1's tiles
+                       are still scrolling off screen. For Area 2 practice, seed the background directly
+                       with Area 2's textures (0x48 base, 0x49 bottom) across all slots and queue so Area 2
+                       starts with its proper background instead of Area 1's background. */
+                    g_exBgCur = sel;
+                    ExBgSeed(&g_exBgGroups[sel]);
+                }
             }
             *(volatile int*)(uintptr_t)0x4dadf8 = target;
             g_exMuteSe = 0;
@@ -4263,10 +4289,22 @@ typedef struct { IDirectSoundBuffer *buf; int paused, looping, posValid; DWORD p
 static AudioBuf g_audio[AUDIO_MAX];
 static int g_audioN = 0;
 static int g_audioInitialized = 0;
-static IDirectSoundBuffer *g_chkBuf = NULL;
-static DWORD g_chkPos = 0;
-static DWORD g_chkTick = 0;
 static CRITICAL_SECTION g_audioCs;
+
+/* Play() on a stopped looping buffer restarts the voice at position 0 on the
+   emulated DirectSound (the cursor report stays stale until the next Play), so an
+   unpaused BGM resumes at the ring start, which holds already decoded audio ahead
+   of the paused position.  Reposition the buffer after Stop and verify the cursor
+   after the resume, resyncing if the position still snapped to 0. */
+typedef struct { IDirectSoundBuffer *buf; DWORD settled, size, bps, due; int tries; } AudioChk;
+static AudioChk g_chk[16];
+static int g_chkN = 0;
+
+static DWORD WrapDist(DWORD a, DWORD b, DWORD size) {
+    DWORD d = (a >= b) ? a - b : a + size - b;
+    if (size && d > size / 2) d = size - d;
+    return d;
+}
 
 typedef HRESULT (STDMETHODCALLTYPE *PF_DSCreateBuf)(IDirectSound*, LPCDSBUFFERDESC, LPDIRECTSOUNDBUFFER*, LPUNKNOWN);
 typedef HRESULT (STDMETHODCALLTYPE *PF_DSDupBuf)(IDirectSound*, LPDIRECTSOUNDBUFFER, LPDIRECTSOUNDBUFFER*);
@@ -4377,13 +4415,95 @@ static HRESULT WINAPI DSCreateHook(LPCGUID guid, LPDIRECTSOUND *pp, LPUNKNOWN un
     return hr;
 }
 
+/* Logs the faulting instruction and registers of a crash, so a crash during the BGM seek can be located. */
+static LONG CALLBACK SeekCrashVeh(PEXCEPTION_POINTERS ep);
+
+/* Diagnostics for the unpause position jump: snapshot the music ring state (DSound play/write
+   cursors, game stream cursor fields, decoder position and a checksum of the ring bytes under the
+   play cursor) at pause, then diff it at resume.  A changed checksum means the streaming refill
+   thread kept decoding while the buffer was stopped and overwrote the audio at the paused
+   position, which would explain the BGM continuing from an advanced point after unpause. */
+typedef void *(__cdecl *PF_GetCurrentMusicSnap)(void);
+
+static int g_snapValid = 0;
+static DWORD g_snapPlay, g_snapWrite, g_snap4c, g_snap50, g_snap58, g_snapSum;
+static long long g_snapFrames;
+
+static void AudioRingSnapshot(const char *when) {
+    void *music;
+    IDirectSoundBuffer *ds;
+    DWORD play = 0, write = 0, m4c = 0, m50 = 0, m58 = 0, checksum = 0;
+
+    if (!g_audioInitialized) return;
+    music = ((PF_GetCurrentMusicSnap)(uintptr_t)0x411880)();
+    if (!music || IsBadReadPtr(music, 0x70)) return;
+    if (*(DWORD*)((char*)music + 0x14) != 0x453548) return;
+    ds = *(IDirectSoundBuffer**)((char*)music + 0x18);
+    if (!ds || IsBadReadPtr(ds, sizeof(void*))) return;
+    if (FAILED(IDirectSoundBuffer_GetCurrentPosition(ds, &play, &write))) return;
+    m4c = *(DWORD*)((char*)music + 0x4c);
+    m50 = *(DWORD*)((char*)music + 0x50);
+    m58 = *(DWORD*)((char*)music + 0x58);
+    {
+        void *p1 = NULL, *p2 = NULL;
+        DWORD b1 = 0, b2 = 0, k;
+        if (SUCCEEDED(IDirectSoundBuffer_Lock(ds, play, 4096, &p1, &b1, &p2, &b2, 0))) {
+            unsigned char *q = (unsigned char*)p1;
+            for (k = 0; k < b1; k++) checksum += q[k];
+            IDirectSoundBuffer_Unlock(ds, p1, b1, p2, b2);
+        } else {
+            checksum = 0xDEADBEEF;
+        }
+    }
+    if (g_snapValid) {
+        Log("PauseAudio: ring@%s: play=%lu write=%lu m4c=%lu m50=%lu m58=%lu sum@play=%08X",
+            when, (unsigned long)play, (unsigned long)write,
+            (unsigned long)m4c, (unsigned long)m50, (unsigned long)m58, (unsigned)checksum);
+        Log("PauseAudio: ring diff since pause: play%+ld write%+ld m4c%+ld m50%+ld m58%+ld sum %s",
+            (long)((long long)play - (long long)g_snapPlay),
+            (long)((long long)write - (long long)g_snapWrite),
+            (long)((long long)m4c - (long long)g_snap4c),
+            (long)((long long)m50 - (long long)g_snap50),
+            (long)((long long)m58 - (long long)g_snap58),
+            checksum == 0xDEADBEEF ? "unknown (lock failed)" :
+            (checksum == g_snapSum ? "UNCHANGED" : "CHANGED (ring overwritten while stopped)"));
+        g_snapValid = 0;
+    } else {
+        g_snapPlay = play; g_snapWrite = write; g_snap4c = m4c;
+        g_snap50 = m50; g_snap58 = m58; g_snapSum = checksum;
+        g_snapValid = (checksum != 0xDEADBEEF);
+        Log("PauseAudio: ring@%s: play=%lu write=%lu m4c=%lu m50=%lu m58=%lu sum@play=%08X",
+            when, (unsigned long)play, (unsigned long)write,
+            (unsigned long)m4c, (unsigned long)m50, (unsigned long)m58, (unsigned)checksum);
+    }
+}
+
+/* The game's streaming refill pump (0x4133f0, called from the music streaming loop at 0x413012)
+   keeps decoding while the pause menu is open: the stopped DSound buffer no longer constrains the
+   write cursor, so the pump races at several times realtime speed and, once the decode-ahead
+   window is full, wraps around and overwrites the audio at the paused play position.  The play
+   cursor is restored correctly on unpause, but the data under it is future audio, which makes the
+   BGM continue from an advanced point.  Freeze the pump while the pause menu is open so the ring
+   stays exactly as it was when the game paused. */
+typedef unsigned char (__attribute__((thiscall)) *PF_MusicPump)(void *);
+static PF_MusicPump g_origMusicPump = NULL;
+
+static unsigned char __attribute__((thiscall)) MusicPumpHook(void *music) {
+    if (*(volatile unsigned char*)(uintptr_t)0x4dae16) {
+        Sleep(20);
+        return 1;
+    }
+    return g_origMusicPump ? g_origMusicPump(music) : 1;
+}
+
 static void AudioPause(void) {
     int i, n = 0;
     EnterCriticalSection(&g_audioCs);
-    g_chkBuf = NULL;
+    g_chkN = 0;
     for (i = 0; i < g_audioN; i++) {
         DWORD st = 0;
         IDirectSoundBuffer *b = g_audio[i].buf;
+        if (g_audio[i].paused) continue;
         g_audio[i].paused = 0;
         if (SUCCEEDED(IDirectSoundBuffer_GetStatus(b, &st)) && (st & DSBSTATUS_PLAYING)) {
             DWORD pos = 0;
@@ -4410,6 +4530,7 @@ static void AudioPause(void) {
             n++;
         }
     }
+    AudioRingSnapshot("pause");
     LeaveCriticalSection(&g_audioCs);
     Log("PauseAudio: paused %d of %d buffers", n, g_audioN);
 }
@@ -4417,6 +4538,7 @@ static void AudioPause(void) {
 static void AudioResume(int doPlay) {
     int i, n = 0;
     EnterCriticalSection(&g_audioCs);
+    AudioRingSnapshot(doPlay ? "resume" : "drop");
     for (i = 0; i < g_audioN; i++) {
         if (!g_audio[i].paused) continue;
         g_audio[i].paused = 0;
@@ -4425,8 +4547,17 @@ static void AudioResume(int doPlay) {
             IDirectSoundBuffer *b = g_audio[i].buf;
             if (SUCCEEDED(IDirectSoundBuffer_GetStatus(b, &st)) && !(st & DSBSTATUS_PLAYING)) {
                 DWORD cur = 0, after = 0;
+                LONG vol = 0;
                 if (st & DSBSTATUS_BUFFERLOST) {
                     IDirectSoundBuffer_Restore(b);
+                }
+                if (SUCCEEDED(IDirectSoundBuffer_GetVolume(b, &vol)) && vol == DSBVOLUME_MIN) {
+                    IDirectSoundBuffer_SetVolume(b, 0);
+                }
+                if (g_audio[i].looping && g_audio[i].posValid && g_audio[i].settled) {
+                    HRESULT phr = IDirectSoundBuffer_SetCurrentPosition(b, g_audio[i].settled);
+                    Log("PauseAudio: loop buffer %p repositioned to %lu before play (hr=%08X)",
+                        (void*)b, (unsigned long)g_audio[i].settled, (unsigned)phr);
                 }
                 IDirectSoundBuffer_GetCurrentPosition(b, &cur, NULL);
                 IDirectSoundBuffer_Play(b, 0, 0, g_audio[i].looping ? DSBPLAY_LOOPING : 0);
@@ -4435,9 +4566,20 @@ static void AudioResume(int doPlay) {
                     Log("PauseAudio: loop buffer %p resumed: saved=%lu settled=%lu before_play=%lu after_play=%lu",
                         (void*)b, (unsigned long)g_audio[i].pos, (unsigned long)g_audio[i].settled,
                         (unsigned long)cur, (unsigned long)after);
-                    g_chkBuf = b;
-                    g_chkPos = after;
-                    g_chkTick = GetTickCount();
+                    if (g_audio[i].posValid && g_audio[i].settled && g_chkN < 16) {
+                        DSBCAPS caps;
+                        WAVEFORMATEX wf;
+                        memset(&caps, 0, sizeof(caps));
+                        caps.dwSize = sizeof(caps);
+                        memset(&wf, 0, sizeof(wf));
+                        g_chk[g_chkN].buf = b;
+                        g_chk[g_chkN].settled = g_audio[i].settled;
+                        g_chk[g_chkN].size = SUCCEEDED(IDirectSoundBuffer_GetCaps(b, &caps)) ? caps.dwBufferBytes : 0;
+                        g_chk[g_chkN].bps = SUCCEEDED(IDirectSoundBuffer_GetFormat(b, &wf, sizeof(wf), NULL)) ? wf.nAvgBytesPerSec : 0;
+                        g_chk[g_chkN].due = GetTickCount() + 150;
+                        g_chk[g_chkN].tries = 0;
+                        if (g_chk[g_chkN].size && g_chk[g_chkN].bps) g_chkN++;
+                    }
                 }
                 n++;
             }
@@ -4642,36 +4784,66 @@ static int PracticeSeekBgm(int seconds) {
     return r;
 }
 
+static void AudioChkTick(void) {
+    DWORD now = GetTickCount();
+    int i = 0;
+    while (i < g_chkN) {
+        AudioChk *c = &g_chk[i];
+        if ((int)(now - c->due) < 0) { i++; continue; }
+        {
+            IDirectSoundBuffer *b = c->buf;
+            int alive = 0, k;
+            DWORD pos = 0, elapsed, exp, dist;
+            for (k = 0; k < g_audioN; k++)
+                if (g_audio[k].buf == b) { alive = 1; break; }
+            if (!alive) { g_chk[i] = g_chk[g_chkN - 1]; g_chkN--; continue; }
+            if (SUCCEEDED(IDirectSoundBuffer_GetCurrentPosition(b, &pos, NULL))) {
+                /* elapsed time since the resume (due = resumeTick + 150) */
+                elapsed = (now - c->due) + 150;
+                exp = c->settled + elapsed * c->bps / 1000;
+                exp %= c->size;
+                dist = WrapDist(pos, exp, c->size);
+                if (dist > c->bps * 350 / 1000) {
+                    HRESULT h1, h2, h3;
+                    c->tries++;
+                    if (c->tries & 1) {
+                        h1 = IDirectSoundBuffer_SetCurrentPosition(b, c->settled);
+                        h2 = h3 = 0;
+                        Log("PauseAudio: buffer %p drifted %lu ms after resume (pos=%lu exp=%lu), repositioned while playing (try %d, hr=%08X)",
+                            (void*)b, (unsigned long)(dist * 1000 / c->bps), (unsigned long)pos,
+                            (unsigned long)exp, c->tries, (unsigned)h1);
+                    } else {
+                        h1 = IDirectSoundBuffer_Stop(b);
+                        h2 = IDirectSoundBuffer_SetCurrentPosition(b, c->settled);
+                        h3 = IDirectSoundBuffer_Play(b, 0, 0, DSBPLAY_LOOPING);
+                        Log("PauseAudio: buffer %p still drifted %lu ms after resume (pos=%lu exp=%lu), stopped and repositioned (try %d, hr=%08X %08X %08X)",
+                            (void*)b, (unsigned long)(dist * 1000 / c->bps), (unsigned long)pos,
+                            (unsigned long)exp, c->tries, (unsigned)h1, (unsigned)h2, (unsigned)h3);
+                    }
+                    if (c->tries < 3) { c->due = now + 150; i++; continue; }
+                    Log("PauseAudio: buffer %p still off position after %d resync attempts, giving up", (void*)b, c->tries);
+                } else {
+                    Log("PauseAudio: buffer %p resume position ok (pos=%lu exp=%lu, off %lu ms)",
+                        (void*)b, (unsigned long)pos, (unsigned long)exp,
+                        (unsigned long)(dist * 1000 / c->bps));
+                }
+            }
+            g_chk[i] = g_chk[g_chkN - 1];
+            g_chkN--;
+            continue;
+        }
+    }
+}
+
 static DWORD WINAPI PauseAudioThread(LPVOID unused) {
     int prev = 0;
     (void)unused;
     for (;;) {
         int cur;
         Sleep(5);
-        if (g_chkBuf && GetTickCount() - g_chkTick >= 150) {
-            int k;
-            EnterCriticalSection(&g_audioCs);
-            for (k = 0; k < g_audioN; k++) {
-                if (g_audio[k].buf == g_chkBuf) {
-                    DWORD now = 0, size = 0, adv, avg = 0;
-                    DSBCAPS caps;
-                    WAVEFORMATEX wf;
-                    memset(&caps, 0, sizeof(caps));
-                    caps.dwSize = sizeof(caps);
-                    memset(&wf, 0, sizeof(wf));
-                    IDirectSoundBuffer_GetCurrentPosition(g_chkBuf, &now, NULL);
-                    if (SUCCEEDED(IDirectSoundBuffer_GetCaps(g_chkBuf, &caps))) size = caps.dwBufferBytes;
-                    if (SUCCEEDED(IDirectSoundBuffer_GetFormat(g_chkBuf, &wf, sizeof(wf), NULL))) avg = wf.nAvgBytesPerSec;
-                    adv = (now >= g_chkPos) ? now - g_chkPos : now + size - g_chkPos;
-                    Log("PauseAudio: resume check: cursor advanced %lu bytes (%lu ms of audio) in %lu ms",
-                        (unsigned long)adv, avg ? (unsigned long)((unsigned long long)adv * 1000 / avg) : 0UL,
-                        (unsigned long)(GetTickCount() - g_chkTick));
-                    break;
-                }
-            }
-            LeaveCriticalSection(&g_audioCs);
-            g_chkBuf = NULL;
-        }
+        EnterCriticalSection(&g_audioCs);
+        if (g_chkN) AudioChkTick();
+        LeaveCriticalSection(&g_audioCs);
         cur = (*(volatile unsigned char*)(uintptr_t)0x4dae16) != 0;
         if (cur && !prev) {
             AudioPause();
@@ -4702,6 +4874,11 @@ static void PatchPauseAudio(void) {
         Log("PauseAudio: DirectSoundCreate call not hooked, skipped");
         return;
     }
+    g_origMusicPump = (PF_MusicPump)(uintptr_t)0x4133f0;
+    if (HookCall(0x413012, 0x4133f0, (void*)&MusicPumpHook))
+        Log("PauseAudio: music refill pump frozen while the pause menu is open (hook=0x413012)");
+    else
+        Log("PauseAudio: music refill pump hook failed at 0x413012, ring may advance during pause");
     th = CreateThread(NULL, 0, PauseAudioThread, NULL, 0, NULL);
     if (th) CloseHandle(th);
     Log("PauseAudio: patched (thread %s)", th ? "ok" : "failed");
@@ -5181,8 +5358,96 @@ static void FrameWaitInit(void) {
 
 typedef unsigned (__attribute__((fastcall)) *PF_FrameTimer)(int *ctx);
 
+/* ---- main-thread heartbeat + freeze watchdog (debug builds) ----------------
+   The reported freezes leave the log with no last line inside our code, so the
+   watchdog samples the frame heartbeat and, when the main thread stalls for 5 s
+   while the process is alive, suspends it and dumps EIP/module/registers.
+   That points at exactly which OS call the frame is blocked in. */
+#ifdef SMD_DEBUG_BUILD
+static volatile LONG g_frameSeq = 0;
+static volatile DWORD g_frameSeqTick = 0;
+static volatile DWORD g_mainThreadId = 0;
+
+static void LogModuleOf(DWORD eip) {
+    HMODULE m = NULL;
+    char name[MAX_PATH];
+    if (eip && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                  (const char*)(uintptr_t)eip, &m) && m) {
+        DWORD n = GetModuleFileNameA(m, name, sizeof(name));
+        char *slash = n ? strrchr(name, '\\') : NULL;
+        MEMORY_BASIC_INFORMATION mi;
+        DWORD end = 0;
+        if (VirtualQuery((LPCVOID)(uintptr_t)eip, &mi, sizeof(mi)))
+            end = (DWORD)(uintptr_t)mi.BaseAddress + (DWORD)mi.RegionSize;
+        SmdLog("FreezeWatch: eip module %s+0x%lX (region %08X-%08X)", slash ? slash + 1 : name,
+               eip - (DWORD)(uintptr_t)m, (unsigned)(uintptr_t)mi.BaseAddress, end);
+    }
+}
+
+static void DumpMainThread(DWORD stallMs) {
+    DWORD tid = g_mainThreadId;
+    HANDLE th;
+    CONTEXT c;
+    DWORD *sp;
+    if (!tid) return;
+    th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!th) {
+        SmdLog("FreezeWatch: OpenThread(%lu) failed err=%lu", tid, GetLastError());
+        return;
+    }
+    if (SuspendThread(th) == (DWORD)-1) {
+        SmdLog("FreezeWatch: SuspendThread failed err=%lu", GetLastError());
+        CloseHandle(th);
+        return;
+    }
+    memset(&c, 0, sizeof(c));
+    c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    if (GetThreadContext(th, &c)) {
+        SmdLog("FreezeWatch: main thread stalled %lu ms: eip=%08X esp=%08X",
+               stallMs, (unsigned)c.Eip, (unsigned)c.Esp);
+        LogModuleOf(c.Eip);
+        SmdLog("FreezeWatch: eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X ebp=%08X",
+               (unsigned)c.Eax, (unsigned)c.Ebx, (unsigned)c.Ecx, (unsigned)c.Edx,
+               (unsigned)c.Esi, (unsigned)c.Edi, (unsigned)c.Ebp);
+        sp = (DWORD*)(uintptr_t)c.Esp;
+        if (!IsBadReadPtr(sp, 64))
+            SmdLog("FreezeWatch: stack %08X %08X %08X %08X %08X %08X %08X %08X",
+                   sp[0], sp[1], sp[2], sp[3], sp[4], sp[5], sp[6], sp[7]);
+        sp = (DWORD*)(uintptr_t)c.Ebp;
+        if (!IsBadReadPtr(sp, 16))
+            SmdLog("FreezeWatch: frame [ebp]=%08X [ebp+4]=%08X [ebp+8]=%08X", sp[0], sp[1], sp[2]);
+    } else {
+        SmdLog("FreezeWatch: GetThreadContext failed err=%lu", GetLastError());
+    }
+    ResumeThread(th);
+    CloseHandle(th);
+}
+
+static DWORD WINAPI FreezeWatchThread(LPVOID unused) {
+    static DWORD lastDump;
+    (void)unused;
+    for (;;) {
+        DWORD now, seqTick;
+        Sleep(1000);
+        now = GetTickCount();
+        seqTick = g_frameSeqTick;
+        if (!seqTick || now - seqTick < 5000) continue;
+        if (lastDump && now - lastDump < 5000) continue;
+        lastDump = now;
+        DumpMainThread(now - seqTick);
+    }
+    return 0;
+}
+#endif
+
 static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
     unsigned r;
+#ifdef SMD_DEBUG_BUILD
+    g_mainThreadId = GetCurrentThreadId();
+    InterlockedIncrement(&g_frameSeq);
+    g_frameSeqTick = GetTickCount();
+#endif
     SmdControllerPoll();
     BatchTryInstall();
     r = ((PF_FrameTimer)(uintptr_t)0x424f20)(ctx);
@@ -5223,6 +5488,13 @@ static void PatchFrameWait(void) {
     DWORD a;
     int n = 0;
 
+#ifdef SMD_DEBUG_BUILD
+    {
+        HANDLE th = CreateThread(NULL, 0, FreezeWatchThread, NULL, 0, NULL);
+        if (th) CloseHandle(th);
+        Log("FreezeWatch: watchdog armed");
+    }
+#endif
     if (!g_FrameWaitSleep && !g_BatchDraw) return;
     if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
         Log("FrameWait: unexpected image base, skipped");

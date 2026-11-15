@@ -460,10 +460,11 @@ static void JoyDirectInputScan(void) {
     HWND hwnd;
     DWORD now = GetTickCount();
     static unsigned scanSeq;
+    static int stableScans = 0;   /* unchanged device count in a row: stretch the interval */
     LARGE_INTEGER s0, s1, sfreq;
     unsigned seq;
 
-    if (g_di8 && now - g_diLastScan < 1000) return;
+    if (g_di8 && now - g_diLastScan < (g_diCount && stableScans >= 3 ? 5000 : 1000)) return;
     g_diLastScan = now;
     seq = ++scanSeq;
     QueryPerformanceCounter(&s0);
@@ -503,10 +504,21 @@ static void JoyDirectInputScan(void) {
         g_diEnumSeen = 0;
         ehr = IDirectInput8_EnumDevices(g_di8, DI8DEVCLASS_GAMECTRL, JoyEnumDirectInput, hwnd, DIEDFL_ATTACHEDONLY);
         QueryPerformanceCounter(&s1);
-        if (oldCount != g_diCount || g_diScans <= 3)
-            SmdLog("JoyBridge: DirectInput scan #%u: EnumDevices hr=%08X, %u device(s) enumerated, %u usable (was %u), window=%p, took %.2f ms",
-                g_diScans, (unsigned)ehr, g_diEnumSeen, g_diCount, oldCount, (void*)hwnd,
-                (double)(s1.QuadPart - s0.QuadPart) * 1000.0 / (double)sfreq.QuadPart);
+        {
+            double took = (double)(s1.QuadPart - s0.QuadPart) * 1000.0 / (double)sfreq.QuadPart;
+            if (oldCount != g_diCount || g_diScans <= 3)
+                SmdLog("JoyBridge: DirectInput scan #%u: EnumDevices hr=%08X, %u device(s) enumerated, %u usable (was %u), window=%p, took %.2f ms",
+                    g_diScans, (unsigned)ehr, g_diEnumSeen, g_diCount, oldCount, (void*)hwnd, took);
+            /* The freeze logs ended right around the 1 s scan; make any slow/blocked
+               enumeration visible, not only the first few. */
+            if (took > 50.0)
+                SmdLog("JoyBridge: DirectInput scan #%u took %.1f ms (slow)", g_diScans, took);
+            if (g_diCount == oldCount && SUCCEEDED(ehr)) {
+                if (stableScans < 1000) stableScans++;
+            } else {
+                stableScans = 0;
+            }
+        }
     }
 }
 
