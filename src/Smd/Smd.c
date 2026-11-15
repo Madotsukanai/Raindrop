@@ -4285,7 +4285,8 @@ static int __cdecl ExBgmEventHook(int id) {
 static const int g_PauseAudio = 1;
 
 #define AUDIO_MAX 1024
-typedef struct { IDirectSoundBuffer *buf; int paused, looping, posValid; DWORD pos, settled; } AudioBuf;
+typedef struct { IDirectSoundBuffer *buf; int paused, looping, posValid; DWORD pos, settled;
+                 DWORD absPos; int haveAbs; } AudioBuf;
 static AudioBuf g_audio[AUDIO_MAX];
 static int g_audioN = 0;
 static int g_audioInitialized = 0;
