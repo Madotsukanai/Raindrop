@@ -739,8 +739,31 @@ void SmdHookPrimary(IDirectDrawSurface7 *s) {
 
 static const int g_TitleCancelExit = 1;
 static int g_titleEscCarryover = 0;
+static int g_titleMainMenuPrev = 0;
 
 typedef unsigned char (__attribute__((thiscall)) *PF_InputKey)(void *self, int id);
+
+/* The input object keeps physical key states at +8 (0x80 = down).  The game's key
+   query helpers only expose an edge, so a held ESC looks like a fresh press again
+   after a scene change.  Read the level directly for the cancel carryover guard. */
+static int TitleEscDown(void *input) {
+    return input && !IsBadReadPtr(input, 0x140) &&
+           ((*((unsigned char*)input + 8 + 0x1b)) & 0x80) != 0;
+}
+
+/* Called once per frame: arm the carryover when the title main menu (state 2) is
+   re-entered from a submenu while ESC is still held, so that leftover press is
+   not treated as a fresh cancel that would move the cursor to Exit. */
+static void TitleCancelFrameTick(void) {
+    void *input = *(void**)(uintptr_t)0x46bbec;
+    void *title = *(void**)(uintptr_t)0x4e93c8;
+    int mainMenu = title && !IsBadReadPtr(title, 0x10) && *(int*)((char*)title + 8) == 2;
+    if (mainMenu && !g_titleMainMenuPrev && TitleEscDown(input)) {
+        g_titleEscCarryover = 1;
+        Log("TitleCancel: ESC carryover armed on main menu entry");
+    }
+    g_titleMainMenuPrev = mainMenu;
+}
 
 static int __cdecl TitleCancelHook(void *input) {
     static int cancelHeld = 0;
@@ -917,10 +940,8 @@ static unsigned char __attribute__((fastcall)) OptionUpdateHook(void *opt) {
     PF_InputHold hold = (PF_InputHold)(uintptr_t)0x431480;
     PF_InputKey edge = (PF_InputKey)(uintptr_t)0x431540;
 
-    if (input) {
-        PF_InputKey rawkey = (PF_InputKey)(uintptr_t)0x431500;
-        g_titleEscCarryover = rawkey(input, 0x1b) ? 1 : 0;
-    }
+    if (input)
+        g_titleEscCarryover = TitleEscDown(input) ? 1 : 0;
 
     if (input && page == 1) {
         PF_InputKey rawkeyEnter = (PF_InputKey)(uintptr_t)0x431500;
@@ -4292,6 +4313,9 @@ static int g_audioN = 0;
 static int g_audioInitialized = 0;
 static CRITICAL_SECTION g_audioCs;
 
+/* defined further down, used by the buffer creation hooks above them */
+static void AudioSuppressIfPaused(IDirectSoundBuffer *b);
+
 /* Play() on a stopped looping buffer restarts the voice at position 0 on the
    emulated DirectSound (the cursor report stays stale until the next Play), so an
    unpaused BGM resumes at the ring start, which holds already decoded audio ahead
@@ -4389,15 +4413,20 @@ static void AudioAdd(IDirectSoundBuffer *buf) {
 static HRESULT STDMETHODCALLTYPE DSCreateBufHook(IDirectSound *self, LPCDSBUFFERDESC desc,
                                                  LPDIRECTSOUNDBUFFER *pp, LPUNKNOWN unk) {
     HRESULT hr = g_origCreateBuf(self, desc, pp, unk);
-    if (SUCCEEDED(hr) && pp && *pp && desc && !(desc->dwFlags & DSBCAPS_PRIMARYBUFFER))
+    if (SUCCEEDED(hr) && pp && *pp && desc && !(desc->dwFlags & DSBCAPS_PRIMARYBUFFER)) {
         AudioAdd(*pp);
+        AudioSuppressIfPaused(*pp);
+    }
     return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE DSDupBufHook(IDirectSound *self, LPDIRECTSOUNDBUFFER src,
                                               LPDIRECTSOUNDBUFFER *pp) {
     HRESULT hr = g_origDupBuf(self, src, pp);
-    if (SUCCEEDED(hr) && pp && *pp) AudioAdd(*pp);
+    if (SUCCEEDED(hr) && pp && *pp) {
+        AudioAdd(*pp);
+        AudioSuppressIfPaused(*pp);
+    }
     return hr;
 }
 
@@ -4489,6 +4518,14 @@ static void AudioRingSnapshot(const char *when) {
 typedef unsigned char (__attribute__((thiscall)) *PF_MusicPump)(void *);
 static PF_MusicPump g_origMusicPump = NULL;
 
+/* 1 while the pause menu is open and the audio should be silent.  Buffers that the game
+   creates or restarts during the pause (a new BGM for a menu, a re-Play of the streaming
+   buffer) would otherwise keep playing, which is heard as "the BGM advances during the
+   pause".  The flag lets the creation hooks and the watchdog stop those as well. */
+static volatile int g_audioPaused = 0;
+
+static void AudioPause(void);
+
 static unsigned char __attribute__((thiscall)) MusicPumpHook(void *music) {
     if (*(volatile unsigned char*)(uintptr_t)0x4dae16) {
         Sleep(20);
@@ -4497,9 +4534,57 @@ static unsigned char __attribute__((thiscall)) MusicPumpHook(void *music) {
     return g_origMusicPump ? g_origMusicPump(music) : 1;
 }
 
+/* Stops a single buffer and remembers where it was, so that a buffer started while the
+   pause menu is open becomes silent too.  Returns 1 when the buffer was playing. */
+static int AudioSuppressBuffer(IDirectSoundBuffer *b, const char *why) {
+    DWORD st = 0;
+    int i;
+    if (!b) return 0;
+    if (FAILED(IDirectSoundBuffer_GetStatus(b, &st)) || !(st & DSBSTATUS_PLAYING)) return 0;
+    for (i = 0; i < g_audioN; i++) {
+        if (g_audio[i].buf != b) continue;
+        if (g_audio[i].paused) return 0;
+        g_audio[i].paused = 1;
+        g_audio[i].looping = (st & DSBSTATUS_LOOPING) ? 1 : 0;
+        g_audio[i].posValid = SUCCEEDED(IDirectSoundBuffer_GetCurrentPosition(b, &g_audio[i].pos, NULL));
+        g_audio[i].settled = g_audio[i].pos;
+        IDirectSoundBuffer_Stop(b);
+        Log("PauseAudio: %s buffer %p (%s) stopped at pos %lu", why, (void*)b,
+            g_audio[i].looping ? "looping" : "one-shot", (unsigned long)g_audio[i].pos);
+        return 1;
+    }
+    /* unknown buffer (created while paused and not in the table): just stop it */
+    IDirectSoundBuffer_Stop(b);
+    Log("PauseAudio: %s unknown buffer %p stopped", why, (void*)b);
+    return 1;
+}
+
+/* Called for every buffer the game creates or duplicates while the menu is open. */
+static void AudioSuppressIfPaused(IDirectSoundBuffer *b) {
+    if (!g_audioPaused || !b) return;
+    EnterCriticalSection(&g_audioCs);
+    AudioSuppressBuffer(b, "new");
+    LeaveCriticalSection(&g_audioCs);
+}
+
+/* Watchdog: the game can restart the streaming buffer behind our back; keep the pause silent. */
+static void AudioEnforceSilence(void) {
+    int i;
+    EnterCriticalSection(&g_audioCs);
+    for (i = 0; i < g_audioN; i++) {
+        DWORD st = 0;
+        if (g_audio[i].paused) continue;
+        if (FAILED(IDirectSoundBuffer_GetStatus(g_audio[i].buf, &st))) continue;
+        if (!(st & DSBSTATUS_PLAYING)) continue;
+        AudioSuppressBuffer(g_audio[i].buf, "restarted");
+    }
+    LeaveCriticalSection(&g_audioCs);
+}
+
 static void AudioPause(void) {
     int i, n = 0;
     EnterCriticalSection(&g_audioCs);
+    g_audioPaused = 1;
     g_chkN = 0;
     for (i = 0; i < g_audioN; i++) {
         DWORD st = 0;
@@ -4539,6 +4624,7 @@ static void AudioPause(void) {
 static void AudioResume(int doPlay) {
     int i, n = 0;
     EnterCriticalSection(&g_audioCs);
+    g_audioPaused = 0;
     AudioRingSnapshot(doPlay ? "resume" : "drop");
     for (i = 0; i < g_audioN; i++) {
         if (!g_audio[i].paused) continue;
@@ -4856,6 +4942,15 @@ static DWORD WINAPI PauseAudioThread(LPVOID unused) {
                 if (st == 4 || st == 5) doPlay = 0;
             }
             AudioResume(doPlay);
+        } else if (cur) {
+            /* Keep the pause silent: the game may restart the streaming buffer or create a
+               new one for the menu, which would otherwise keep the BGM playing. */
+            DWORD now = GetTickCount();
+            static DWORD lastEnforce;
+            if (now - lastEnforce >= 100) {
+                lastEnforce = now;
+                AudioEnforceSilence();
+            }
         }
         prev = cur;
     }
@@ -5449,6 +5544,7 @@ static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
     InterlockedIncrement(&g_frameSeq);
     g_frameSeqTick = GetTickCount();
 #endif
+    TitleCancelFrameTick();
     SmdControllerPoll();
     BatchTryInstall();
     r = ((PF_FrameTimer)(uintptr_t)0x424f20)(ctx);
