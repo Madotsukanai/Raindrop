@@ -49,7 +49,7 @@ static void ExeDirFile(const char *name, char *out) {
 static void LogOpen(void) {
     if (g_log) return;
     char path[MAX_PATH];
-    ExeDirFile("Smd_ddraw.log", path);
+    ExeDirFile("raindrop.log", path);
     g_log = fopen(path, "a");
 }
 
@@ -482,6 +482,15 @@ static void PressShared(LONGLONG d) {
             if (!p->counted && d > p->t) {
                 StatAdd(&g_stLatFirst, TicksToMs(d - p->t));
                 p->counted = 1;
+#ifdef SMD_DEBUG_BUILD
+                /* Per-press detail: press -> this present done, and where in the frame the press
+                   landed relative to the frame start (previous present done).  A press after the
+                   frame start was still sampled by that frame's input read; a press before it had
+                   to wait for the next frame. */
+                SmdLog("KeyLat: press->present %.2f ms (press->frame end %.2f, frame start->press %.2f)",
+                       TicksToMs(d - p->t), TicksToMs(d - p->t),
+                       frameStart ? TicksToMs(p->t - frameStart) : -1.0);
+#endif
             }
             done = (TicksToMs(d - p->t) > 1000.0);
             if (frameStart && frameStart >= p->t) {
@@ -1227,8 +1236,15 @@ static const int g_ReplayStageFix = 1;
 
 typedef void (__attribute__((fastcall)) *PF_ReplayUpdate)(void *obj);
 
+static const int g_ReplayRename = 1;
+static void RnTick(void *menu, void *input);
+
 static void __attribute__((fastcall)) ReplayUpdateHook(void *obj) {
     unsigned char *o = (unsigned char*)obj;
+    void *input = *(void**)(uintptr_t)0x46bbec;
+    if (g_ReplayRename && input && !IsBadReadPtr(input, 0x240) &&
+        !IsBadReadPtr(o, 0x2800))
+        RnTick(obj, input);
     if (o[0x27f4] != 0 && o[0x271e] == 0) {
         if (o[0x2711] > 2) {
             Log("ReplayStage: header stage byte %u -> 2", (unsigned)o[0x2711]);
@@ -1270,6 +1286,390 @@ static void PatchReplayStage(void) {
     Log("ReplayStage: patched (hook=%p)", (void*)&ReplayUpdateHook);
 }
 
+/* ------------------------------------------------------------------------
+/* ------------------------------------------------------------------------ *\
+ * ReplayRename: F2 opens an in-place editor for the highlighted replay's
+ * score name (replay menu, state +0x27f4 = 1).  F2 again commits, ESC cancels.
+ * While editing, a blinking horizontal line is shown below the first text
+ * position to mark that keyboard input is in progress.
+ *
+ * The name lives in the first encrypted block of the replay file
+ * (replay\replay%03d.dat), which the game's loader (0x431bd0) verifies:
+ *
+ *   +0x00 'SMDR'   +0x04 version u16   +0x06 u16   +0x08 seed
+ *   +0x20 0x20 bytes: name (16) | crc32(name) | crc32(encrypted block @0x20..EOF)
+ *   +0x40 save block (encrypted) + frame stream
+ *
+ * The block is stored XOR seed stream, one byte per PRNG call.  The game's
+ * PRNG is MT19937-32 (0x405200 seed / 0x405250 next) with a tempering variant;
+ * 0x431bd0 also XORs the first 16 bytes with a second independent stream, so
+ * the stored name is name ^ S(seed) ^ S'(seed) with two generators primed by
+ * the same seed.  Both streams and the CRC32 (game's 0x410c10) are replicated
+ * here so an edited replay still passes the loader's checksum verification.
+ * Log lines start with "ReplayRename:".
+ * ---------------------------------------------------------------------- */
+
+static unsigned int (__attribute__((thiscall)) *RN_CRC32)(void *self, const void *data, int len) =
+    (unsigned int (__attribute__((thiscall)) *)(void *, const void *, int))(uintptr_t)0x410c10;
+
+static unsigned char g_rnEdit[16];  /* name being edited (NUL padded) */
+static int  g_rnCursor;             /* insert position 0..16 */
+static char g_rnBuf[17];            /* display buffer */
+static int  g_rnActive;             /* editor open */
+static int  g_rnId;                 /* replay being edited */
+static int  g_rnErrTimer;           /* frames to flash the error colour */
+static int  g_rnTick;               /* editor frame counter */
+static int  g_rnEscArmed;           /* ESC edge latch while typing */
+static char g_rnNameRow[0xe8] __attribute__((aligned(16)));
+static char g_rnCaptionRow[0xe8] __attribute__((aligned(16)));
+static char g_rnCaretRow[0xe8] __attribute__((aligned(16)));
+static void *g_rnRowTex;
+static int  g_rnRowInit;
+
+/* --- the game's MT19937-32 PRNG (0x405200 seed, 0x405250 next) ------------ */
+static unsigned int g_rnMt[625];
+static int g_rnMtLeft = 0;          /* words left in the generated block */
+
+static void RnMtSeed(unsigned int seed) {
+    int i;
+    g_rnMt[0] = seed;
+    for (i = 1; i < 625; i++) {
+        unsigned int prev = g_rnMt[i - 1];
+        unsigned int y = (prev >> 30) ^ prev;
+        g_rnMt[i] = y * 0x6c078965 + (unsigned)i;
+    }
+    g_rnMtLeft = 624;               /* 0x405200 marks 624; 0x405250 regenerates */
+}
+
+static unsigned int RnMtNext(void) {
+    unsigned int y;
+    if (g_rnMtLeft == 0) {
+        int i;
+        for (i = 0; i < 624; i++) {
+            y = (g_rnMt[i] & 0x80000000) | (g_rnMt[i + 1] & 0x7fffffff);
+            g_rnMt[i] = g_rnMt[i + 1] ^ (y >> 1) ^ ((y & 1) ? 0x9908b0df : 0);
+        }
+        y = (g_rnMt[624] & 0x80000000) | (g_rnMt[0] & 0x7fffffff);
+        g_rnMt[624] = g_rnMt[0] ^ (y >> 1) ^ ((y & 1) ? 0x9908b0df : 0);
+        g_rnMtLeft = 624;
+    }
+    y = g_rnMt[624 - g_rnMtLeft];
+    g_rnMtLeft--;
+    y ^= y >> 11;
+    y ^= (y & 0xff3a58ad) << 7;
+    y ^= (y & 0xffffdf8c) << 15;
+    y ^= y >> 18;
+    return y;
+}
+
+static unsigned int RnCrc32(const void *data, int len) {
+    return RN_CRC32(NULL, data, len);
+}
+
+/* one byte of the stream the game stores data under: data byte ^ (rand & 0xff) */
+static void RnSeedXor(unsigned char *p, int len, unsigned int seed) {
+    int i;
+    RnMtSeed(seed);
+    for (i = 0; i < len; i++)
+        p[i] = (unsigned char)(p[i] ^ (RnMtNext() & 0xff));
+}
+
+/* read the stored score name of replay id; 1 = ok (checksums verified) */
+static int RnLoadName(int id, char name[17]) {
+    char path[64];
+    FILE *f;
+    unsigned char hdr[12], blk[0x20], *body;
+    long size;
+    unsigned int seed, c1, c2;
+    unsigned char nameEnc[16], namePlain[16];
+    int i;
+    snprintf(path, sizeof(path), "replay\\replay%03d.dat", id);
+    f = fopen(path, "rb");
+    if (!f) return 0;
+    if (fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "SMDR", 4) != 0 ||
+        fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < 0x40) {
+        fclose(f);
+        return 0;
+    }
+    seed = *(unsigned int*)(hdr + 8);
+    body = (unsigned char*)malloc((size_t)size);
+    if (!body) { fclose(f); return 0; }
+    fseek(f, 0, SEEK_SET);
+    if (fread(body, 1, (size_t)size, f) != (size_t)size) {
+        free(body);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    /* encrypted block at +0x20; name = decrypt(0x20..0x2f) ^ stream'(first 16) */
+    memcpy(blk, body + 0x20, 0x20);
+    RnSeedXor(blk, 0x20, seed);
+    c1 = *(unsigned int*)(blk + 0x10);
+    c2 = *(unsigned int*)(blk + 0x14);
+    if (RnCrc32(blk, 16) != c1 || RnCrc32(body + 0x20, (int)size - 0x20) != c2) {
+        free(body);
+        return 0;
+    }
+    memcpy(nameEnc, body + 0x20, 16);
+    RnSeedXor(nameEnc, 16, seed);
+    memcpy(namePlain, nameEnc, 16);
+    RnSeedXor(namePlain, 16, seed);     /* second stream, same seed */
+    memcpy(name, namePlain, 16);
+    name[16] = 0;
+    for (i = 0; i < 16; i++)
+        if ((unsigned char)name[i] < 0x20 || (unsigned char)name[i] >= 0x7f)
+            ((unsigned char*)name)[i] = '?';
+    free(body);
+    return 1;
+}
+
+/* write the score name of replay id back into the file (re-encrypted) */
+static int RnSaveName(int id, const char name[16]) {
+    char path[64];
+    FILE *f;
+    long size;
+    unsigned char hdr[12], blk[0x20], *body;
+    unsigned int seed, c1, c2;
+    unsigned char nameEnc[16];
+    snprintf(path, sizeof(path), "replay\\replay%03d.dat", id);
+    f = fopen(path, "rb");
+    if (!f) return 0;
+    if (fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "SMDR", 4) != 0 ||
+        fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < 0x40) {
+        fclose(f);
+        return 0;
+    }
+    seed = *(unsigned int*)(hdr + 8);
+    body = (unsigned char*)malloc((size_t)size);
+    if (!body) { fclose(f); return 0; }
+    fseek(f, 0, SEEK_SET);
+    if (fread(body, 1, (size_t)size, f) != (size_t)size) {
+        free(body);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    /* encrypt the new name: plain ^ S(seed) ^ S'(seed) */
+    memcpy(nameEnc, name, 16);
+    RnSeedXor(nameEnc, 16, seed);
+    RnSeedXor(nameEnc, 16, seed);
+    memcpy(blk, nameEnc, 16);
+    c1 = RnCrc32(blk, 16);
+    c2 = RnCrc32(body + 0x20, (int)size - 0x20);
+    *(unsigned int*)(blk + 0x10) = c1;
+    *(unsigned int*)(blk + 0x14) = c2;
+    RnSeedXor(blk, 0x20, seed);         /* store XOR S(seed) */
+    memcpy(body + 0x20, blk, 0x20);
+    f = fopen(path, "wb");
+    if (!f) { free(body); return 0; }
+    if (fwrite(body, 1, (size_t)size, f) != (size_t)size) {
+        fclose(f);
+        free(body);
+        return 0;
+    }
+    fclose(f);
+    free(body);
+    return 1;
+}
+
+static void RnDisplay(void) {
+    int i, n = 0;
+    for (i = 0; i < 16 && g_rnEdit[i]; i++)
+        g_rnBuf[n++] = (char)g_rnEdit[i];
+    g_rnBuf[n] = 0;
+}
+
+static void RnRowsEnsure(void *menu) {
+    void *tex = *(void**)((char*)menu + 0x10);
+    if (g_rnRowInit && g_rnRowTex == tex) return;
+    g_rnRowInit = 1;
+    g_rnRowTex = tex;
+    memset(g_rnNameRow, 0, sizeof(g_rnNameRow));
+    memset(g_rnCaptionRow, 0, sizeof(g_rnCaptionRow));
+    ((void (__attribute__((thiscall)) *)(void *))(uintptr_t)0x41c690)(g_rnNameRow);
+    ((void (__attribute__((thiscall)) *)(void *))(uintptr_t)0x41c690)(g_rnCaptionRow);
+    ((void (__attribute__((thiscall)) *)(void *, void *, int, int, int, int, int, int, int))
+        (uintptr_t)0x41ff10)(g_rnNameRow, tex, 0xa0, 0xa8, 0, 0, 0x100, 0x100, 0);
+    ((void (__attribute__((thiscall)) *)(void *, void *, int, int, int, int, int, int, int))
+        (uintptr_t)0x41ff10)(g_rnCaptionRow, tex, 0xa0, 0x98, 0, 0, 0x100, 0x100, 0);
+    /* caret: one row cell below the name row's first text line, at the row's
+       left edge (font cell advance 16 screen px = 16/0.8 tex px, text x = +16) */
+    memset(g_rnCaretRow, 0, sizeof(g_rnCaretRow));
+    ((void (__attribute__((thiscall)) *)(void *))(uintptr_t)0x41c690)(g_rnCaretRow);
+    ((void (__attribute__((thiscall)) *)(void *, void *, int, int, int, int, int, int, int))
+        (uintptr_t)0x41ff10)(g_rnCaretRow, tex, 0xb0, 0xc0, 0, 0, 0x100, 0x100, 0);
+    *(int*)(g_rnNameRow + 0xac) = 0x3f4ccccd;
+    *(int*)(g_rnNameRow + 0xb0) = 0x3f4ccccd;
+    *(int*)(g_rnCaptionRow + 0xac) = 0x3f4ccccd;
+    *(int*)(g_rnCaptionRow + 0xb0) = 0x3f4ccccd;
+    *(int*)(g_rnCaretRow + 0xac) = 0x3f4ccccd;
+    *(int*)(g_rnCaretRow + 0xb0) = 0x3f4ccccd;
+}
+
+static void RnRowText(char *row, DWORD color, const char *text) {
+    *(int*)(row + 0xd8) = (int)color;
+    ((void (__cdecl *)(void *, int, int, int, int, int, const char *, ...))
+        (uintptr_t)0x41ff80)(row, 0x10, 0xc, 8, 9, 0xb, "%s", text);
+}
+
+static void RnDrawEditor(void) {
+    char *title = *(char**)(uintptr_t)0x4e93cc;
+    DWORD color;
+    if (!g_rnActive || !title || IsBadReadPtr(title, 0x18) || !*(void**)(title + 0x10)) return;
+    RnRowsEnsure(title);
+    color = (g_rnErrTimer > 0 && (g_rnErrTimer & 0x10)) ? 0x0000ff : 0xffffff;
+    RnRowText(g_rnCaptionRow, 0xffffff, "SCORE NAME  (F2:Enter,ESC:Cancel)");
+    RnRowText(g_rnNameRow, color, g_rnBuf);
+    /* blinking underline caret while input is in progress */
+    RnRowText(g_rnCaretRow, color, (g_rnTick & 0x10) ? "_" : "");
+    ((void (__attribute__((thiscall)) *)(void *, int))(uintptr_t)0x420270)(g_rnCaptionRow, 0);
+    ((void (__attribute__((thiscall)) *)(void *, int))(uintptr_t)0x420270)(g_rnNameRow, 0);
+    ((void (__attribute__((thiscall)) *)(void *, int))(uintptr_t)0x420270)(g_rnCaretRow, 0);
+}
+
+static unsigned char __attribute__((fastcall)) RnDrawHook(void *obj) {
+    unsigned char r = ((unsigned char (__attribute__((thiscall)) *)(void *))(uintptr_t)0x418d30)(obj);
+    RnDrawEditor();
+    return r;
+}
+
+static void RnOpen(int id) {
+    char name[17];
+    int i;
+    if (RnLoadName(id, name)) {
+        for (i = 0; i < 16; i++) g_rnEdit[i] = (unsigned char)name[i];
+        g_rnCursor = 0;
+        while (g_rnCursor < 16 && g_rnEdit[g_rnCursor]) g_rnCursor++;
+        RnDisplay();
+        g_rnId = id;
+        g_rnActive = 1;
+        g_rnTick = 0;
+        g_rnEscArmed = 1;           /* ESC must be released first */
+        Log("ReplayRename: editing replay %03d name '%s'", id, name);
+    } else {
+        g_rnErrTimer = 0x40;
+        Log("ReplayRename: replay %03d not found or unreadable", id);
+    }
+}
+
+static void RnClose(int commit) {
+    if (commit) {
+        char name[17];
+        int i;
+        for (i = 0; i < 16; i++) name[i] = (char)g_rnEdit[i];
+        name[16] = 0;
+        if (RnSaveName(g_rnId, name)) {
+            Log("ReplayRename: replay %03d saved with name '%s'", g_rnId, name);
+        } else {
+            g_rnErrTimer = 0x60;
+            Log("ReplayRename: saving replay %03d failed", g_rnId);
+        }
+    }
+    g_rnActive = 0;
+}
+
+static void RnTypeKey(int vk) {
+    if (vk >= 'a' && vk <= 'z') vk -= 0x20;
+    if (vk >= 0x20 && vk <= 0x7e && vk != '\\') {
+        if (g_rnCursor < 16) {
+            int tail = 15 - g_rnCursor;
+            if (tail > 0)
+                memmove(g_rnEdit + g_rnCursor + 1, g_rnEdit + g_rnCursor, (size_t)tail);
+            g_rnEdit[g_rnCursor] = (unsigned char)vk;
+            if (g_rnCursor < 15) g_rnCursor++;
+            RnDisplay();
+        }
+    } else if (vk == 0x08) {            /* backspace */
+        if (g_rnCursor > 0) {
+            memmove(g_rnEdit + g_rnCursor - 1, g_rnEdit + g_rnCursor,
+                    (size_t)(16 - g_rnCursor));
+            g_rnEdit[15] = 0;
+            g_rnCursor--;
+            RnDisplay();
+        }
+    }
+}
+
+/* called once per frame from ReplayUpdateHook while the replay menu runs */
+static void RnTick(void *menu, void *input) {
+    unsigned char *keys = (unsigned char*)input + 8;
+    unsigned char *latch = (unsigned char*)input + 0x130;
+    unsigned char down[0x100], latched[0x100];
+    unsigned buttons, prevButtons;
+    int f2, vk;
+
+    if (g_rnErrTimer > 0) g_rnErrTimer--;
+
+    f2 = (keys[0x71] & 0x80) != 0 && (latch[0x71] & 0x80) == 0;
+    if (!g_rnActive) {
+        if (f2 && *(unsigned char*)((char*)menu + 0x27f4) != 0 &&
+            *(unsigned char*)((char*)menu + 0x271e) == 0)
+            RnOpen(*(int*)((char*)menu + 0x27e8));
+        return;
+    }
+
+    g_rnTick++;
+    buttons = *(unsigned*)(input + 4);
+    prevButtons = *(unsigned*)(input + 0x12c);
+    memcpy(down, keys, sizeof(down));
+    memcpy(latched, latch, sizeof(latched));
+    /* the editor consumes the keyboard: hide it from the menu while typing */
+    *(unsigned*)(input + 4) = 0;
+    *(unsigned*)(input + 0x12c) = 0;
+    memset(keys, 0, 0x100);
+    memset(latch, 0, 0x100);
+
+    if (down[0x1b] & 0x80) {
+        if (!g_rnEscArmed) {
+            g_rnEscArmed = 1;
+            RnClose(0);
+        }
+    } else {
+        g_rnEscArmed = 0;
+    }
+    if (g_rnActive) {
+        for (vk = 0x20; vk <= 0x7e; vk++)
+            if ((down[vk] & 0x80) && !(latched[vk] & 0x80)) RnTypeKey(vk);
+        if ((down[0x0d] & 0x80) && !(latched[0x0d] & 0x80))       /* Enter */
+            RnClose(1);
+        else if ((down[0x2e] & 0x80) && !(latched[0x2e] & 0x80))  /* Delete */
+            RnClose(1);
+    }
+
+    memcpy(keys, down, sizeof(down));
+    memcpy(latch, latched, sizeof(latched));
+    *(unsigned*)(input + 4) = buttons;
+    *(unsigned*)(input + 0x12c) = prevButtons;
+}
+
+static void PatchReplayRenameDraw(void) {
+    static const unsigned char orig[9] = {
+        0x10, 0xae, 0x4d, 0x00, 0xe8, 0x41, 0x4e, 0x00, 0x00
+    };
+    const DWORD addr = 0x413ee6;
+    unsigned char *p = (unsigned char*)addr;
+    DWORD old, rel;
+
+    if (!g_ReplayRename) return;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("ReplayRename: unexpected image base, skipped");
+        return;
+    }
+    if (memcmp(p, orig, sizeof(orig)) != 0) {
+        Log("ReplayRename: code signature mismatch, skipped");
+        return;
+    }
+    if (!VirtualProtect(p, sizeof(orig), PAGE_EXECUTE_READWRITE, &old)) {
+        Log("ReplayRename: VirtualProtect failed (err=%08X)", GetLastError());
+        return;
+    }
+    rel = (DWORD)(uintptr_t)&RnDrawHook - (addr + 4 + 5);
+    memcpy(p + 5, &rel, 4);
+    VirtualProtect(p, sizeof(orig), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
+    Log("ReplayRename: draw hook installed (hook=%p)", (void*)&RnDrawHook);
+}
+
 typedef unsigned char (__attribute__((fastcall)) *PF_ReplaySavePromptUpdate)(void *obj);
 typedef void (__attribute__((thiscall)) *PF_ReplaySaveInputAction)(void *input);
 
@@ -1289,65 +1689,49 @@ typedef void (__attribute__((thiscall)) *PF_ReplaySaveInputAction)(void *input);
  */
 static const int g_ReplaySaveCancel = 1;
 
-static int ReplaySaveCancelPressed(void *input, unsigned char *o) {
-    PF_InputKey edge = (PF_InputKey)(uintptr_t)0x431540;
-    PF_InputKey rawkey = (PF_InputKey)(uintptr_t)0x431500;
-    (void)o;
-    if (!input || IsBadReadPtr(input, 0x240)) return 0;
-    /* 7 = ESC / pad Button4 and 5 = X / pad Button2 are the game's cancel buttons (see 0x431180). */
-    if (edge(input, 7) || edge(input, 5)) return 1;
-    return rawkey(input, 0x1b) != 0;
+/* Physical key state as the game's input object keeps it (+0x08 + VK code, 0x80 = down).  In the
+ * replay save scene the prompt object's button bitset (+0x04) is not refreshed (only the game scene
+ * runs the input recorder), so the game's own edge/button queries (0x431540) cannot see the cancel
+ * buttons here; the raw key states are always current. */
+static int ReplaySaveKeyDown(void *input, int vk) {
+    return input && vk >= 0 && vk < 0x100 &&
+           (((unsigned char*)input)[8 + vk] & 0x80) != 0;
 }
 
-static int g_replaySaveTrace = 400;   /* TEMP diagnostics */
+/* 0x1b = ESC and 0x58 = X are the keys the game maps to its cancel buttons by default (0x431180:
+ * action 7 = ESC / pad Button4, action 5 = X / pad Button2). */
+static int ReplaySaveCancelDown(void *input) {
+    return ReplaySaveKeyDown(input, 0x1b) || ReplaySaveKeyDown(input, 0x58);
+}
+
+static void *g_replaySaveArmedObj = NULL;
+static int g_replaySaveArmed = 0;
 
 static unsigned char __attribute__((fastcall)) ReplaySavePromptUpdateHook(void *obj) {
     unsigned char *o = (unsigned char*)obj;
     void *input = *(void**)(uintptr_t)0x46bbec;
 
-    if (o && o[4] && g_replaySaveTrace > 0) {   /* TEMP diagnostics */
-        PF_InputKey edge = (PF_InputKey)(uintptr_t)0x431540;
-        PF_InputKey rawkey = (PF_InputKey)(uintptr_t)0x431500;
-        int ids[7] = { 2, 3, 4, 5, 6, 7, 8 };
-        int i;
-        --g_replaySaveTrace;
-        Log("ReplaySaveDbg: sel=%d fade=%d ready=%d done=%d active=%d input=%p f230=%d f233=%d "
-            "f234=%d f235=%d btn=%08X prev=%08X",
-            *(int*)(o + 0x488), *(int*)(o + 0x48c), *(int*)(o + 0x490), *(int*)(o + 0x494),
-            (int)o[4], input,
-            input ? (int)*((unsigned char*)input + 0x230) : -1,
-            input ? (int)*((unsigned char*)input + 0x233) : -1,
-            input ? (int)*((unsigned char*)input + 0x234) : -1,
-            input ? (int)*((unsigned char*)input + 0x235) : -1,
-            input ? *(unsigned*)((unsigned char*)input + 4) : 0,
-            input ? *(unsigned*)((unsigned char*)input + 0x12c) : 0);
-        if (input) {
-            for (i = 0; i < 7; i++) {
-                if (edge(input, ids[i]))
-                    Log("ReplaySaveDbg: edge button %d pressed", ids[i]);
-            }
-            Log("ReplaySaveDbg: keys esc=%02X x=%02X z=%02X enter=%02X prev=%02X/%02X/%02X/%02X",
-                (unsigned)*((unsigned char*)input + 8 + 0x1b),
-                (unsigned)*((unsigned char*)input + 8 + 0x58),
-                (unsigned)*((unsigned char*)input + 8 + 0x5a),
-                (unsigned)*((unsigned char*)input + 8 + 0x0d),
-                (unsigned)*((unsigned char*)input + 0x130 + 0x1b),
-                (unsigned)*((unsigned char*)input + 0x130 + 0x58),
-                (unsigned)*((unsigned char*)input + 0x130 + 0x5a),
-                (unsigned)*((unsigned char*)input + 0x130 + 0x0d));
+    /* The cancel keys must be released once after the prompt appears, so a button still held from
+     * the previous screen does not dismiss the prompt by itself. */
+    if (obj && o[4] && input && !IsBadReadPtr(input, 0x240)) {
+        if (g_replaySaveArmedObj != obj || *(int*)(o + 0x490) == 0) {
+            g_replaySaveArmedObj = obj;
+            g_replaySaveArmed = !ReplaySaveCancelDown(input);
         }
-    }
-
-    if (obj && o[4] && *(int*)(o + 0x490) != 0 && *(int*)(o + 0x494) == 0 &&
-        g_ReplaySaveCancel && ReplaySaveCancelPressed(input, o)) {
-        *(int*)(o + 0x488) = 1;                 /* NO */
-        ((PF_ReplaySaveInputAction)(uintptr_t)0x431880)(input);
-        ((PF_ReplaySaveInputAction)(uintptr_t)0x4318a0)(input);   /* the game's NO action: no file write */
-        ((PF_PlaySe)(uintptr_t)0x412210)((void*)(uintptr_t)0x4ea3a8, 0, 0xff);
-        *(int*)(o + 0x48c) = 0x19;
-        *(int*)(o + 0x494) = 1;
-        Log("ReplaySave: cancel treated as No, replay not saved");
-        return 1;
+        if (*(int*)(o + 0x494) == 0 && *(int*)(o + 0x490) != 0) {
+            if (!g_replaySaveArmed) {
+                if (!ReplaySaveCancelDown(input)) g_replaySaveArmed = 1;
+            } else if (g_ReplaySaveCancel && ReplaySaveCancelDown(input)) {
+                *(int*)(o + 0x488) = 1;                 /* NO */
+                ((PF_ReplaySaveInputAction)(uintptr_t)0x431880)(input);
+                ((PF_ReplaySaveInputAction)(uintptr_t)0x4318a0)(input);   /* the game's NO action: no file write */
+                ((PF_PlaySe)(uintptr_t)0x412210)((void*)(uintptr_t)0x4ea3a8, 0, 0xff);
+                *(int*)(o + 0x48c) = 0x19;
+                *(int*)(o + 0x494) = 1;
+                Log("ReplaySave: cancel treated as No, replay not saved");
+                return 1;
+            }
+        }
     }
     return ((PF_ReplaySavePromptUpdate)(uintptr_t)0x41a120)(obj);
 }
@@ -1407,16 +1791,6 @@ static unsigned char __attribute__((fastcall)) ReplayInputQueryHook(void *self, 
     (void)edx;
     FpuEnforce("input", -1);
     PauseReplayRestore();
-    /* TEMP diagnostics: F5 jumps to the replay save prompt (scene 5) for testing. */
-    if (self && !IsBadReadPtr(self, 0x240)) {
-        static int f5prev = 0;
-        int f5 = (*((unsigned char*)self + 8 + 0x74) & 0x80) != 0;
-        if (f5 && !f5prev) {
-            Log("Debug: F5 -> scene 5 (replay save prompt)");
-            ((void (__cdecl *)(int, int))(uintptr_t)0x4254d0)(5, 0);
-        }
-        f5prev = f5;
-    }
     /* Practice frame simulation must not consume live keyboard or controller input. */
     if (g_exSimulatingStageFrame) return 0;
     result = g_replayInputQueryOrig(self, id, delay);
@@ -5758,6 +6132,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         PatchReplaySaveCancel();
         PatchResultRetry();
         PatchReplayStage();
+        PatchReplayRenameDraw();
         PatchReplayInputTrace();
         PatchPracticePower();
         PatchExAreaSelect();

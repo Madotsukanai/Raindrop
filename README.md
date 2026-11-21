@@ -22,6 +22,16 @@ API=DirectDraw
 `API=DirectDraw`はシステムのDirectDrawを使用します。利用できない場合はD3D9へフォールバックします。`API=D3D9`にすると、起動時から内蔵D3D9実装を使用します。ファイルまたは設定がない場合は`DirectDraw`を使用します。<br>
 Wine/Protonではデフォルトの`DirectDraw`のままにすることを推奨します。
 
+内蔵D3D9実装（`API=D3D9`）の表示同期は`VSync`で選択できます。
+
+```ini
+[Graphics]
+API=D3D9
+VSync=auto
+```
+
+`VSync=auto`は、Windowsでは59〜61Hzの表示なら垂直同期あり、Wine/Protonでは垂直同期なし（60fpsはゲーム自身のフレームタイマで維持されます）です。Wine/ProtonではX11/Waylandのコンポジタが既に画面の垂直同期に合わせて合成するため、Present内でも垂直同期を待つと入力遅延が1フレーム増えるためです。`VSync=on`で常に垂直同期あり、`VSync=off`で常に垂直同期なしになります。垂直同期なしでは、ティアリングよりも入力遅延を優先します。
+
 ### RefRain
 
 [Releases](https://github.com/Madotsukanai/Raindrop/releases/latest)から`d3d9.dll`をダウンロードし、ディスク版`RefRain.exe` (SHA-256: `db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78`)またはSteam版`RefRain.exe` (SHA-256: 1941799d114dacbbd83a3d40c69ad4f5063ee4a175c591dc155d5deca4a6e959)と同じディレクトリにコピーしてゲームを起動してください。

@@ -20,6 +20,16 @@ API=DirectDraw
 `API=DirectDraw` uses the system DirectDraw implementation and falls back to D3D9 if it is unavailable. Set `API=D3D9` to use the built-in D3D9 implementation from startup. If the file or setting is missing, `DirectDraw` is used.<br>
 On Wine/Proton, keeping the default `DirectDraw` is recommended.
 
+Display synchronisation of the built-in D3D9 implementation (`API=D3D9`) is selected with `VSync`.
+
+```ini
+[Graphics]
+API=D3D9
+VSync=auto
+```
+
+`VSync=auto` means vblank sync on a 59-61 Hz display on Windows, and no vblank sync on Wine/Proton (60 fps comes from the game's own frame timer). Under Wine/Proton the X11/Wayland compositor already presents the window on the display's vblank, so also waiting for the vblank inside Present costs one extra frame of input latency. `VSync=on` always waits for vblank and `VSync=off` never does; without vblank sync, input latency is preferred over tearing.
+
 ### RefRain
 
 Download `d3d9.dll` from [Releases](https://github.com/Madotsukanai/Raindrop/releases/latest), copy it to the same directory as the disc-version `RefRain.exe` (SHA-256: `db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78`) or the Steam-version `RefRain.exe` (SHA-256: `1941799d114dacbbd83a3d40c69ad4f5063ee4a175c591dc155d5deca4a6e959`), and start the game. The DLL detects which build is running at load time.

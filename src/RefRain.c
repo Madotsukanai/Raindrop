@@ -260,7 +260,7 @@ static ID3DXFont *g_pTitleFont = NULL;
 static ID3DXFont *g_pFooterFont = NULL;
 static DWORD g_CurrentFontWidth = 0;
 
-/* Logging (stage_select.log and OutputDebugString) is only compiled into the debug build
+/* Logging (raindrop.log and OutputDebugString) is only compiled into the debug build
    (make refrain-debug, which defines REFRAIN_DEBUG_BUILD).  The release build keeps the call sites but
    LogMessage does nothing there (the arguments are still evaluated). */
 #ifdef REFRAIN_DEBUG_BUILD
@@ -273,7 +273,7 @@ static void LogMessage(const char *format, ...) {
 
     OutputDebugStringA(buf);
 
-    FILE *fp = fopen("stage_select.log", "a");
+    FILE *fp = fopen("raindrop.log", "a");
     if (fp) {
         SYSTEMTIME st;
         GetLocalTime(&st);
@@ -3055,7 +3055,7 @@ static void ResetStageScore(void) {
 }
 
 /* ---- PauseDiag: ポーズメニューの調査用ログ (ゲーム動作は変更しない) ----
- * stage_select.log の "PauseDiag:" 行を共有する。
+ * raindrop.log の "PauseDiag:" 行を共有する。
  *  - シーン変数 0x5c073c(現在) / 0x5c0740(次) / 0x5c0744 / 0x4d237c(リプレイ枠) / 0x5b8e68 の変化
  *  - フレームカウンタ 0x5abb78 が止まった(=ポーズ)/再開した瞬間の、ゲーム変数領域の差分
  *  - IsKeyTriggered が true を返したキー

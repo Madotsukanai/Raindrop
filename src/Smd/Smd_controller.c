@@ -546,7 +546,7 @@ static int JoyDirectInputState(unsigned id, JOYINFOEX *out) {
 
     {
         unsigned n = ++pollSeq;
-        if (n <= 3000) SmdLog("JoyBridge: DI poll enter #%u id=%u", n, id);
+        if (n <= 5 || (n % 500) == 0) SmdLog("JoyBridge: DI poll enter #%u id=%u", n, id);
     }
     if (id >= g_diCount || !out) return 0;
     device = g_diDevices[id];

@@ -23,7 +23,7 @@ $(BUILD)/d3d9.dll: $(BUILD)/RefRain.o
 $(BUILD)/RefRain.o: src/RefRain.c src/d3dx9_font_compat.h | $(BUILD)
 	$(CC) -c -o $@ $< $(CFLAGS)
 
-# make refrain-debug : same, with logging (stage_select.log) enabled -> build/debug/d3d9.dll
+# make refrain-debug : same, with logging (raindrop.log) enabled -> build/debug/d3d9.dll
 refrain-debug: $(BUILD)/debug/d3d9.dll
 
 $(BUILD)/debug/d3d9.dll: $(BUILD)/RefRain_debug.o | $(BUILD)/debug

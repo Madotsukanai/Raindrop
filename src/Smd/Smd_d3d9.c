@@ -22,6 +22,9 @@
 /* D3D9/DDraw emulation restored from Raindrop 0.1.9 (tag 0.1.9, commit 8eb18cc). */
 static int g_fullscreenRequested = 0;
 static int g_displayModeFailures = 0;
+static int g_d7Vsync = 1;   /* device presents with D3DPRESENT_INTERVAL_ONE (see D7E_ConfigVsync) */
+static int D7E_ConfigVsync(UINT refresh);
+static const char *D7E_VsyncSource(void);
 static void ExeDirFile(const char *name, char *out) {
     GetModuleFileNameA(NULL, out, MAX_PATH);
     char *slash = strrchr(out, '\\');
@@ -33,7 +36,7 @@ static void ExeDirFile(const char *name, char *out) {
    so a startup hang can be located by looking at the last logged call. */
 #ifdef SMD_DEBUG_BUILD
 static unsigned g_d7TraceTotal;
-#define D7_TRACE_LIMIT 6000
+#define D7_TRACE_LIMIT 600
 static void TraceHit(const char *name) {
     if (g_d7TraceTotal++ >= D7_TRACE_LIMIT) return;
     SmdLog("TRACE %05u %s", g_d7TraceTotal - 1, name);
@@ -706,10 +709,10 @@ static int D7_InitD3D9(void) {
         UINT rr = 0;
         if (SUCCEEDED(IDirect3D9_GetAdapterDisplayMode(g_d7.d3d, D3DADAPTER_DEFAULT, &dm)))
             rr = dm.RefreshRate;
-        pp.PresentationInterval = (rr >= 59 && rr <= 61) ? D3DPRESENT_INTERVAL_ONE
-                                                        : D3DPRESENT_INTERVAL_IMMEDIATE;
-        SmdLog("D3D7 emu: vsync %s (display %u Hz)",
-            pp.PresentationInterval == D3DPRESENT_INTERVAL_ONE ? "on" : "off (pacing)", rr);
+        g_d7Vsync = D7E_ConfigVsync(rr);
+        pp.PresentationInterval = g_d7Vsync ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
+        SmdLog("D3D7 emu: vsync %s (display %u Hz) - %s",
+            g_d7Vsync ? "on" : "off (async present)", rr, D7E_VsyncSource());
     }
     hr = D3DERR_NOTAVAILABLE;
     if (g_D7PureDevice) {
@@ -783,9 +786,11 @@ static HRESULT D7_PresentFS(void) {
 }
 
 /* Present pacing: align early frame arrivals to 16.667 ms boundaries so D3D9 holds a stable 60.0 fps.
-   On a 60 Hz display the device uses vblank sync (INTERVAL_ONE) so this is usually a no-op; on other
-   refresh rates or async present paths it smooths game-loop jitter.  Disengages when present itself is
-   the bottleneck (driver stall / device loss). */
+   Only used when the device presents without vblank sync (INTERVAL_IMMEDIATE): there Present returns as
+   soon as the frame is handed to the driver/compositor, so the game loop needs its own 60 Hz pacing.
+   With INTERVAL_ONE the vblank already paces the loop, and waiting here only moves the present towards
+   the vblank boundary where it can miss it and slip a whole frame (+16.7 ms of input latency), so the
+   wait is skipped entirely in that mode.  Disengages when present itself is the bottleneck. */
 static LARGE_INTEGER g_paceFreq;
 static LARGE_INTEGER g_lastPresent;
 static double g_costEwmaMs;
@@ -794,8 +799,14 @@ static HANDLE g_paceTimer;
 static int g_paceHiRes;
 static const double D7_PACE_INTERVAL_MS = 16.666667;
 
-static void D7PaceWait(void);
+static double D7PaceWait(void);
 static int SmdIsWine(void);
+
+/* Under Wine the game's own frame timer already holds 60 fps, so the wait is skipped; this guard
+   re-enables it if a system ever presents faster than the game's fixed 60 Hz step. */
+static int g_paceNeeded = -1;   /* -1 unknown, 0 no pacing needed, 1 pacing required */
+static LARGE_INTEGER g_rateStart;
+static unsigned g_rateFrames;
 
 static void D7PaceUpdate(LARGE_INTEGER t1, double cost) {
     if (!g_paceFreq.QuadPart) return;
@@ -803,15 +814,30 @@ static void D7PaceUpdate(LARGE_INTEGER t1, double cost) {
     g_costEwmaMs = g_costEwmaMs ? g_costEwmaMs * 0.85 + cost * 0.15 : cost;
 }
 
-static void D7PaceWait(void) {
-    LARGE_INTEGER now;
+static int D7PaceEnabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("SMD_PACE");
+        v = e ? (atoi(e) != 0) : 1;
+    }
+    return v;
+}
+
+static double D7PaceWait(void) {
+    LARGE_INTEGER now, before;
     double rem, margin, wait;
-    if (!g_paceFreq.QuadPart || !g_lastPresent.QuadPart) return;
-    if (g_costEwmaMs > 4.0) return;   /* present/driver is the bottleneck; don't add latency */
+    QueryPerformanceCounter(&before);
+    if (g_d7Vsync) return 0.0;   /* vblank sync paces the loop; pacing here would race the vblank */
+    if (!D7PaceEnabled()) return 0.0;
+    /* Wine/Proton: the game's own frame timer already holds 60 fps (measured 16.67 ms frame interval
+       with both vblank sync and this pacing disabled), so waiting here only adds to the input latency. */
+    if (SmdIsWine() && g_paceNeeded != 1) return 0.0;
+    if (!g_paceFreq.QuadPart || !g_lastPresent.QuadPart) return 0.0;
+    if (g_costEwmaMs > 4.0) return 0.0;   /* present/driver is the bottleneck; don't add latency */
     QueryPerformanceCounter(&now);
     rem = D7_PACE_INTERVAL_MS -
         (double)(now.QuadPart - g_lastPresent.QuadPart) * 1000.0 / (double)g_paceFreq.QuadPart;
-    if (rem <= 0.3 || rem > 4.0) return;  /* only align early arrivals; late frames pass through */
+    if (rem <= 0.3 || rem > 4.0) return 0.0;  /* only align early arrivals; late frames pass through */
     if (!g_paceTimerInit) {
         typedef HANDLE (WINAPI *PF_CWTExW)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
         HMODULE k = GetModuleHandleA("kernel32.dll");
@@ -849,23 +875,61 @@ static void D7PaceWait(void) {
                 >= D7_PACE_INTERVAL_MS - 0.05) break;
         }
     }
+    {
+        LARGE_INTEGER after;
+        QueryPerformanceCounter(&after);
+        return (double)(after.QuadPart - before.QuadPart) * 1000.0 / (double)g_paceFreq.QuadPart;
+    }
+}
+
+/* Count presents and re-enable the pacing wait when the loop runs faster than the game's 60 Hz
+   step (only relevant while the wait is skipped: no vblank sync, and not yet re-enabled). */
+static void D7RateGuard(void) {
+    LARGE_INTEGER now;
+    if (!SmdIsWine() || g_d7Vsync || g_paceNeeded == 1 || !g_paceFreq.QuadPart) return;
+    QueryPerformanceCounter(&now);
+    if (!g_rateStart.QuadPart) {
+        g_rateStart = now;
+        g_rateFrames = 0;
+        return;
+    }
+    if (++g_rateFrames < 120) return;
+    {
+        double ms = (double)(now.QuadPart - g_rateStart.QuadPart) * 1000.0 / (double)g_paceFreq.QuadPart;
+        double fps = ms > 0.0 ? (double)g_rateFrames * 1000.0 / ms : 0.0;
+        if (fps > 64.0) {
+            g_paceNeeded = 1;
+            SmdLog("D7Present: %.1f fps without pacing, enabling present pacing", fps);
+        } else {
+            g_paceNeeded = 0;
+        }
+    }
+    g_rateStart = now;
+    g_rateFrames = 0;
 }
 
 static void D7_Present(void) {
     LARGE_INTEGER t0, t1;
     TraceHit("Dev.Present(emu)");
     HRESULT hr;
-    double cost;
+    double cost, paceMs;
     if (!g_d7.dev) return;
     if (!g_paceFreq.QuadPart) QueryPerformanceFrequency(&g_paceFreq);
-    D7PaceWait();
+    paceMs = D7PaceWait();
     QueryPerformanceCounter(&t0);
     hr = D7_PresentFS();
     QueryPerformanceCounter(&t1);
     cost = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)g_paceFreq.QuadPart;
     D7PaceUpdate(t1, cost);
+    D7RateGuard();
     SmdKeyLatNote(t1.QuadPart);   /* press->present latency measurement feeds each D3D9 present */
-    SmdLog("D7Present: hr=%08X elapsed=%.2f ms", (unsigned)hr, cost);
+    {
+        static unsigned presentSeq;
+        /* Per-frame present logging makes the debug build's own I/O a measurable part of the frame;
+           sample every 10th present so latency measurements stay representative. */
+        if ((++presentSeq % 10) == 0 || cost > 8.0)
+            SmdLog("D7Present: hr=%08X elapsed=%.2f ms pace=%.2f ms", (unsigned)hr, cost, paceMs);
+    }
     if (hr == D3DERR_DEVICELOST || hr == D3DERR_DEVICENOTRESET) {
         hr = IDirect3DDevice9_TestCooperativeLevel(g_d7.dev);
         if (hr == D3DERR_DEVICENOTRESET) {
@@ -2031,6 +2095,45 @@ static int SmdIsWine(void) {
     if (v < 0) {
         HMODULE ntd = GetModuleHandleA("ntdll.dll");
         v = (ntd && GetProcAddress(ntd, "wine_get_version")) ? 1 : 0;
+    }
+    return v;
+}
+
+/* [Graphics] VSync=auto|on|off in raindrop.ini, SMD_VSYNC=0/1 in the environment.
+   auto: vblank sync on a 59-61 Hz display, except under Wine/Proton where the X11/Wayland
+   compositor already presents the window on its own vblank; waiting for the vblank inside
+   Present as well costs one extra frame of input latency there, so Wine defaults to the
+   async present paced to 60 Hz instead. */
+static const char *g_d7VsyncSrc = "display refresh";
+
+static const char *D7E_VsyncSource(void) { return g_d7VsyncSrc; }
+
+static int D7E_ConfigVsync(UINT refresh) {
+    static int v = -1;
+    if (v >= 0) return v;
+    {
+        const char *env = getenv("SMD_VSYNC");
+        if (env) {
+            v = atoi(env) != 0;
+            g_d7VsyncSrc = "SMD_VSYNC environment";
+        } else {
+            char path[MAX_PATH], value[32];
+            ExeDirFile("raindrop.ini", path);
+            GetPrivateProfileStringA("Graphics", "VSync", "auto", value, sizeof(value), path);
+            if (!_stricmp(value, "on") || !_stricmp(value, "1") || !_stricmp(value, "yes")) {
+                v = 1;
+                g_d7VsyncSrc = "raindrop.ini VSync=on";
+            } else if (!_stricmp(value, "off") || !_stricmp(value, "0") || !_stricmp(value, "no")) {
+                v = 0;
+                g_d7VsyncSrc = "raindrop.ini VSync=off";
+            } else if (SmdIsWine()) {
+                v = 0;
+                g_d7VsyncSrc = "auto (Wine/Proton: compositor vblank, async present)";
+            } else {
+                v = (refresh >= 59 && refresh <= 61) ? 1 : 0;
+                g_d7VsyncSrc = "auto (display refresh)";
+            }
+        }
     }
     return v;
 }
