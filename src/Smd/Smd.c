@@ -1273,23 +1273,81 @@ static void PatchReplayStage(void) {
 typedef unsigned char (__attribute__((fastcall)) *PF_ReplaySavePromptUpdate)(void *obj);
 typedef void (__attribute__((thiscall)) *PF_ReplaySaveInputAction)(void *input);
 
+/*
+ * Replay save prompt: "Save Replay? (No.%03d)" (object at 0x4e93d4, scene 5).
+ *
+ * Its update (0x41a120) only reads left/right (buttons 2/3, selection toggles +0x488 between
+ * 0 = YES and 1 = NO) and confirm (button 4 or Enter), which runs 0x431900 (writes
+ * replay\replay%03d.dat) for YES or 0x4318a0 (nothing) for NO before starting the fade-out
+ * (+0x48c = 0x19, +0x494 = 1).  The cancel buttons are not handled at all, so a player who
+ * does not want to save has to move the cursor to NO and confirm.
+ *
+ * Here a cancel press is turned into NO: the selection is set to NO and the game's own NO
+ * branch (same sound, same fade-out, no 0x431900 call) is run, so no replay file is written.
+ * +0x490 is the "input ready" flag (the prompt waits for the confirm button to be released
+ * before accepting input) and +0x494 is the "decided" flag.
+ */
+static const int g_ReplaySaveCancel = 1;
+
+static int ReplaySaveCancelPressed(void *input, unsigned char *o) {
+    PF_InputKey edge = (PF_InputKey)(uintptr_t)0x431540;
+    PF_InputKey rawkey = (PF_InputKey)(uintptr_t)0x431500;
+    (void)o;
+    if (!input || IsBadReadPtr(input, 0x240)) return 0;
+    /* 7 = ESC / pad Button4 and 5 = X / pad Button2 are the game's cancel buttons (see 0x431180). */
+    if (edge(input, 7) || edge(input, 5)) return 1;
+    return rawkey(input, 0x1b) != 0;
+}
+
+static int g_replaySaveTrace = 400;   /* TEMP diagnostics */
+
 static unsigned char __attribute__((fastcall)) ReplaySavePromptUpdateHook(void *obj) {
     unsigned char *o = (unsigned char*)obj;
     void *input = *(void**)(uintptr_t)0x46bbec;
-    if (input && o[4] && *(int*)(o + 0x494) == 0) {
+
+    if (o && o[4] && g_replaySaveTrace > 0) {   /* TEMP diagnostics */
         PF_InputKey edge = (PF_InputKey)(uintptr_t)0x431540;
         PF_InputKey rawkey = (PF_InputKey)(uintptr_t)0x431500;
-        if (edge(input, 5) || edge(input, 7) || rawkey(input, 0x1b)) {
-            /* Run the game's No branch and its normal fade-out sequence. */
-            *(int*)(o + 0x488) = 0;
-            ((PF_ReplaySaveInputAction)(uintptr_t)0x431880)(input);
-            ((PF_ReplaySaveInputAction)(uintptr_t)0x431900)(input);
-            ((PF_PlaySe)(uintptr_t)0x412210)((void*)(uintptr_t)0x4ea3a8, 0, 0xff);
-            *(int*)(o + 0x48c) = 0x19;
-            *(int*)(o + 0x494) = 1;
-            Log("ReplaySave: cancel skipped saving");
-            return 1;
+        int ids[7] = { 2, 3, 4, 5, 6, 7, 8 };
+        int i;
+        --g_replaySaveTrace;
+        Log("ReplaySaveDbg: sel=%d fade=%d ready=%d done=%d active=%d input=%p f230=%d f233=%d "
+            "f234=%d f235=%d btn=%08X prev=%08X",
+            *(int*)(o + 0x488), *(int*)(o + 0x48c), *(int*)(o + 0x490), *(int*)(o + 0x494),
+            (int)o[4], input,
+            input ? (int)*((unsigned char*)input + 0x230) : -1,
+            input ? (int)*((unsigned char*)input + 0x233) : -1,
+            input ? (int)*((unsigned char*)input + 0x234) : -1,
+            input ? (int)*((unsigned char*)input + 0x235) : -1,
+            input ? *(unsigned*)((unsigned char*)input + 4) : 0,
+            input ? *(unsigned*)((unsigned char*)input + 0x12c) : 0);
+        if (input) {
+            for (i = 0; i < 7; i++) {
+                if (edge(input, ids[i]))
+                    Log("ReplaySaveDbg: edge button %d pressed", ids[i]);
+            }
+            Log("ReplaySaveDbg: keys esc=%02X x=%02X z=%02X enter=%02X prev=%02X/%02X/%02X/%02X",
+                (unsigned)*((unsigned char*)input + 8 + 0x1b),
+                (unsigned)*((unsigned char*)input + 8 + 0x58),
+                (unsigned)*((unsigned char*)input + 8 + 0x5a),
+                (unsigned)*((unsigned char*)input + 8 + 0x0d),
+                (unsigned)*((unsigned char*)input + 0x130 + 0x1b),
+                (unsigned)*((unsigned char*)input + 0x130 + 0x58),
+                (unsigned)*((unsigned char*)input + 0x130 + 0x5a),
+                (unsigned)*((unsigned char*)input + 0x130 + 0x0d));
         }
+    }
+
+    if (obj && o[4] && *(int*)(o + 0x490) != 0 && *(int*)(o + 0x494) == 0 &&
+        g_ReplaySaveCancel && ReplaySaveCancelPressed(input, o)) {
+        *(int*)(o + 0x488) = 1;                 /* NO */
+        ((PF_ReplaySaveInputAction)(uintptr_t)0x431880)(input);
+        ((PF_ReplaySaveInputAction)(uintptr_t)0x4318a0)(input);   /* the game's NO action: no file write */
+        ((PF_PlaySe)(uintptr_t)0x412210)((void*)(uintptr_t)0x4ea3a8, 0, 0xff);
+        *(int*)(o + 0x48c) = 0x19;
+        *(int*)(o + 0x494) = 1;
+        Log("ReplaySave: cancel treated as No, replay not saved");
+        return 1;
     }
     return ((PF_ReplaySavePromptUpdate)(uintptr_t)0x41a120)(obj);
 }
@@ -1349,6 +1407,16 @@ static unsigned char __attribute__((fastcall)) ReplayInputQueryHook(void *self, 
     (void)edx;
     FpuEnforce("input", -1);
     PauseReplayRestore();
+    /* TEMP diagnostics: F5 jumps to the replay save prompt (scene 5) for testing. */
+    if (self && !IsBadReadPtr(self, 0x240)) {
+        static int f5prev = 0;
+        int f5 = (*((unsigned char*)self + 8 + 0x74) & 0x80) != 0;
+        if (f5 && !f5prev) {
+            Log("Debug: F5 -> scene 5 (replay save prompt)");
+            ((void (__cdecl *)(int, int))(uintptr_t)0x4254d0)(5, 0);
+        }
+        f5prev = f5;
+    }
     /* Practice frame simulation must not consume live keyboard or controller input. */
     if (g_exSimulatingStageFrame) return 0;
     result = g_replayInputQueryOrig(self, id, delay);
