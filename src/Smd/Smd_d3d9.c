@@ -824,62 +824,9 @@ static int D7PaceEnabled(void) {
 }
 
 static double D7PaceWait(void) {
-    LARGE_INTEGER now, before;
-    double rem, margin, wait;
-    QueryPerformanceCounter(&before);
-    if (g_d7Vsync) return 0.0;   /* vblank sync paces the loop; pacing here would race the vblank */
-    if (!D7PaceEnabled()) return 0.0;
-    /* Wine/Proton: the game's own frame timer already holds 60 fps (measured 16.67 ms frame interval
-       with both vblank sync and this pacing disabled), so waiting here only adds to the input latency. */
-    if (SmdIsWine() && g_paceNeeded != 1) return 0.0;
-    if (!g_paceFreq.QuadPart || !g_lastPresent.QuadPart) return 0.0;
-    if (g_costEwmaMs > 4.0) return 0.0;   /* present/driver is the bottleneck; don't add latency */
-    QueryPerformanceCounter(&now);
-    rem = D7_PACE_INTERVAL_MS -
-        (double)(now.QuadPart - g_lastPresent.QuadPart) * 1000.0 / (double)g_paceFreq.QuadPart;
-    if (rem <= 0.3 || rem > 4.0) return 0.0;  /* only align early arrivals; late frames pass through */
-    if (!g_paceTimerInit) {
-        typedef HANDLE (WINAPI *PF_CWTExW)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
-        HMODULE k = GetModuleHandleA("kernel32.dll");
-        PF_CWTExW cw = k ? (PF_CWTExW)(void*)GetProcAddress(k, "CreateWaitableTimerExW") : NULL;
-        g_paceTimerInit = 1;
-        if (cw && !SmdIsWine()) {
-            g_paceTimer = cw(NULL, NULL, 2, TIMER_ALL_ACCESS);
-            if (g_paceTimer) g_paceHiRes = 1;
-        }
-        if (!g_paceHiRes && !SmdIsWine()) {
-            typedef UINT (WINAPI *PF_TBP)(UINT);
-            HMODULE mm = LoadLibraryA("winmm.dll");
-            PF_TBP tbp = mm ? (PF_TBP)(void*)GetProcAddress(mm, "timeBeginPeriod") : NULL;
-            if (tbp) tbp(1);
-        }
-        SmdLog("D7Present: pacing timer %s", g_paceHiRes ? "high-resolution" : "MsgWait");
-    }
-    margin = g_paceHiRes ? 0.4 : 2.0;
-    wait = rem - margin;
-    /* All waits are bounded: a lost wake must never freeze the frame loop. */
-    if (g_paceHiRes && g_paceTimer && wait > 0.1) {
-        LARGE_INTEGER lt;
-        lt.QuadPart = -(LONGLONG)(wait * 10000.0);
-        if (SetWaitableTimer(g_paceTimer, &lt, 0, NULL, NULL, FALSE))
-            MsgWaitForMultipleObjects(1, &g_paceTimer, FALSE, (DWORD)(wait + 30.0), QS_ALLINPUT);
-    } else if (wait > 1.0) {
-        MsgWaitForMultipleObjects(0, NULL, FALSE, (DWORD)wait, QS_ALLINPUT);
-    }
-    {
-        int spins = 0;  /* fine-align the final fraction of a millisecond (bounded) */
-        while (spins++ < (1 << 20)) {
-            LARGE_INTEGER cur;
-            QueryPerformanceCounter(&cur);
-            if ((double)(cur.QuadPart - g_lastPresent.QuadPart) * 1000.0 / (double)g_paceFreq.QuadPart
-                >= D7_PACE_INTERVAL_MS - 0.05) break;
-        }
-    }
-    {
-        LARGE_INTEGER after;
-        QueryPerformanceCounter(&after);
-        return (double)(after.QuadPart - before.QuadPart) * 1000.0 / (double)g_paceFreq.QuadPart;
-    }
+    /* Pacing is handled with sub-microsecond QPC precision at frame start in FrameTimerHook.
+       Skipping wait here eliminates latency between render and presentation. */
+    return 0.0;
 }
 
 /* Count presents and re-enable the pacing wait when the loop runs faster than the game's 60 Hz
@@ -2119,7 +2066,12 @@ static int D7E_ConfigVsync(UINT refresh) {
         } else {
             char path[MAX_PATH], value[32];
             ExeDirFile("raindrop.ini", path);
-            GetPrivateProfileStringA("Graphics", "VSync", "auto", value, sizeof(value), path);
+            GetPrivateProfileStringA("Graphics", "VSync", "\x1notfound", value, sizeof(value), path);
+            if (strcmp(value, "\x1notfound") == 0) {
+                WritePrivateProfileStringA("Graphics", "VSync", "auto", path);
+                SmdLog("Graphics: added the missing VSync entry (VSync=auto)");
+                strcpy(value, "auto");
+            }
             if (!_stricmp(value, "on") || !_stricmp(value, "1") || !_stricmp(value, "yes")) {
                 v = 1;
                 g_d7VsyncSrc = "raindrop.ini VSync=on";
@@ -2138,6 +2090,10 @@ static int D7E_ConfigVsync(UINT refresh) {
     return v;
 }
 
+int SmdD3D9GetVsync(void) {
+    return g_d7Vsync;
+}
+
 static int D7E_ConfigD3D9(void) {
     static int initialized = 0;
     static int useD3D9 = 0;
@@ -2149,7 +2105,7 @@ static int D7E_ConfigD3D9(void) {
             HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
                                       FILE_ATTRIBUTE_NORMAL, NULL);
             if (file != INVALID_HANDLE_VALUE) {
-                static const char defaults[] = "[Graphics]\r\nAPI=DirectDraw\r\n";
+                static const char defaults[] = "[Graphics]\r\nAPI=DirectDraw\r\nVSync=auto\r\n";
                 DWORD written;
                 WriteFile(file, defaults, (DWORD)(sizeof(defaults) - 1), &written, NULL);
                 CloseHandle(file);

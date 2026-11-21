@@ -143,10 +143,10 @@ static void IniAddGeneralSection(const char *path) {
     free(buf);
 }
 
-/* appends "[Graphics]\\r\\nAPI=DirectDraw\\r\\n" to the end when the ini exists without a
+/* appends "[Graphics]\\r\\nAPI=DirectDraw\\r\\nVSync=auto\\r\\n" to the end when the ini exists without a
    [Graphics] section (DirectDraw is the same default the API selector uses unconfigured) */
 static void IniAddGraphicsSection(const char *path) {
-    static const char block[] = "\r\n[Graphics]\r\nAPI=DirectDraw\r\n";
+    static const char block[] = "\r\n[Graphics]\r\nAPI=DirectDraw\r\nVSync=auto\r\n";
     FILE *f = fopen(path, "rb");
     long fsize;
     char *buf;
@@ -179,7 +179,7 @@ static void LoadGeneralConfig(void) {
         HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
                                   FILE_ATTRIBUTE_NORMAL, NULL);
         if (file != INVALID_HANDLE_VALUE) {
-            static const char defaults[] = "[General]\r\nPrEx=1\r\n\r\n[Graphics]\r\nAPI=DirectDraw\r\n";
+            static const char defaults[] = "[General]\r\nPrEx=1\r\n\r\n[Graphics]\r\nAPI=DirectDraw\r\nVSync=auto\r\n";
             DWORD written;
             WriteFile(file, defaults, (DWORD)(sizeof(defaults) - 1), &written, NULL);
             CloseHandle(file);
@@ -191,6 +191,14 @@ static void LoadGeneralConfig(void) {
         if ((int)GetPrivateProfileIntA("General", "PrEx", -1, path) < 0) {
             WritePrivateProfileStringA("General", "PrEx", "1", path);
             Log("General: added the missing PrEx entry (PrEx=1)");
+        }
+        {
+            char vsyncVal[32];
+            GetPrivateProfileStringA("Graphics", "VSync", "\x1notfound", vsyncVal, sizeof(vsyncVal), path);
+            if (strcmp(vsyncVal, "\x1notfound") == 0) {
+                WritePrivateProfileStringA("Graphics", "VSync", "auto", path);
+                Log("Graphics: added the missing VSync entry (VSync=auto)");
+            }
         }
     }
     GetPrivateProfileStringA("General", "PrEx", "1", value, sizeof(value), path);
@@ -1286,367 +1294,484 @@ static void PatchReplayStage(void) {
     Log("ReplayStage: patched (hook=%p)", (void*)&ReplayUpdateHook);
 }
 
-/* ------------------------------------------------------------------------
-/* ------------------------------------------------------------------------ *\
- * ReplayRename: F2 opens an in-place editor for the highlighted replay's
- * score name (replay menu, state +0x27f4 = 1).  F2 again commits, ESC cancels.
- * While editing, a blinking horizontal line is shown below the first text
- * position to mark that keyboard input is in progress.
- *
- * The name lives in the first encrypted block of the replay file
- * (replay\replay%03d.dat), which the game's loader (0x431bd0) verifies:
- *
- *   +0x00 'SMDR'   +0x04 version u16   +0x06 u16   +0x08 seed
- *   +0x20 0x20 bytes: name (16) | crc32(name) | crc32(encrypted block @0x20..EOF)
- *   +0x40 save block (encrypted) + frame stream
- *
- * The block is stored XOR seed stream, one byte per PRNG call.  The game's
- * PRNG is MT19937-32 (0x405200 seed / 0x405250 next) with a tempering variant;
- * 0x431bd0 also XORs the first 16 bytes with a second independent stream, so
- * the stored name is name ^ S(seed) ^ S'(seed) with two generators primed by
- * the same seed.  Both streams and the CRC32 (game's 0x410c10) are replicated
- * here so an edited replay still passes the loader's checksum verification.
- * Log lines start with "ReplayRename:".
- * ---------------------------------------------------------------------- */
+// ------------------------------------------------------------------------
+// ReplayRename: In replay list (state +0x27f4 == 0), pressing F2 activates
+// in-place score name editing for the highlighted replay (+0x27e4).
+// A blinking horizontal underline ('_') appears beneath the character at
+// the cursor position (starts at the 1st character of the score name).
+// Keys from keyboard edit the score name in real-time.
+// Pressing Enter or F2 saves the new name to replay\replay%03d.dat with
+// valid LZSS compression and CRC checksums, and reloads the menu page.
+// Pressing Esc cancels and restores the original name.
+// ------------------------------------------------------------------------
 
-static unsigned int (__attribute__((thiscall)) *RN_CRC32)(void *self, const void *data, int len) =
-    (unsigned int (__attribute__((thiscall)) *)(void *, const void *, int))(uintptr_t)0x410c10;
+static unsigned char g_rnEdit[32];          /* name being edited (null terminated) */
+static int           g_rnCursor;            /* cursor column in score name 0..15 */
+static int           g_rnActive;            /* 1 = edit mode active */
+static int           g_rnId;                /* replay ID 0..999 */
+static int           g_rnTick;              /* frame counter for blinking */
+static unsigned char g_rnHdr[0xe0];         /* uncompressed 224-byte header */
+static char          g_rnOrigRowText[20];   /* backup of original row score name */
+static unsigned char g_rnPrevKeys[256];     /* keyboard edge tracking */
+static int           g_rnRepeatKey;         /* key currently held down */
+static int           g_rnRepeatTimer;       /* repeat delay / interval timer */
+static int           g_rnEscCooldown;       /* frames to suppress ESC after cancelling */
+static int           g_rnEnterCooldown;     /* frames to suppress Enter/F2 after commit */
+static int           g_rnPrevF2;            /* F2 edge tracking */
+static int           g_rnPrevEnter;         /* Enter edge tracking */
+static int           g_rnPrevEsc;           /* Esc edge tracking */
 
-static unsigned char g_rnEdit[16];  /* name being edited (NUL padded) */
-static int  g_rnCursor;             /* insert position 0..16 */
-static char g_rnBuf[17];            /* display buffer */
-static int  g_rnActive;             /* editor open */
-static int  g_rnId;                 /* replay being edited */
-static int  g_rnErrTimer;           /* frames to flash the error colour */
-static int  g_rnTick;               /* editor frame counter */
-static int  g_rnEscArmed;           /* ESC edge latch while typing */
-static char g_rnNameRow[0xe8] __attribute__((aligned(16)));
-static char g_rnCaptionRow[0xe8] __attribute__((aligned(16)));
-static char g_rnCaretRow[0xe8] __attribute__((aligned(16)));
-static void *g_rnRowTex;
-static int  g_rnRowInit;
-
-/* --- the game's MT19937-32 PRNG (0x405200 seed, 0x405250 next) ------------ */
-static unsigned int g_rnMt[625];
-static int g_rnMtLeft = 0;          /* words left in the generated block */
-
-static void RnMtSeed(unsigned int seed) {
-    int i;
-    g_rnMt[0] = seed;
-    for (i = 1; i < 625; i++) {
-        unsigned int prev = g_rnMt[i - 1];
-        unsigned int y = (prev >> 30) ^ prev;
-        g_rnMt[i] = y * 0x6c078965 + (unsigned)i;
-    }
-    g_rnMtLeft = 624;               /* 0x405200 marks 624; 0x405250 regenerates */
+/* Reads 224-byte uncompressed header of replay id using the game's reader (0x431bd0).
+   Returns 1 if valid, 0 if not found or corrupted. */
+static int RnLoadHdr(int id, unsigned char hdr0xE0[0xe0]) {
+    void *input = *(void**)(uintptr_t)0x46bbec;
+    if (!input || IsBadReadPtr(input, 0x10)) return 0;
+    return ((int (__attribute__((thiscall)) *)(void *, int, void *))(uintptr_t)0x431bd0)(input, id, hdr0xE0);
 }
 
-static unsigned int RnMtNext(void) {
-    unsigned int y;
-    if (g_rnMtLeft == 0) {
-        int i;
-        for (i = 0; i < 624; i++) {
-            y = (g_rnMt[i] & 0x80000000) | (g_rnMt[i + 1] & 0x7fffffff);
-            g_rnMt[i] = g_rnMt[i + 1] ^ (y >> 1) ^ ((y & 1) ? 0x9908b0df : 0);
+/* Writes updated score name into replay\replay%03d.dat and refreshes the replay menu. */
+static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
+    char path[MAX_PATH];
+    FILE *f;
+    long fileSize;
+    unsigned char old_hdr[0x20];
+    unsigned int old_seed;
+    unsigned char dec16[16];
+    unsigned short version, inp_offset;
+    long cmp_inp_len;
+    unsigned char *cmp_inp = NULL;
+    int new_cmp_hdr_len = 0;
+    void *new_cmp_hdr;
+    unsigned char new_hdr[0x20];
+    unsigned int inp_crc, hdr_crc, new_seed;
+    unsigned char new_dec16[16];
+    int i;
+
+    snprintf(path, sizeof(path), "replay\\replay%03d.dat", id);
+    f = fopen(path, "rb");
+    if (!f) {
+        Log("ReplayRename: failed to open %s for reading", path);
+        return 0;
+    }
+    fseek(f, 0, SEEK_END);
+    fileSize = ftell(f);
+    if (fileSize < 0x20) {
+        fclose(f);
+        return 0;
+    }
+    fseek(f, 0, SEEK_SET);
+
+    if (fread(old_hdr, 1, 0x20, f) != 0x20 || memcmp(old_hdr, "SMDR", 4) != 0) {
+        fclose(f);
+        return 0;
+    }
+
+    /* Decrypt the 16 bytes in old header using MT19937 seeded with old_seed */
+    old_seed = *(unsigned int*)(old_hdr + 4);
+    ((void (__cdecl *)(unsigned int))(uintptr_t)0x405200)(old_seed);
+    memcpy(dec16, old_hdr + 0x10, 16);
+    for (i = 0; i < 16; i++) {
+        dec16[i] ^= (unsigned char)(((unsigned int (__cdecl *)(void))(uintptr_t)0x405250)() & 0xff);
+    }
+
+    version = *(unsigned short*)(dec16 + 0);
+    inp_offset = *(unsigned short*)(dec16 + 2);
+    if (inp_offset < 0x20 || inp_offset > fileSize) {
+        fclose(f);
+        Log("ReplayRename: invalid inp_offset %u in %s", (unsigned)inp_offset, path);
+        return 0;
+    }
+
+    cmp_inp_len = fileSize - (long)inp_offset;
+    if (cmp_inp_len > 0) {
+        cmp_inp = (unsigned char*)malloc((size_t)cmp_inp_len);
+        if (!cmp_inp) { fclose(f); return 0; }
+        fseek(f, inp_offset, SEEK_SET);
+        if (fread(cmp_inp, 1, (size_t)cmp_inp_len, f) != (size_t)cmp_inp_len) {
+            free(cmp_inp);
+            fclose(f);
+            return 0;
         }
-        y = (g_rnMt[624] & 0x80000000) | (g_rnMt[0] & 0x7fffffff);
-        g_rnMt[624] = g_rnMt[0] ^ (y >> 1) ^ ((y & 1) ? 0x9908b0df : 0);
-        g_rnMtLeft = 624;
-    }
-    y = g_rnMt[624 - g_rnMtLeft];
-    g_rnMtLeft--;
-    y ^= y >> 11;
-    y ^= (y & 0xff3a58ad) << 7;
-    y ^= (y & 0xffffdf8c) << 15;
-    y ^= y >> 18;
-    return y;
-}
-
-static unsigned int RnCrc32(const void *data, int len) {
-    return RN_CRC32(NULL, data, len);
-}
-
-/* one byte of the stream the game stores data under: data byte ^ (rand & 0xff) */
-static void RnSeedXor(unsigned char *p, int len, unsigned int seed) {
-    int i;
-    RnMtSeed(seed);
-    for (i = 0; i < len; i++)
-        p[i] = (unsigned char)(p[i] ^ (RnMtNext() & 0xff));
-}
-
-/* read the stored score name of replay id; 1 = ok (checksums verified) */
-static int RnLoadName(int id, char name[17]) {
-    char path[64];
-    FILE *f;
-    unsigned char hdr[12], blk[0x20], *body;
-    long size;
-    unsigned int seed, c1, c2;
-    unsigned char nameEnc[16], namePlain[16];
-    int i;
-    snprintf(path, sizeof(path), "replay\\replay%03d.dat", id);
-    f = fopen(path, "rb");
-    if (!f) return 0;
-    if (fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "SMDR", 4) != 0 ||
-        fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < 0x40) {
-        fclose(f);
-        return 0;
-    }
-    seed = *(unsigned int*)(hdr + 8);
-    body = (unsigned char*)malloc((size_t)size);
-    if (!body) { fclose(f); return 0; }
-    fseek(f, 0, SEEK_SET);
-    if (fread(body, 1, (size_t)size, f) != (size_t)size) {
-        free(body);
-        fclose(f);
-        return 0;
     }
     fclose(f);
-    /* encrypted block at +0x20; name = decrypt(0x20..0x2f) ^ stream'(first 16) */
-    memcpy(blk, body + 0x20, 0x20);
-    RnSeedXor(blk, 0x20, seed);
-    c1 = *(unsigned int*)(blk + 0x10);
-    c2 = *(unsigned int*)(blk + 0x14);
-    if (RnCrc32(blk, 16) != c1 || RnCrc32(body + 0x20, (int)size - 0x20) != c2) {
-        free(body);
-        return 0;
-    }
-    memcpy(nameEnc, body + 0x20, 16);
-    RnSeedXor(nameEnc, 16, seed);
-    memcpy(namePlain, nameEnc, 16);
-    RnSeedXor(namePlain, 16, seed);     /* second stream, same seed */
-    memcpy(name, namePlain, 16);
-    name[16] = 0;
-    for (i = 0; i < 16; i++)
-        if ((unsigned char)name[i] < 0x20 || (unsigned char)name[i] >= 0x7f)
-            ((unsigned char*)name)[i] = '?';
-    free(body);
-    return 1;
-}
 
-/* write the score name of replay id back into the file (re-encrypted) */
-static int RnSaveName(int id, const char name[16]) {
-    char path[64];
-    FILE *f;
-    long size;
-    unsigned char hdr[12], blk[0x20], *body;
-    unsigned int seed, c1, c2;
-    unsigned char nameEnc[16];
-    snprintf(path, sizeof(path), "replay\\replay%03d.dat", id);
-    f = fopen(path, "rb");
-    if (!f) return 0;
-    if (fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "SMDR", 4) != 0 ||
-        fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < 0x40) {
-        fclose(f);
+    /* Compress updated 0xe0 header with the game's LZSS encoder (0x4106e0) */
+    new_cmp_hdr = ((void* (__cdecl *)(const void*, int, int*))(uintptr_t)0x4106e0)(hdr0xE0, 0xe0, &new_cmp_hdr_len);
+    if (!new_cmp_hdr || new_cmp_hdr_len <= 0) {
+        if (cmp_inp) free(cmp_inp);
+        Log("ReplayRename: LZSS encode failed");
         return 0;
     }
-    seed = *(unsigned int*)(hdr + 8);
-    body = (unsigned char*)malloc((size_t)size);
-    if (!body) { fclose(f); return 0; }
-    fseek(f, 0, SEEK_SET);
-    if (fread(body, 1, (size_t)size, f) != (size_t)size) {
-        free(body);
-        fclose(f);
-        return 0;
+
+    /* Prepare new 0x20 header */
+    memcpy(new_hdr, "SMDR", 4);
+
+    /* Checksum of inputs chunk (0x410c10) */
+    inp_crc = (cmp_inp && cmp_inp_len > 0)
+        ? ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(cmp_inp, (int)cmp_inp_len)
+        : 0;
+    *(unsigned int*)(new_hdr + 8) = inp_crc;
+
+    /* Checksum of uncompressed 0xe0 header */
+    hdr_crc = ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(hdr0xE0, 0xe0);
+    *(unsigned int*)(new_hdr + 0x0c) = hdr_crc;
+
+    /* Prepare 16-byte payload */
+    memcpy(new_dec16, dec16, 16);
+    *(unsigned short*)(new_dec16 + 0) = version;
+    *(unsigned short*)(new_dec16 + 2) = (unsigned short)(0x20 + new_cmp_hdr_len);
+    *(unsigned short*)(new_dec16 + 4) = 1;
+    *(unsigned short*)(new_dec16 + 14) = (unsigned short)new_cmp_hdr_len;
+    memcpy(new_hdr + 0x10, new_dec16, 16);
+
+    /* Checksum of 0x20 header with 0xdeadbeef at +0x04 */
+    *(unsigned int*)(new_hdr + 0x04) = 0xdeadbeef;
+    new_seed = ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(new_hdr, 0x20);
+    *(unsigned int*)(new_hdr + 0x04) = new_seed;
+
+    /* Encrypt 16 bytes with MT19937 seeded with new_seed */
+    ((void (__cdecl *)(unsigned int))(uintptr_t)0x405200)(new_seed);
+    for (i = 0; i < 16; i++) {
+        (new_hdr + 0x10)[i] ^= (unsigned char)(((unsigned int (__cdecl *)(void))(uintptr_t)0x405250)() & 0xff);
     }
-    fclose(f);
-    /* encrypt the new name: plain ^ S(seed) ^ S'(seed) */
-    memcpy(nameEnc, name, 16);
-    RnSeedXor(nameEnc, 16, seed);
-    RnSeedXor(nameEnc, 16, seed);
-    memcpy(blk, nameEnc, 16);
-    c1 = RnCrc32(blk, 16);
-    c2 = RnCrc32(body + 0x20, (int)size - 0x20);
-    *(unsigned int*)(blk + 0x10) = c1;
-    *(unsigned int*)(blk + 0x14) = c2;
-    RnSeedXor(blk, 0x20, seed);         /* store XOR S(seed) */
-    memcpy(body + 0x20, blk, 0x20);
+
+    /* Write back to file */
     f = fopen(path, "wb");
-    if (!f) { free(body); return 0; }
-    if (fwrite(body, 1, (size_t)size, f) != (size_t)size) {
-        fclose(f);
-        free(body);
+    if (!f) {
+        ((void (__cdecl *)(void*))(uintptr_t)0x434fad)(new_cmp_hdr);
+        if (cmp_inp) free(cmp_inp);
+        Log("ReplayRename: failed to open %s for writing", path);
         return 0;
     }
+    fwrite(new_hdr, 1, 0x20, f);
+    fwrite(new_cmp_hdr, 1, (size_t)new_cmp_hdr_len, f);
+    if (cmp_inp && cmp_inp_len > 0) {
+        fwrite(cmp_inp, 1, (size_t)cmp_inp_len, f);
+    }
     fclose(f);
-    free(body);
+
+    ((void (__cdecl *)(void*))(uintptr_t)0x434fad)(new_cmp_hdr);
+    if (cmp_inp) free(cmp_inp);
+
+    Log("ReplayRename: saved %s (hdr_len=%d, inp_len=%ld, seed=0x%08x)",
+        path, new_cmp_hdr_len, cmp_inp_len, new_seed);
+
+    /* Refresh replay menu list using game's page loader (0x4215c0) */
+    if (menu) {
+        int curPage = *(int*)((char*)menu + 0x27f0);
+        ((void (__attribute__((thiscall)) *)(void*, int))(uintptr_t)0x4215c0)(menu, curPage);
+    }
     return 1;
 }
 
-static void RnDisplay(void) {
-    int i, n = 0;
-    for (i = 0; i < 16 && g_rnEdit[i]; i++)
-        g_rnBuf[n++] = (char)g_rnEdit[i];
-    g_rnBuf[n] = 0;
+static void RnSyncRowText(void *menu) {
+    if (!g_rnActive || !menu) return;
+    int r = g_rnId & 0xf;
+    char *row = (char*)menu + 0x3a8 + r * 0x130;
+    char *row_str;
+    if (IsBadReadPtr(row, 0x130)) return;
+    row_str = *(char**)(row + 0xc0);
+    if (!row_str || IsBadWritePtr(row_str, 20)) return;
+
+    /* g_rnEdit is exactly 16 characters right-aligned */
+    memcpy(row_str + 3, g_rnEdit, 16);
 }
 
-static void RnRowsEnsure(void *menu) {
-    void *tex = *(void**)((char*)menu + 0x10);
-    if (g_rnRowInit && g_rnRowTex == tex) return;
-    g_rnRowInit = 1;
-    g_rnRowTex = tex;
-    memset(g_rnNameRow, 0, sizeof(g_rnNameRow));
-    memset(g_rnCaptionRow, 0, sizeof(g_rnCaptionRow));
-    ((void (__attribute__((thiscall)) *)(void *))(uintptr_t)0x41c690)(g_rnNameRow);
-    ((void (__attribute__((thiscall)) *)(void *))(uintptr_t)0x41c690)(g_rnCaptionRow);
-    ((void (__attribute__((thiscall)) *)(void *, void *, int, int, int, int, int, int, int))
-        (uintptr_t)0x41ff10)(g_rnNameRow, tex, 0xa0, 0xa8, 0, 0, 0x100, 0x100, 0);
-    ((void (__attribute__((thiscall)) *)(void *, void *, int, int, int, int, int, int, int))
-        (uintptr_t)0x41ff10)(g_rnCaptionRow, tex, 0xa0, 0x98, 0, 0, 0x100, 0x100, 0);
-    /* caret: one row cell below the name row's first text line, at the row's
-       left edge (font cell advance 16 screen px = 16/0.8 tex px, text x = +16) */
-    memset(g_rnCaretRow, 0, sizeof(g_rnCaretRow));
-    ((void (__attribute__((thiscall)) *)(void *))(uintptr_t)0x41c690)(g_rnCaretRow);
-    ((void (__attribute__((thiscall)) *)(void *, void *, int, int, int, int, int, int, int))
-        (uintptr_t)0x41ff10)(g_rnCaretRow, tex, 0xb0, 0xc0, 0, 0, 0x100, 0x100, 0);
-    *(int*)(g_rnNameRow + 0xac) = 0x3f4ccccd;
-    *(int*)(g_rnNameRow + 0xb0) = 0x3f4ccccd;
-    *(int*)(g_rnCaptionRow + 0xac) = 0x3f4ccccd;
-    *(int*)(g_rnCaptionRow + 0xb0) = 0x3f4ccccd;
-    *(int*)(g_rnCaretRow + 0xac) = 0x3f4ccccd;
-    *(int*)(g_rnCaretRow + 0xb0) = 0x3f4ccccd;
-}
+static void RnOpen(void *menu, int id) {
+    char *row;
+    char *row_str;
+    int r;
 
-static void RnRowText(char *row, DWORD color, const char *text) {
-    *(int*)(row + 0xd8) = (int)color;
-    ((void (__cdecl *)(void *, int, int, int, int, int, const char *, ...))
-        (uintptr_t)0x41ff80)(row, 0x10, 0xc, 8, 9, 0xb, "%s", text);
-}
-
-static void RnDrawEditor(void) {
-    char *title = *(char**)(uintptr_t)0x4e93cc;
-    DWORD color;
-    if (!g_rnActive || !title || IsBadReadPtr(title, 0x18) || !*(void**)(title + 0x10)) return;
-    RnRowsEnsure(title);
-    color = (g_rnErrTimer > 0 && (g_rnErrTimer & 0x10)) ? 0x0000ff : 0xffffff;
-    RnRowText(g_rnCaptionRow, 0xffffff, "SCORE NAME  (F2:Enter,ESC:Cancel)");
-    RnRowText(g_rnNameRow, color, g_rnBuf);
-    /* blinking underline caret while input is in progress */
-    RnRowText(g_rnCaretRow, color, (g_rnTick & 0x10) ? "_" : "");
-    ((void (__attribute__((thiscall)) *)(void *, int))(uintptr_t)0x420270)(g_rnCaptionRow, 0);
-    ((void (__attribute__((thiscall)) *)(void *, int))(uintptr_t)0x420270)(g_rnNameRow, 0);
-    ((void (__attribute__((thiscall)) *)(void *, int))(uintptr_t)0x420270)(g_rnCaretRow, 0);
-}
-
-static unsigned char __attribute__((fastcall)) RnDrawHook(void *obj) {
-    unsigned char r = ((unsigned char (__attribute__((thiscall)) *)(void *))(uintptr_t)0x418d30)(obj);
-    RnDrawEditor();
-    return r;
-}
-
-static void RnOpen(int id) {
-    char name[17];
-    int i;
-    if (RnLoadName(id, name)) {
-        for (i = 0; i < 16; i++) g_rnEdit[i] = (unsigned char)name[i];
-        g_rnCursor = 0;
-        while (g_rnCursor < 16 && g_rnEdit[g_rnCursor]) g_rnCursor++;
-        RnDisplay();
-        g_rnId = id;
-        g_rnActive = 1;
-        g_rnTick = 0;
-        g_rnEscArmed = 1;           /* ESC must be released first */
-        Log("ReplayRename: editing replay %03d name '%s'", id, name);
-    } else {
-        g_rnErrTimer = 0x40;
-        Log("ReplayRename: replay %03d not found or unreadable", id);
-    }
-}
-
-static void RnClose(int commit) {
-    if (commit) {
-        char name[17];
-        int i;
-        for (i = 0; i < 16; i++) name[i] = (char)g_rnEdit[i];
-        name[16] = 0;
-        if (RnSaveName(g_rnId, name)) {
-            Log("ReplayRename: replay %03d saved with name '%s'", g_rnId, name);
-        } else {
-            g_rnErrTimer = 0x60;
-            Log("ReplayRename: saving replay %03d failed", g_rnId);
-        }
-    }
-    g_rnActive = 0;
-}
-
-static void RnTypeKey(int vk) {
-    if (vk >= 'a' && vk <= 'z') vk -= 0x20;
-    if (vk >= 0x20 && vk <= 0x7e && vk != '\\') {
-        if (g_rnCursor < 16) {
-            int tail = 15 - g_rnCursor;
-            if (tail > 0)
-                memmove(g_rnEdit + g_rnCursor + 1, g_rnEdit + g_rnCursor, (size_t)tail);
-            g_rnEdit[g_rnCursor] = (unsigned char)vk;
-            if (g_rnCursor < 15) g_rnCursor++;
-            RnDisplay();
-        }
-    } else if (vk == 0x08) {            /* backspace */
-        if (g_rnCursor > 0) {
-            memmove(g_rnEdit + g_rnCursor - 1, g_rnEdit + g_rnCursor,
-                    (size_t)(16 - g_rnCursor));
-            g_rnEdit[15] = 0;
-            g_rnCursor--;
-            RnDisplay();
-        }
-    }
-}
-
-/* called once per frame from ReplayUpdateHook while the replay menu runs */
-static void RnTick(void *menu, void *input) {
-    unsigned char *keys = (unsigned char*)input + 8;
-    unsigned char *latch = (unsigned char*)input + 0x130;
-    unsigned char down[0x100], latched[0x100];
-    unsigned buttons, prevButtons;
-    int f2, vk;
-
-    if (g_rnErrTimer > 0) g_rnErrTimer--;
-
-    f2 = (keys[0x71] & 0x80) != 0 && (latch[0x71] & 0x80) == 0;
-    if (!g_rnActive) {
-        if (f2 && *(unsigned char*)((char*)menu + 0x27f4) != 0 &&
-            *(unsigned char*)((char*)menu + 0x271e) == 0)
-            RnOpen(*(int*)((char*)menu + 0x27e8));
+    if (id < 0 || id > 999) return;
+    memset(g_rnHdr, 0, sizeof(g_rnHdr));
+    if (!RnLoadHdr(id, g_rnHdr)) {
+        Log("ReplayRename: replay %03d not found or invalid", id);
         return;
     }
 
-    g_rnTick++;
-    buttons = *(unsigned*)(input + 4);
-    prevButtons = *(unsigned*)(input + 0x12c);
-    memcpy(down, keys, sizeof(down));
-    memcpy(latched, latch, sizeof(latched));
-    /* the editor consumes the keyboard: hide it from the menu while typing */
-    *(unsigned*)(input + 4) = 0;
-    *(unsigned*)(input + 0x12c) = 0;
-    memset(keys, 0, 0x100);
-    memset(latch, 0, 0x100);
+    g_rnId = id;
+    g_rnActive = 1;
+    g_rnCursor = 15;  /* Cursor stays at the right end */
+    g_rnTick = 16;    /* Caret immediately visible on frame 0 */
+    g_rnEscCooldown = 0;
+    g_rnEnterCooldown = 0;
 
-    if (down[0x1b] & 0x80) {
-        if (!g_rnEscArmed) {
-            g_rnEscArmed = 1;
-            RnClose(0);
+    /* Save original row score name text for clean cancel on ESC */
+    r = id & 0xf;
+    row = (char*)menu + 0x3a8 + r * 0x130;
+    if (!IsBadReadPtr(row, 0x130)) {
+        row_str = *(char**)(row + 0xc0);
+        if (row_str && !IsBadReadPtr(row_str, 20)) {
+            memcpy(g_rnOrigRowText, row_str + 3, 16);
+            g_rnOrigRowText[16] = 0;
+        }
+    }
+
+    /* Start with a blank input field (16 spaces) */
+    memset(g_rnEdit, ' ', 16);
+    g_rnEdit[16] = 0;
+
+    RnSyncRowText(menu);
+    Log("ReplayRename: opened replay %03d, edit buffer cleared", id);
+}
+
+static void RnCancel(void *menu) {
+    if (!g_rnActive) return;
+    if (menu) {
+        int r = g_rnId & 0xf;
+        char *row = (char*)menu + 0x3a8 + r * 0x130;
+        if (!IsBadReadPtr(row, 0x130)) {
+            char *row_str = *(char**)(row + 0xc0);
+            if (row_str && !IsBadWritePtr(row_str, 20)) {
+                memcpy(row_str + 3, g_rnOrigRowText, 16);
+            }
+        }
+    }
+    g_rnActive = 0;
+    g_rnEscCooldown = 10;
+    Log("ReplayRename: cancelled editing for replay %03d, restored '%s'", g_rnId, g_rnOrigRowText);
+}
+
+static void RnCommit(void *menu) {
+    char finalName[16];
+    const char *p;
+    size_t plen;
+    if (!g_rnActive) return;
+
+    /* Trim leading spaces for storage */
+    p = (const char*)g_rnEdit;
+    while (*p == ' ') p++;
+
+    if (!*p) {
+        /* If blank (no characters typed), cancel and restore original name */
+        RnCancel(menu);
+        return;
+    }
+
+    memset(finalName, 0, sizeof(finalName));
+    plen = strlen(p);
+    if (plen > 15) plen = 15;
+    memcpy(finalName, p, plen);
+
+    /* Update score name in 0xe0 header (0x30..0x3f) */
+    memset(g_rnHdr + 0x30, 0, 16);
+    memcpy(g_rnHdr + 0x30, finalName, 16);
+
+    RnSaveReplay(menu, g_rnId, g_rnHdr);
+    g_rnActive = 0;
+    g_rnEnterCooldown = 10;
+    Log("ReplayRename: committed replay %03d with name '%s'", g_rnId, finalName);
+}
+
+static char RnGetAsciiChar(int vk, int shift) {
+    if (vk >= 'A' && vk <= 'Z') {
+        return shift ? (char)vk : (char)(vk - 'A' + 'a');
+    }
+    if (vk >= '0' && vk <= '9') {
+        if (shift) {
+            static const char syms[] = ")!@#$%^&*(";
+            return syms[vk - '0'];
+        }
+        return (char)vk;
+    }
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) return (char)('0' + (vk - VK_NUMPAD0));
+    if (vk == VK_SPACE) return ' ';
+    if (vk == VK_OEM_MINUS || vk == VK_SUBTRACT) return shift ? '_' : '-';
+    if (vk == VK_OEM_PERIOD || vk == VK_DECIMAL) return shift ? '>' : '.';
+    if (vk == VK_OEM_COMMA) return shift ? '<' : ',';
+    if (vk == VK_OEM_1) return shift ? ':' : ';';
+    if (vk == VK_OEM_2 || vk == VK_DIVIDE) return shift ? '?' : '/';
+    if (vk == VK_OEM_7) return shift ? '\"' : '\'';
+    if (vk == VK_OEM_PLUS || vk == VK_ADD) return shift ? '+' : '=';
+    if (vk == VK_OEM_3) return shift ? '~' : '`';
+    if (vk == VK_OEM_4) return shift ? '{' : '[';
+    if (vk == VK_OEM_6) return shift ? '}' : ']';
+    if (vk == VK_MULTIPLY) return '*';
+    return 0;
+}
+
+static void RnDrawCaret(void *menu) {
+    int r;
+    char *row;
+    double row_x, row_y, char_w;
+    int col;
+
+    if (!g_rnActive || !menu) return;
+    if (*(unsigned char*)((char*)menu + 0x27f4) != 0) return; /* Only in replay list */
+
+    r = g_rnId & 0xf;
+    row = (char*)menu + 0x3a8 + r * 0x130;
+    if (IsBadReadPtr(row, 0x130) || !*(void**)(row + 0xe0)) return;
+
+    /* Blink caret every 16 frames */
+    if ((g_rnTick & 0x10) != 0) {
+        char caretRow[0x130] __attribute__((aligned(16)));
+        memcpy(caretRow, row, sizeof(caretRow));
+        row_x = *(double*)(row + 8);
+        row_y = *(double*)(row + 0x10);
+        char_w = 12.8;
+        if (*(int*)(row + 0x18) > 0 && *(float*)(row + 0xac) > 0.0f) {
+            char_w = (double)*(int*)(row + 0x18) * (double)*(float*)(row + 0xac);
+        }
+        col = 3 + g_rnCursor;
+        *(double*)(caretRow + 8) = row_x + col * char_w;
+        *(double*)(caretRow + 0x10) = row_y + 1.0;
+        *(char**)(caretRow + 0xc0) = "_";
+        *(int*)(caretRow + 0xd8) = 0x00ffffff; /* white */
+        ((void (__cdecl *)(void *, int))(uintptr_t)0x420270)(caretRow, 0);
+    }
+}
+
+static void __attribute__((fastcall)) ReplayDrawHook(void *menu) {
+    /* 1. Call original replay menu drawer (0x421d40) */
+    ((void (__attribute__((thiscall)) *)(void*))(uintptr_t)0x421d40)(menu);
+
+    /* 2. If editing score name, render the blinking caret/underline */
+    if (g_rnActive) {
+        RnDrawCaret(menu);
+    }
+}
+
+/* RnTick is called every frame from ReplayUpdateHook */
+static void RnTick(void *menu, void *input) {
+    unsigned char *keys = (unsigned char*)input + 8;
+    unsigned char *latch = (unsigned char*)input + 0x130;
+    unsigned char *buttons = (unsigned char*)input + 4;
+    unsigned char *prevButtons = (unsigned char*)input + 0x12c;
+    int shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    int f2Down, f2Trigger;
+    int escDown, escTrigger;
+    int enterDown, enterTrigger;
+    int vk;
+
+    int enterRaw = ((keys[VK_RETURN] & 0x80) != 0) || ((GetAsyncKeyState(VK_RETURN) & 0x8000) != 0);
+    int escRaw   = ((keys[VK_ESCAPE] & 0x80) != 0) || ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0);
+    int f2Raw    = ((keys[VK_F2] & 0x80) != 0) || ((GetAsyncKeyState(VK_F2) & 0x8000) != 0);
+
+    /* Cancel editing if menu state changed away from replay list */
+    if (g_rnActive && *(unsigned char*)((char*)menu + 0x27f4) != 0) {
+        RnCancel(menu);
+    }
+
+    if (g_rnEscCooldown > 0) {
+        if (escRaw) {
+            if (g_rnEscCooldown < 10) g_rnEscCooldown = 10;
+        } else {
+            g_rnEscCooldown--;
+        }
+        keys[VK_ESCAPE] = 0;
+        latch[VK_ESCAPE] = 1;
+        *(unsigned*)buttons &= ~(1u << 5);
+        *(unsigned*)prevButtons |= (1u << 5);
+    }
+
+    if (g_rnEnterCooldown > 0) {
+        if (enterRaw) {
+            if (g_rnEnterCooldown < 10) g_rnEnterCooldown = 10;
+        } else {
+            g_rnEnterCooldown--;
+        }
+        keys[VK_RETURN] = 0;
+        latch[VK_RETURN] = 1;
+        *(unsigned*)buttons &= ~(1u << 4);
+        *(unsigned*)prevButtons |= (1u << 4);
+    }
+
+    /* Edge detection for F2, Esc, Enter checking BOTH GetAsyncKeyState and game's keys buffer */
+    f2Down = f2Raw;
+    f2Trigger = f2Down && !g_rnPrevF2;
+    g_rnPrevF2 = f2Down;
+
+    escDown = escRaw;
+    escTrigger = escDown && !g_rnPrevEsc;
+    g_rnPrevEsc = escDown;
+
+    enterDown = enterRaw;
+    enterTrigger = enterDown && !g_rnPrevEnter;
+    g_rnPrevEnter = enterDown;
+
+    if (g_rnActive) {
+        g_rnTick++;
+        RnSyncRowText(menu);
+        /* Suppress Enter, Esc, and Decide/Cancel buttons while typing */
+        keys[VK_RETURN] = 0;
+        latch[VK_RETURN] = 1;
+        keys[VK_ESCAPE] = 0;
+        latch[VK_ESCAPE] = 1;
+        *(unsigned*)buttons &= ~((1u << 4) | (1u << 5));
+        *(unsigned*)prevButtons |= ((1u << 4) | (1u << 5));
+
+        if (escTrigger) {
+            RnCancel(menu);
+            keys[VK_ESCAPE] = 0;
+            latch[VK_ESCAPE] = 1;
+            *(unsigned*)buttons &= ~(1u << 5);
+            *(unsigned*)prevButtons |= (1u << 5);
+            return;
+        }
+        if (enterTrigger || f2Trigger) {
+            RnCommit(menu);
+            keys[VK_RETURN] = 0;
+            latch[VK_RETURN] = 1;
+            *(unsigned*)buttons &= ~(1u << 4);
+            *(unsigned*)prevButtons |= (1u << 4);
+            return;
+        }
+
+        /* Process character typing and Backspace/Delete with key-repeat */
+        for (vk = 0; vk < 256; vk++) {
+            if (vk == VK_ESCAPE || vk == VK_RETURN || vk == VK_F2 || vk == VK_SHIFT) continue;
+            int isDown = ((GetAsyncKeyState(vk) & 0x8000) != 0) || ((keys[vk] & 0x80) != 0);
+            int wasDown = (g_rnPrevKeys[vk] & 0x80) != 0;
+            int triggered = 0;
+
+            if (isDown && !wasDown) {
+                triggered = 1;
+                g_rnRepeatKey = vk;
+                g_rnRepeatTimer = 0;
+            } else if (isDown && wasDown && vk == g_rnRepeatKey) {
+                g_rnRepeatTimer++;
+                if (g_rnRepeatTimer >= 24 && ((g_rnRepeatTimer - 24) % 4 == 0)) {
+                    triggered = 1;
+                }
+            }
+
+            if (isDown) g_rnPrevKeys[vk] = 0x80;
+            else g_rnPrevKeys[vk] = 0;
+
+            if (!triggered) continue;
+
+            if (vk == VK_BACK || vk == VK_DELETE) {
+                /* Shift right, inserting space at the left */
+                memmove(g_rnEdit + 1, g_rnEdit, 15);
+                g_rnEdit[0] = ' ';
+                g_rnEdit[16] = 0;
+                RnSyncRowText(menu);
+            } else {
+                char ch = RnGetAsciiChar(vk, shift);
+                if (ch) {
+                    /* Shift left, inserting new character at the right end */
+                    memmove(g_rnEdit, g_rnEdit + 1, 15);
+                    g_rnEdit[15] = (unsigned char)ch;
+                    g_rnEdit[16] = 0;
+                    RnSyncRowText(menu);
+                }
+            }
         }
     } else {
-        g_rnEscArmed = 0;
+        /* In replay list (state +0x27f4 == 0): open editor on F2 */
+        if (f2Trigger && *(unsigned char*)((char*)menu + 0x27f4) == 0) {
+            int curId = *(int*)((char*)menu + 0x27e4);
+            RnOpen(menu, curId);
+        }
     }
-    if (g_rnActive) {
-        for (vk = 0x20; vk <= 0x7e; vk++)
-            if ((down[vk] & 0x80) && !(latched[vk] & 0x80)) RnTypeKey(vk);
-        if ((down[0x0d] & 0x80) && !(latched[0x0d] & 0x80))       /* Enter */
-            RnClose(1);
-        else if ((down[0x2e] & 0x80) && !(latched[0x2e] & 0x80))  /* Delete */
-            RnClose(1);
-    }
-
-    memcpy(keys, down, sizeof(down));
-    memcpy(latch, latched, sizeof(latched));
-    *(unsigned*)(input + 4) = buttons;
-    *(unsigned*)(input + 0x12c) = prevButtons;
 }
 
 static void PatchReplayRenameDraw(void) {
-    static const unsigned char orig[9] = {
-        0x10, 0xae, 0x4d, 0x00, 0xe8, 0x41, 0x4e, 0x00, 0x00
+    static const unsigned char orig[5] = {
+        0xe8, 0xed, 0xdd, 0xff, 0xff
     };
-    const DWORD addr = 0x413ee6;
+    const DWORD addr = 0x423f4e;
     unsigned char *p = (unsigned char*)addr;
     DWORD old, rel;
 
@@ -1656,18 +1781,55 @@ static void PatchReplayRenameDraw(void) {
         return;
     }
     if (memcmp(p, orig, sizeof(orig)) != 0) {
-        Log("ReplayRename: code signature mismatch, skipped");
+        Log("ReplayRename: code signature mismatch at %08X, skipped", addr);
         return;
     }
     if (!VirtualProtect(p, sizeof(orig), PAGE_EXECUTE_READWRITE, &old)) {
         Log("ReplayRename: VirtualProtect failed (err=%08X)", GetLastError());
         return;
     }
-    rel = (DWORD)(uintptr_t)&RnDrawHook - (addr + 4 + 5);
-    memcpy(p + 5, &rel, 4);
+    rel = (DWORD)(uintptr_t)&ReplayDrawHook - (addr + 5);
+    p[0] = 0xe8;
+    memcpy(p + 1, &rel, 4);
     VirtualProtect(p, sizeof(orig), old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
-    Log("ReplayRename: draw hook installed (hook=%p)", (void*)&RnDrawHook);
+    Log("ReplayRename: draw hook installed at 0x%08X (hook=%p)", addr, (void*)&ReplayDrawHook);
+}
+
+static void __attribute__((fastcall)) ReplayMenuInputHook(void *menu) {
+    if (g_rnActive || g_rnEnterCooldown > 0 || g_rnEscCooldown > 0) {
+        return;
+    }
+    ((void (__attribute__((fastcall)) *)(void*))(uintptr_t)0x422080)(menu);
+}
+
+static void PatchReplayRenameInput(void) {
+    static const unsigned char orig[5] = {
+        0xe8, 0x98, 0x01, 0x00, 0x00
+    };
+    const DWORD addr = 0x421ee3;
+    unsigned char *p = (unsigned char*)addr;
+    DWORD old, rel;
+
+    if (!g_ReplayRename) return;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("ReplayRenameInput: unexpected image base, skipped");
+        return;
+    }
+    if (memcmp(p, orig, sizeof(orig)) != 0) {
+        Log("ReplayRenameInput: code signature mismatch at %08X, skipped", addr);
+        return;
+    }
+    if (!VirtualProtect(p, sizeof(orig), PAGE_EXECUTE_READWRITE, &old)) {
+        Log("ReplayRenameInput: VirtualProtect failed (err=%08X)", GetLastError());
+        return;
+    }
+    rel = (DWORD)(uintptr_t)&ReplayMenuInputHook - (addr + 5);
+    p[0] = 0xe8;
+    memcpy(p + 1, &rel, 4);
+    VirtualProtect(p, sizeof(orig), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
+    Log("ReplayRenameInput: menu input hook installed at 0x%08X (hook=%p)", addr, (void*)&ReplayMenuInputHook);
 }
 
 typedef unsigned char (__attribute__((fastcall)) *PF_ReplaySavePromptUpdate)(void *obj);
@@ -5882,136 +6044,86 @@ static void FrameWaitInit(void) {
     PF_CWTEx cw = k ? (PF_CWTEx)(void*)GetProcAddress(k, "CreateWaitableTimerExW") : NULL;
 
     g_fwTimerInit = 1;
-    if (!SmdIsWine() && cw) {
-        g_fwTimer = cw(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
-        if (g_fwTimer) g_fwHiRes = 1;
-    }
-    if (!g_fwHiRes) {
+    {
         HMODULE mm = LoadLibraryA("winmm.dll");
         PF_TBP tbp = mm ? (PF_TBP)(void*)GetProcAddress(mm, "timeBeginPeriod") : NULL;
         if (tbp) tbp(1);
+    }
+    if (cw) {
+        g_fwTimer = cw(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+        if (g_fwTimer) g_fwHiRes = 1;
     }
     Log("FrameWait: %s", g_fwHiRes ? "high-resolution waitable timer" : "MsgWait with 1 ms timer resolution");
 }
 
 typedef unsigned (__attribute__((fastcall)) *PF_FrameTimer)(int *ctx);
+int SmdD3D9GetVsync(void);
 
-/* ---- main-thread heartbeat + freeze watchdog (debug builds) ----------------
-   The reported freezes leave the log with no last line inside our code, so the
-   watchdog samples the frame heartbeat and, when the main thread stalls for 5 s
-   while the process is alive, suspends it and dumps EIP/module/registers.
-   That points at exactly which OS call the frame is blocked in. */
-#ifdef SMD_DEBUG_BUILD
-static volatile LONG g_frameSeq = 0;
-static volatile DWORD g_frameSeqTick = 0;
-static volatile DWORD g_mainThreadId = 0;
-
-static void LogModuleOf(DWORD eip) {
-    HMODULE m = NULL;
-    char name[MAX_PATH];
-    if (eip && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                  (const char*)(uintptr_t)eip, &m) && m) {
-        DWORD n = GetModuleFileNameA(m, name, sizeof(name));
-        char *slash = n ? strrchr(name, '\\') : NULL;
-        MEMORY_BASIC_INFORMATION mi;
-        DWORD end = 0;
-        if (VirtualQuery((LPCVOID)(uintptr_t)eip, &mi, sizeof(mi)))
-            end = (DWORD)(uintptr_t)mi.BaseAddress + (DWORD)mi.RegionSize;
-        SmdLog("FreezeWatch: eip module %s+0x%lX (region %08X-%08X)", slash ? slash + 1 : name,
-               eip - (DWORD)(uintptr_t)m, (unsigned)(uintptr_t)mi.BaseAddress, end);
-    }
-}
-
-static void DumpMainThread(DWORD stallMs) {
-    DWORD tid = g_mainThreadId;
-    HANDLE th;
-    CONTEXT c;
-    DWORD *sp;
-    if (!tid) return;
-    th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
-    if (!th) {
-        SmdLog("FreezeWatch: OpenThread(%lu) failed err=%lu", tid, GetLastError());
-        return;
-    }
-    if (SuspendThread(th) == (DWORD)-1) {
-        SmdLog("FreezeWatch: SuspendThread failed err=%lu", GetLastError());
-        CloseHandle(th);
-        return;
-    }
-    memset(&c, 0, sizeof(c));
-    c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-    if (GetThreadContext(th, &c)) {
-        SmdLog("FreezeWatch: main thread stalled %lu ms: eip=%08X esp=%08X",
-               stallMs, (unsigned)c.Eip, (unsigned)c.Esp);
-        LogModuleOf(c.Eip);
-        SmdLog("FreezeWatch: eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X ebp=%08X",
-               (unsigned)c.Eax, (unsigned)c.Ebx, (unsigned)c.Ecx, (unsigned)c.Edx,
-               (unsigned)c.Esi, (unsigned)c.Edi, (unsigned)c.Ebp);
-        sp = (DWORD*)(uintptr_t)c.Esp;
-        if (!IsBadReadPtr(sp, 64))
-            SmdLog("FreezeWatch: stack %08X %08X %08X %08X %08X %08X %08X %08X",
-                   sp[0], sp[1], sp[2], sp[3], sp[4], sp[5], sp[6], sp[7]);
-        sp = (DWORD*)(uintptr_t)c.Ebp;
-        if (!IsBadReadPtr(sp, 16))
-            SmdLog("FreezeWatch: frame [ebp]=%08X [ebp+4]=%08X [ebp+8]=%08X", sp[0], sp[1], sp[2]);
-    } else {
-        SmdLog("FreezeWatch: GetThreadContext failed err=%lu", GetLastError());
-    }
-    ResumeThread(th);
-    CloseHandle(th);
-}
-
-static DWORD WINAPI FreezeWatchThread(LPVOID unused) {
-    static DWORD lastDump;
-    (void)unused;
-    for (;;) {
-        DWORD now, seqTick;
-        Sleep(1000);
-        now = GetTickCount();
-        seqTick = g_frameSeqTick;
-        if (!seqTick || now - seqTick < 5000) continue;
-        if (lastDump && now - lastDump < 5000) continue;
-        lastDump = now;
-        DumpMainThread(now - seqTick);
-    }
-    return 0;
-}
-#endif
+static LARGE_INTEGER g_ftFreq;
+static LARGE_INTEGER g_ftNextTick;
+static int g_ftInit = 0;
 
 static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
-    unsigned r;
+    LARGE_INTEGER now;
+    int fps;
+    LONGLONG targetCounts;
+    LONGLONG remainingCounts;
+    double remMs;
+    int vsync = SmdD3D9GetVsync();
+
 #ifdef SMD_DEBUG_BUILD
     g_mainThreadId = GetCurrentThreadId();
     InterlockedIncrement(&g_frameSeq);
     g_frameSeqTick = GetTickCount();
 #endif
-    TitleCancelFrameTick();
-    SmdControllerPoll();
-    BatchTryInstall();
-    r = ((PF_FrameTimer)(uintptr_t)0x424f20)(ctx);
-    /* on Wine the original paces adequately; adding sleep on top double-waits → <60fps */
-    if (g_FrameWaitSleep && !SmdIsWine() && (r & 0xff) == 0) {
-        unsigned acc = (unsigned)ctx[3], dacc = (unsigned)ctx[4], per = (unsigned)ctx[1];
-        double rem = 30000.0 - (double)acc;
-        if (per > 0 && per < 1000000) {
-            double d = (double)per - (double)dacc;
-            if (d < rem) rem = d;
-        }
-        double margin;
-        rem /= 1800.0;
+
+    if (vsync) {
+        /* When VSync is ON, D3D9 present blocks on vblank (16.67ms);
+           run original frame timer without additional delay */
+        TitleCancelFrameTick();
+        SmdControllerPoll();
+        BatchTryInstall();
+        return ((PF_FrameTimer)(uintptr_t)0x424f20)(ctx);
+    }
+
+    /* VSync is OFF: Pace the frame loop to a rock-solid 60.0000 FPS using QPC
+       to eliminate stutter, frame drops, and 100% CPU busy-spinning. */
+    if (!g_ftInit) {
+        g_ftInit = 1;
+        QueryPerformanceFrequency(&g_ftFreq);
+        QueryPerformanceCounter(&now);
+        g_ftNextTick = now;
         if (!g_fwTimerInit) FrameWaitInit();
-        margin = g_fwHiRes ? g_FrameWaitMarginHiResMs : g_FrameWaitMarginMs;
-        if (rem > margin + (g_fwHiRes ? 0.5 : 1.0) && rem < 100.0) {
+    }
+
+    fps = ctx[0];
+    if (fps <= 0 || fps > 240) fps = 60;
+    targetCounts = g_ftFreq.QuadPart / fps;
+
+    QueryPerformanceCounter(&now);
+
+    /* If clock desynced or stalled by more than 2 frames (e.g. stage load / pause),
+       resynchronize immediately to current time */
+    if (now.QuadPart > g_ftNextTick.QuadPart + targetCounts * 2 ||
+        now.QuadPart < g_ftNextTick.QuadPart - targetCounts * 2) {
+        g_ftNextTick = now;
+    }
+
+    remainingCounts = g_ftNextTick.QuadPart - now.QuadPart;
+    if (remainingCounts > 0) {
+        remMs = (double)remainingCounts * 1000.0 / (double)g_ftFreq.QuadPart;
+        if (remMs > 1.5 && remMs < 100.0) {
+            double sleepMs = remMs - 1.2;
             LARGE_INTEGER a, b;
             QueryPerformanceCounter(&a);
-            if (g_fwHiRes) {
+            if (g_fwHiRes && g_fwTimer) {
                 LARGE_INTEGER due;
-                due.QuadPart = -(LONGLONG)((rem - margin) * 10000.0);
-                if (SetWaitableTimer(g_fwTimer, &due, 0, NULL, NULL, FALSE))
-                    MsgWaitForMultipleObjects(1, &g_fwTimer, FALSE, INFINITE, QS_ALLINPUT);
+                due.QuadPart = -(LONGLONG)(sleepMs * 10000.0);
+                if (SetWaitableTimer(g_fwTimer, &due, 0, NULL, NULL, FALSE)) {
+                    MsgWaitForMultipleObjects(1, &g_fwTimer, FALSE, (DWORD)(sleepMs + 20.0), QS_ALLINPUT);
+                }
             } else {
-                MsgWaitForMultipleObjects(0, NULL, FALSE, (DWORD)(rem - margin), QS_ALLINPUT);
+                MsgWaitForMultipleObjects(0, NULL, FALSE, (DWORD)sleepMs, QS_ALLINPUT);
             }
             QueryPerformanceCounter(&b);
             g_fwSleeps++;
@@ -6019,8 +6131,42 @@ static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
         } else {
             g_fwSpins++;
         }
+
+        /* Fine-grained QPC spin-wait for the sub-millisecond remainder */
+        for (;;) {
+            QueryPerformanceCounter(&now);
+            if (now.QuadPart >= g_ftNextTick.QuadPart) break;
+            if (now.QuadPart < g_ftNextTick.QuadPart - targetCounts * 2) break;
+            #if defined(__i386__) || defined(__x86_64__)
+            __builtin_ia32_pause();
+            #endif
+        }
     }
-    return r;
+
+    /* Advance next target tick by exactly 1 frame interval (preserves 60.0 Hz phase) */
+    g_ftNextTick.QuadPart += targetCounts;
+
+    /* Poll input directly at the frame boundary right before logic update for minimum latency */
+    TitleCancelFrameTick();
+    SmdControllerPoll();
+    BatchTryInstall();
+
+    /* Populate the game timer context (ctx = 0x4e92a8) */
+    {
+        int idx = ctx[65]; /* [ctx + 0x104] frame index 0..59 */
+        ctx[3] = 0; /* logic accumulator */
+        ctx[4] = 0; /* render accumulator */
+        ((unsigned char*)ctx)[0x108] = 1; /* logic ready flag */
+        ((unsigned char*)ctx)[0x109] = 1; /* render ready flag */
+
+        if (idx >= 0 && idx < 60) {
+            ctx[5 + idx] = (int)((double)now.QuadPart * 1800000.0 / (double)g_ftFreq.QuadPart);
+            idx = (idx + 1) % 60;
+            ctx[65] = idx;
+            if (idx == 0) ((unsigned char*)ctx)[0x10a] = 1;
+        }
+    }
+    return 1;
 }
 
 static void PatchFrameWait(void) {
@@ -6133,6 +6279,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         PatchResultRetry();
         PatchReplayStage();
         PatchReplayRenameDraw();
+        PatchReplayRenameInput();
         PatchReplayInputTrace();
         PatchPracticePower();
         PatchExAreaSelect();
