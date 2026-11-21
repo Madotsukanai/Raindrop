@@ -1321,6 +1321,20 @@ static int           g_rnPrevF2;            /* F2 edge tracking */
 static int           g_rnPrevEnter;         /* Enter edge tracking */
 static int           g_rnPrevEsc;           /* Esc edge tracking */
 
+/* Max uncompressed inputs bytes the game uses for a replay (0x4f1a0), i.e. the
+   input count cap.  The playback loader (0x431d30) LZSS-decodes the inputs chunk
+   into a 0x4f1a0-byte buffer and CRCs the first 2 * count bytes of it, where
+   count is the dword at hdr0xE0 + 0x18. */
+#define RR_MAX_IN_COUNT (0x4f1a0 / 2)
+
+/* The game's LZSS decoder (0x410970): cdecl(src, srcLen, dst, dstLen).  Returns
+   dst when exactly dstLen bytes were produced, NULL on failure (and frees dst
+   when it had to allocate it itself). */
+static int RrDecodeChunk(const void *src, int srcLen, void *dst, int dstLen) {
+    void *r = ((void * (__cdecl *)(const void*, int, void*, int))(uintptr_t)0x410970)(src, srcLen, dst, dstLen);
+    return r == dst;
+}
+
 /* Reads 224-byte uncompressed header of replay id using the game's reader (0x431bd0).
    Returns 1 if valid, 0 if not found or corrupted. */
 static int RnLoadHdr(int id, unsigned char hdr0xE0[0xe0]) {
@@ -1337,7 +1351,7 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
     unsigned char old_hdr[0x20];
     unsigned int old_seed;
     unsigned char dec16[16];
-    unsigned short version, inp_offset;
+    unsigned short version, inp_offset, comp_mode;
     long cmp_inp_len;
     unsigned char *cmp_inp = NULL;
     int new_cmp_hdr_len = 0;
@@ -1376,6 +1390,7 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
 
     version = *(unsigned short*)(dec16 + 0);
     inp_offset = *(unsigned short*)(dec16 + 2);
+    comp_mode = *(unsigned short*)(dec16 + 4);
     if (inp_offset < 0x20 || inp_offset > fileSize) {
         fclose(f);
         Log("ReplayRename: invalid inp_offset %u in %s", (unsigned)inp_offset, path);
@@ -1406,10 +1421,39 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
     /* Prepare new 0x20 header */
     memcpy(new_hdr, "SMDR", 4);
 
-    /* Checksum of inputs chunk (0x410c10) */
-    inp_crc = (cmp_inp && cmp_inp_len > 0)
-        ? ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(cmp_inp, (int)cmp_inp_len)
-        : 0;
+    /* Checksum of the inputs chunk.  The playback loader (0x431d30) verifies this CRC
+       over the *uncompressed* inputs (2 bytes * input count, the count is the dword at
+       hdr0xE0 + 0x18), not over the compressed chunk, so decompress it first. */
+    inp_crc = 0;
+    {
+        unsigned int inCount = *(unsigned int*)(hdr0xE0 + 0x18);
+        unsigned char *decInp;
+        if (inCount > RR_MAX_IN_COUNT) inCount = RR_MAX_IN_COUNT;
+        /* +0x1000 slack: the game's LZSS decoder writes literal tokens without
+           checking dstLen, so a malformed stream can overrun the buffer */
+        decInp = inCount ? (unsigned char*)malloc((size_t)inCount * 2 + 0x1000) : NULL;
+        if (inCount && !decInp) {
+            ((void (__cdecl *)(void*))(uintptr_t)0x434fad)(new_cmp_hdr);
+            if (cmp_inp) free(cmp_inp);
+            Log("ReplayRename: out of memory for inputs decompression");
+            return 0;
+        }
+        if (decInp) {
+            int got = 0;
+            if (comp_mode == 1) {
+                got = RrDecodeChunk(cmp_inp, (int)cmp_inp_len, decInp, (int)(inCount * 2));
+            } else if (cmp_inp_len >= (long)(inCount * 2)) {
+                memcpy(decInp, cmp_inp, (size_t)inCount * 2);
+                got = 1;
+            }
+            if (got) {
+                inp_crc = ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(decInp, (int)(inCount * 2));
+            } else {
+                Log("ReplayRename: inputs chunk failed to decompress, inp CRC will not match");
+            }
+            free(decInp);
+        }
+    }
     *(unsigned int*)(new_hdr + 8) = inp_crc;
 
     /* Checksum of uncompressed 0xe0 header */
@@ -1462,6 +1506,339 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
         ((void (__attribute__((thiscall)) *)(void*, int))(uintptr_t)0x4215c0)(menu, curPage);
     }
     return 1;
+}
+
+// ------------------------------------------------------------------------
+// ReplayRepair: replay files whose stored checksums do not match their
+// contents fail to load with "Data Checksum Error...".  RrRepairFile verifies
+// a replay the same way the game does (format word, CRC of the uncompressed
+// 0xe0 header, CRC of the 0x20 header with 0xdeadbeef at +0x04, CRC of the
+// decompressed inputs) and, when a check fails, re-derives every checksum
+// and layout field from the current file contents and rewrites the file:
+//   - format word restored from the replay manager's expected value
+//   - header chunk length re-found by LZSS-decode scan when unusable
+//   - inputs offset fixed to 0x20 + header chunk length
+//   - inputs chunk length fixed to the remaining file size when out of range
+//   - all three checksums recomputed and the 16-byte payload re-encrypted
+// The compressed chunks are kept byte-identical.  Hooks on the replay menu
+// reader (0x431bd0) and the playback loader (0x431d30) run the repair around
+// the game's own load, so edited or corrupted replays load again.
+// ------------------------------------------------------------------------
+
+/* Verifies the file like the game does.  Returns 0 when every check passes. */
+static int RrVerify(unsigned char *buf, long size, unsigned short wantFmt,
+                    unsigned short *outFmt, unsigned short *outInpOff,
+                    unsigned short *outMode, unsigned int *outCmpInpLen,
+                    unsigned short *outHdrLen, unsigned char outHdr[0xe0],
+                    int *outHdrOk) {
+    unsigned int seed = *(unsigned int*)(buf + 4);
+    unsigned int inpCrc = *(unsigned int*)(buf + 8);
+    unsigned int hdrCrc = *(unsigned int*)(buf + 0x0c);
+    unsigned short fmt, inpOff, mode, hdrLen;
+    unsigned int cmpInpLen;
+    unsigned int fail = 0;
+    unsigned int i;
+    unsigned char dec16[16];
+    unsigned char enc16[16];
+    unsigned int count;
+    unsigned char *decInp;
+    int gotInp = 0;
+
+    *outHdrOk = 0;
+
+    /* decrypt the 16-byte payload (game seeds MT19937 with the stored seed) and
+       parse the layout fields from it */
+    memcpy(dec16, buf + 0x10, 16);
+    ((void (__cdecl *)(unsigned int))(uintptr_t)0x405200)(seed);
+    for (i = 0; i < 16; i++) {
+        dec16[i] ^= (unsigned char)(((unsigned int (__cdecl *)(void))(uintptr_t)0x405250)() & 0xff);
+    }
+    fmt = *(unsigned short*)(dec16 + 0);
+    inpOff = *(unsigned short*)(dec16 + 2);
+    mode = *(unsigned short*)(dec16 + 4);
+    cmpInpLen = *(unsigned int*)(dec16 + 0x0a);
+    hdrLen = *(unsigned short*)(dec16 + 0x0e);
+    *outFmt = fmt; *outInpOff = inpOff; *outMode = mode;
+    *outCmpInpLen = cmpInpLen; *outHdrLen = hdrLen;
+
+    if (fmt != wantFmt) fail = 1;
+
+    /* CRC of the 0x20 header with 0xdeadbeef at +0x04 and the decrypted payload */
+    {
+        unsigned int r;
+        memcpy(enc16, buf + 0x10, 16);             /* payload as stored */
+        *(unsigned int*)(buf + 4) = 0xdeadbeef;
+        memcpy(buf + 0x10, dec16, 16);
+        r = ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(buf, 0x20);
+        *(unsigned int*)(buf + 4) = seed;
+        memcpy(buf + 0x10, enc16, 16);             /* restore encrypted payload */
+        if (r != seed) fail = 1;
+    }
+
+    /* decompress the 0xe0 header and check its CRC */
+    if (mode == 0) {
+        if (size >= 0x100) {
+            memcpy(outHdr, buf + 0x20, 0xe0);
+            *outHdrOk = 1;
+        }
+    } else if (hdrLen >= 1 && 0x20 + (long)hdrLen <= size &&
+               RrDecodeChunk(buf + 0x20, hdrLen, outHdr, 0xe0)) {
+        *outHdrOk = 1;
+    }
+    if (*outHdrOk) {
+        if (((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(outHdr, 0xe0) != hdrCrc) fail = 1;
+    } else {
+        fail = 1;
+    }
+
+    /* CRC of the decompressed inputs */
+    count = *outHdrOk ? *(unsigned int*)(outHdr + 0x18) : 0;
+    if (count > RR_MAX_IN_COUNT) count = RR_MAX_IN_COUNT;
+    decInp = (unsigned char*)malloc(count ? (size_t)count * 2 + 0x1000 : 1);
+    if (decInp) {
+        if (count) {
+            if (mode == 0) {
+                if ((long)inpOff < 0x20 || (long)inpOff + (long)(count * 2) > size) fail = 1;
+                else { memcpy(decInp, buf + inpOff, (size_t)count * 2); gotInp = 1; }
+            } else {
+                if ((long)inpOff < 0x20 || (long)inpOff > size ||
+                    (long)inpOff + (long)cmpInpLen > size ||
+                    !RrDecodeChunk(buf + inpOff, (int)cmpInpLen, decInp, (int)(count * 2))) fail = 1;
+                else gotInp = 1;
+            }
+        } else {
+            gotInp = 1;
+        }
+        if (gotInp) {
+            if (((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(decInp, (int)(count * 2)) != inpCrc) fail = 1;
+        }
+        free(decInp);
+    } else {
+        fail = 1;
+    }
+    return (int)fail;
+}
+
+/* Rewrites the replay at path with recomputed checksums/fields.  Returns 1 when
+   the file was repaired, 0 when nothing was wrong or it is beyond repair. */
+static int RrRepairFile(const char *path) {
+    FILE *f;
+    long size;
+    unsigned char *buf;
+    unsigned char *hdr;    /* heap with slack: decode may overrun 0xe0 on bad input */
+    unsigned char dec16[16];
+    unsigned int seed, inpCrc, hdrCrc, newSeed, count, i;
+    unsigned short fmt, inpOff, mode, hdrLen;
+    unsigned int cmpInpLen;
+    int hdrOk, changed = 0;
+
+    if (!path || !*path) return 0;
+    f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size < 0x21) { fclose(f); return 0; }
+    hdr = (unsigned char*)malloc(0x1000);
+    buf = (unsigned char*)malloc((size_t)size);
+    if (!hdr || !buf) { free(hdr); free(buf); fclose(f); return 0; }
+    if (fread(buf, 1, (size_t)size, f) != (size_t)size) { free(hdr); free(buf); fclose(f); return 0; }
+    fclose(f);
+    if (memcmp(buf, "SMDR", 4) != 0) { free(hdr); free(buf); return 0; }
+
+    /* expected format word from the replay manager object (same source the
+       game's reader compares against) */
+    {
+        void *input = *(void**)(uintptr_t)0x46bbec;
+        unsigned short want = 0;
+        if (input && !IsBadReadPtr(input, 2)) want = *(unsigned short*)input;
+        if (RrVerify(buf, size, want, &fmt, &inpOff, &mode, &cmpInpLen, &hdrLen, hdr, &hdrOk) == 0) {
+            free(hdr); free(buf);
+            return 0;   /* file is already consistent */
+        }
+    }
+
+    Log("ReplayRepair: %s fails verification, repairing", path);
+
+    /* decrypt payload */
+    seed = *(unsigned int*)(buf + 4);
+    memcpy(dec16, buf + 0x10, 16);
+    ((void (__cdecl *)(unsigned int))(uintptr_t)0x405200)(seed);
+    for (i = 0; i < 16; i++) {
+        dec16[i] ^= (unsigned char)(((unsigned int (__cdecl *)(void))(uintptr_t)0x405250)() & 0xff);
+    }
+    fmt = *(unsigned short*)(dec16 + 0);
+    inpOff = *(unsigned short*)(dec16 + 2);
+    mode = *(unsigned short*)(dec16 + 4);
+    cmpInpLen = *(unsigned int*)(dec16 + 0x0a);
+    hdrLen = *(unsigned short*)(dec16 + 0x0e);
+
+    /* format word */
+    {
+        void *input = *(void**)(uintptr_t)0x46bbec;
+        if (input && !IsBadReadPtr(input, 2)) {
+            unsigned short want = *(unsigned short*)input;
+            if (fmt != want) { fmt = want; changed = 1; }
+        }
+    }
+
+    /* header chunk: recover hdrLen by decode scan when it does not decode */
+    hdrOk = 0;
+    if (mode == 0 && size >= 0x100) {
+        memcpy(hdr, buf + 0x20, 0xe0);
+        if (hdrLen != 0xe0) { hdrLen = 0xe0; changed = 1; }
+        hdrOk = 1;
+    } else {
+        if (mode != 1) { mode = 1; changed = 1; }
+        if (hdrLen >= 1 && 0x20 + (long)hdrLen <= size &&
+            RrDecodeChunk(buf + 0x20, hdrLen, hdr, 0xe0)) {
+            hdrOk = 1;
+        } else {
+            long maxScan = size - 0x20;
+            long L;
+            if (maxScan > 0x800) maxScan = 0x800;
+            for (L = 1; L <= maxScan; L++) {
+                if (RrDecodeChunk(buf + 0x20, (int)L, hdr, 0xe0)) { hdrLen = (unsigned short)L; hdrOk = 1; changed = 1; break; }
+            }
+        }
+    }
+    if (!hdrOk) {
+        Log("ReplayRepair: %s header chunk not decodable, giving up", path);
+        free(hdr); free(buf);
+        return 0;
+    }
+
+    /* inputs offset: must sit right after the header chunk */
+    {
+        unsigned short want = (unsigned short)(0x20 + hdrLen);
+        if ((long)(0x20 + hdrLen) > size || want < 0x20) {
+            Log("ReplayRepair: %s file too small for layout, giving up", path);
+            free(hdr); free(buf);
+            return 0;
+        }
+        if (inpOff != want) { inpOff = want; changed = 1; }
+    }
+
+    /* inputs chunk length: fix when it runs past EOF (trailing bytes are kept) */
+    if ((long)inpOff + (long)cmpInpLen > size) {
+        cmpInpLen = (unsigned int)(size - (long)inpOff);
+        changed = 1;
+    }
+
+    /* checksums */
+    count = *(unsigned int*)(hdr + 0x18);
+    if (count > RR_MAX_IN_COUNT) count = RR_MAX_IN_COUNT;
+    {
+        unsigned char *decInp = (unsigned char*)malloc(count ? (size_t)count * 2 + 0x1000 : 1);
+        int gotInp = 0;
+        if (!decInp) { free(hdr); free(buf); return 0; }
+        if (count) {
+            if (mode == 0) {
+                if ((long)inpOff + (long)(count * 2) <= size) {
+                    memcpy(decInp, buf + inpOff, (size_t)count * 2);
+                    gotInp = 1;
+                }
+            } else {
+                gotInp = RrDecodeChunk(buf + inpOff, (int)cmpInpLen, decInp, (int)(count * 2));
+                if (!gotInp && (long)inpOff + (long)cmpInpLen != size && size - (long)inpOff > 0) {
+                    /* stored inputs length is suspect: try the whole remainder */
+                    gotInp = RrDecodeChunk(buf + inpOff, (int)(size - inpOff), decInp, (int)(count * 2));
+                    if (gotInp) { cmpInpLen = (unsigned int)(size - (long)inpOff); changed = 1; }
+                }
+            }
+        } else {
+            gotInp = 1;
+        }
+        inpCrc = *(unsigned int*)(buf + 8);
+        if (gotInp) {
+            unsigned int want = ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(decInp, (int)(count * 2));
+            if (want != inpCrc) { inpCrc = want; changed = 1; }
+        } else {
+            Log("ReplayRepair: %s inputs chunk not decodable, inp CRC left unchanged", path);
+        }
+        free(decInp);
+    }
+    hdrCrc = ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(hdr, 0xe0);
+    if (hdrCrc != *(unsigned int*)(buf + 0x0c)) changed = 1;
+
+    if (!changed) {
+        free(hdr); free(buf);
+        return 0;
+    }
+
+    /* write fields back into the payload */
+    *(unsigned short*)(dec16 + 0) = fmt;
+    *(unsigned short*)(dec16 + 2) = inpOff;
+    *(unsigned short*)(dec16 + 4) = mode;
+    *(unsigned int*)(dec16 + 0x0a) = cmpInpLen;
+    *(unsigned short*)(dec16 + 0x0e) = hdrLen;
+    *(unsigned int*)(buf + 8) = inpCrc;
+    *(unsigned int*)(buf + 0x0c) = hdrCrc;
+    /* re-seed: CRC over the 0x20 header with 0xdeadbeef at +0x04 and the plain payload */
+    *(unsigned int*)(buf + 0x04) = 0xdeadbeef;
+    memcpy(buf + 0x10, dec16, 16);
+    newSeed = ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(buf, 0x20);
+    *(unsigned int*)(buf + 0x04) = newSeed;
+    ((void (__cdecl *)(unsigned int))(uintptr_t)0x405200)(newSeed);
+    for (i = 0; i < 16; i++) {
+        (buf + 0x10)[i] ^= (unsigned char)(((unsigned int (__cdecl *)(void))(uintptr_t)0x405250)() & 0xff);
+    }
+
+    f = fopen(path, "wb");
+    if (!f) { free(hdr); free(buf); Log("ReplayRepair: failed to open %s for writing", path); return 0; }
+    fwrite(buf, 1, (size_t)size, f);
+    fclose(f);
+    free(hdr); free(buf);
+    Log("ReplayRepair: repaired %s (fmt=%u inpOff=%u mode=%u hdrLen=%u inpLen=%u inpCrc=0x%08x hdrCrc=0x%08x seed=0x%08x)",
+        path, (unsigned)fmt, (unsigned)inpOff, (unsigned)mode, (unsigned)hdrLen, cmpInpLen, inpCrc, hdrCrc, newSeed);
+    return 1;
+}
+
+/* Repair-on-failure wrapper for the replay menu reader call sites. */
+static int RrRepairId(void *input, int id) {
+    char path[MAX_PATH];
+    if (id < 0 || id > 999) return 0;
+    snprintf(path, sizeof(path), "replay\\replay%03d.dat", id);
+    (void)input;
+    return RrRepairFile(path);
+}
+
+static int __attribute__((fastcall)) RrMenuReaderHook(void *input, void *edx, int id, void *hdr) {
+    int r = ((int (__attribute__((thiscall)) *)(void *, int, void *))(uintptr_t)0x431bd0)(input, id, hdr);
+    if (!r) {
+        if (RrRepairId(input, id)) {
+            r = ((int (__attribute__((thiscall)) *)(void *, int, void *))(uintptr_t)0x431bd0)(input, id, hdr);
+            if (r) Log("ReplayRepair: replay %03d loads after repair", id);
+        }
+    }
+    return r;
+}
+
+/* Repair-before-load wrapper for the playback loader call sites.  RrRepairFile
+   is a no-op when the file already verifies. */
+static int __attribute__((fastcall)) RrPlaybackLoaderHook(void *self, void *edx,
+                                                          const char *file, int a2, int a3) {
+    RrRepairFile(file);
+    return ((int (__attribute__((thiscall)) *)(void *, const char *, int, int))(uintptr_t)0x431d30)(self, file, a2, a3);
+}
+
+static void PatchReplayRepair(void) {
+    int n = 0;
+    if ((DWORD)(uintptr_t)GetModuleHandleA(NULL) != 0x400000) {
+        Log("ReplayRepair: unexpected image base, skipped");
+        return;
+    }
+    /* replay menu reader (0x431bd0, thiscall, ret 0x8) call sites */
+    n += HookCall(0x4216c7, 0x431bd0, (void*)&RrMenuReaderHook);
+    n += HookCall(0x421c0f, 0x431bd0, (void*)&RrMenuReaderHook);
+    n += HookCall(0x421c49, 0x431bd0, (void*)&RrMenuReaderHook);
+    n += HookCall(0x4221b7, 0x431bd0, (void*)&RrMenuReaderHook);
+    n += HookCall(0x4223fc, 0x431bd0, (void*)&RrMenuReaderHook);
+    /* playback loader (0x431d30, thiscall, ret 0xc) call sites */
+    n += HookCall(0x4236db, 0x431d30, (void*)&RrPlaybackLoaderHook);
+    n += HookCall(0x425bfa, 0x431d30, (void*)&RrPlaybackLoaderHook);
+    n += HookCall(0x43200b, 0x431d30, (void*)&RrPlaybackLoaderHook);
+    Log("ReplayRepair: %d hook site(s) installed", n);
 }
 
 static void RnSyncRowText(void *menu) {
@@ -6059,6 +6436,43 @@ static void FrameWaitInit(void) {
 typedef unsigned (__attribute__((fastcall)) *PF_FrameTimer)(int *ctx);
 int SmdD3D9GetVsync(void);
 
+/* ---- main-thread heartbeat + freeze watchdog (debug builds) ---------------- */
+#ifdef SMD_DEBUG_BUILD
+static volatile LONG g_frameSeq = 0;        /* bumped once per frame by FrameTimerHook */
+static volatile DWORD g_frameSeqTick = 0;   /* last heartbeat update time */
+static volatile DWORD g_mainThreadId = 0;
+
+/* Logs a report when the main thread stops producing frames while the process
+   is still alive (hooked call stuck, deadloop, deadlock, ...). */
+static DWORD WINAPI FreezeWatchThread(LPVOID arg) {
+    LONG lastSeq = 0;
+    DWORD lastSeqTick = 0, lastReport = 0;
+    (void)arg;
+    for (;;) {
+        DWORD now, tick;
+        LONG seq;
+        Sleep(1000);
+        now = GetTickCount();
+        seq = g_frameSeq;
+        tick = g_frameSeqTick;
+        if (seq != lastSeq || tick != lastSeqTick) {
+            lastSeq = seq;
+            lastSeqTick = tick;
+            continue;
+        }
+        if (!seq) continue;    /* game loop not started yet */
+        if (now - (lastSeqTick ? lastSeqTick : now) > 5000 &&
+            now - lastReport > 5000) {
+            lastReport = now;
+            Log("FreezeWatch: no frame for %lu ms (frameSeq=%ld, main tid=%lu)",
+                (unsigned long)(now - (lastSeqTick ? lastSeqTick : now)),
+                (long)seq, (unsigned long)g_mainThreadId);
+        }
+    }
+    return 0;
+}
+#endif
+
 static LARGE_INTEGER g_ftFreq;
 static LARGE_INTEGER g_ftNextTick;
 static int g_ftInit = 0;
@@ -6275,6 +6689,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         PatchPauseKeys();
         PatchReplayPause();
         PatchReplayLoadCapture();
+        PatchReplayRepair();
         PatchReplaySaveCancel();
         PatchResultRetry();
         PatchReplayStage();

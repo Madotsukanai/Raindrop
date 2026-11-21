@@ -17,6 +17,7 @@
 PrEx=1
 [Graphics]
 API=DirectDraw
+VSync=auto
 ```
 
 `API=DirectDraw`はシステムのDirectDrawを使用します。利用できない場合はD3D9へフォールバックします。`API=D3D9`にすると、起動時から内蔵D3D9実装を使用します。ファイルまたは設定がない場合は`DirectDraw`を使用します。<br>
