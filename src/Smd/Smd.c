@@ -2853,8 +2853,24 @@ static void PerfFlush(int frame) {
    0x42ade0 (ship dead -> wait for the fire button) is skipped while +0x2a8 > 0x78 and the ship would never
    reappear.  F9 toggles the feature on the fly. */
 static void DebugDisablePlayerHitbox(void) {
-    static int on = 1, logged = 0, dumpN = 0;
+    static int on = 1, logged = 0, dumpN = 0, playbackWarned = 0;
     void *body = *(void **)(uintptr_t)0x4e9ac0;
+    /* Never touch game state while a replay/demo/ghost is playing back: forcing the
+       invincibility counter during playback mutates state the recording never had and
+       desynchronises the replay partway through the stage. */
+    {
+        void *input = *(void **)(uintptr_t)0x46bbec;
+        int playback = input && !IsBadReadPtr(input, 0x235) &&
+                       *(volatile unsigned char *)((char *)input + 0x234);
+        if (playback) {
+            if (!playbackWarned) {
+                Log("Debug: player invincibility suspended during replay playback");
+                playbackWarned = 1;
+            }
+            return;
+        }
+        playbackWarned = 0;
+    }
     if (GetAsyncKeyState(VK_F9) & 1) {
         on = !on;
         Log("Debug: player invincibility now %s", on ? "ON" : "OFF");
