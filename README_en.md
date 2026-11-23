@@ -15,6 +15,7 @@ Choose the graphics API in `raindrop.ini` in the same directory as `Rain.exe`:
 PrEx=1
 [Graphics]
 API=DirectDraw
+VSync=auto
 ```
 
 `API=DirectDraw` uses the system DirectDraw implementation and falls back to D3D9 if it is unavailable. Set `API=D3D9` to use the built-in D3D9 implementation from startup. If the file or setting is missing, `DirectDraw` is used.<br>
