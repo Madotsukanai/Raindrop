@@ -47,6 +47,10 @@ typedef HRESULT (WINAPI *PF_DirectInput8Create)(HINSTANCE, DWORD, REFIID, LPVOID
 #define JOY_CAPS_BRIDGED (JOYCAPS_HASZ | JOYCAPS_HASR | JOYCAPS_HASU | JOYCAPS_HASV | \
                           JOYCAPS_HASPOV | JOYCAPS_POV4DIR | JOYCAPS_POVCTS)
 
+#ifndef DIDFT_OPTIONAL
+#define DIDFT_OPTIONAL 0x80000000
+#endif
+
 #define XI_ID_VK_A            0x1000u
 #define XI_ID_VK_B            0x2000u
 #define XI_ID_VK_X            0x4000u
