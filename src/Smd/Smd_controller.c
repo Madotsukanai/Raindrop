@@ -131,7 +131,7 @@ static int JoyHidrawOpen(int idx) {
     char dev[64], uev[80], buf[512];
     HANDLE h;
     DWORD rd = 0, got = 0;
-    unsigned vid = 0, pid = 0, bvid = 0, bpid = 0;
+    unsigned vid = 0, pid = 0, bustype = 0;
     unsigned char *p, *end;
 
     sprintf(dev, "Z:\\dev\\hidraw%d", idx);
@@ -147,8 +147,10 @@ static int JoyHidrawOpen(int idx) {
         /* HID_ID=BBBB:VVVVVVVV:PPPPPPPP */
         end = (unsigned char*)buf + rd;
         for (p = (unsigned char*)buf; p < end; p += strlen((char*)p) + 1) {
-            if (strncmp((char*)p, "HID_ID=", 7) == 0)
-                sscanf((char*)p + 7, "%x:%x:%x", &bvid, &vid, &pid);
+            if (strncmp((char*)p, "HID_ID=", 7) == 0) {
+                sscanf((char*)p + 7, "%x:%x:%x", &bustype, &vid, &pid);
+                (void)bustype;
+            }
             if (p + strlen((char*)p) + 1 >= end) break;
         }
     }
