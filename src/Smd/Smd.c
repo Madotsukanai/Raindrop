@@ -1076,6 +1076,7 @@ static const int g_ReplayPause = 1;
 static int g_pauseSeen = 0;
 static int g_pauseReplay = 0;
 static int g_pauseReplayHandled = 0;
+static DWORD g_replaySavedButtons = 0;
 static int g_pauseAfterLoad = 0;
 static int g_pauseLoadArmed = 0;
 static int g_replayFileId = -1;
@@ -1088,30 +1089,55 @@ typedef int (__attribute__((thiscall)) *PF_ReplayLoad)(void *input, int replayId
 typedef void (__cdecl *PF_SceneSwitch)(int a, int b);
 
 static void PauseReplayRestore(void) {
-    if (*(volatile unsigned char*)(uintptr_t)0x4dae16 != 0) return;
-    if (g_pauseReplay && !g_pauseReplayHandled) {
-        void *input = *(void**)(uintptr_t)0x46bbec;
-        if (input) {
-            *((volatile unsigned char*)input + 0x234) = 1;
-            Log("ReplayPause: pause menu closed, replay playback restored");
+    /* Handled synchronously by ReplayPauseResumeHook at 0x419c03 */
+}
+
+static unsigned char __attribute__((thiscall)) ReplayPauseOpenHook(void *input) {
+    unsigned char *inp = (unsigned char*)input;
+    if (g_ReplayPause && inp && inp[0x234]) {
+        g_pauseReplay = 1;
+        g_pauseReplayHandled = 0;
+        g_replaySavedButtons = *(DWORD*)(inp + 4);
+        inp[0x234] = 0;
+        Log("ReplayPause: replay paused (stage frame=%d cursor=%u buttons=%04X)",
+            *(volatile int*)(uintptr_t)0x4dadf8, *(unsigned*)(inp + 0x11a8), (unsigned)g_replaySavedButtons);
+    }
+    return ((unsigned char (__attribute__((thiscall)) *)(void*))(uintptr_t)0x431850)(input);
+}
+
+static void __attribute__((thiscall)) ReplayPauseResumeHook(void *input) {
+    unsigned char *inp = (unsigned char*)input;
+    if (g_ReplayPause && inp && g_pauseReplay && !g_pauseReplayHandled) {
+        inp[0x234] = 1;
+        *(DWORD*)(inp + 4) = g_replaySavedButtons;
+        g_pauseReplay = 0;
+        Log("ReplayPause: replay resumed (stage frame=%d cursor=%u restoredButtons=%04X)",
+            *(volatile int*)(uintptr_t)0x4dadf8, *(unsigned*)(inp + 0x11a8), (unsigned)g_replaySavedButtons);
+    }
+    ((void (__attribute__((thiscall)) *)(void*))(uintptr_t)0x431880)(input);
+}
+
+static void __attribute__((thiscall)) ReplayPauseExitHook(void *input) {
+    unsigned char *inp = (unsigned char*)input;
+    void *menu = *(void**)(uintptr_t)0x4dae08;
+    int st = menu ? OPT_F(menu, 0x538) : 0;
+    if (g_ReplayPause && inp && g_pauseReplay && !g_pauseReplayHandled) {
+        if (st == 4) {
+            g_pauseReplay = 0;
+            g_pauseReplayHandled = 1;
+            inp[0x234] = 1;
+            ((PF_ReplayStop)(uintptr_t)0x432020)(input);
+            Log("ReplayPause: title chosen, replay stopped");
+        } else if (st == 5) {
+            g_pauseReplayHandled = 1;
+            Log("ReplayPause: retry chosen, will reload replay");
         }
     }
-    g_pauseSeen = 0;
-    g_pauseReplay = 0;
-    g_pauseReplayHandled = 0;
+    ((void (__attribute__((thiscall)) *)(void*))(uintptr_t)0x4318a0)(input);
 }
 
 static void __attribute__((fastcall)) PauseUpdateHook(void *menu) {
     void *input = *(void**)(uintptr_t)0x46bbec;
-    if (input && !g_pauseSeen) {
-        g_pauseSeen = 1;
-        if (g_ReplayPause && *((volatile unsigned char*)input + 0x234)) {
-            g_pauseReplay = 1;
-            g_pauseReplayHandled = 0;
-            *((volatile unsigned char*)input + 0x234) = 0;
-            Log("ReplayPause: pause menu opened during replay playback");
-        }
-    }
     /* menu+0xc is the command input mode flag (set when the 4th item is chosen); the typed letters must not
        act as the Q/R shortcuts while a command is being entered. */
     if (input && menu && OPT_F(menu, 0x538) == 6 && OPT_F(menu, 0xc) == 0) {
@@ -1125,17 +1151,6 @@ static void __attribute__((fastcall)) PauseUpdateHook(void *menu) {
         }
     }
     ((PF_PauseUpdate)(uintptr_t)0x419b30)(menu);
-    if (g_pauseReplay && !g_pauseReplayHandled && input && menu) {
-        int st = OPT_F(menu, 0x538);
-        if (st == 4) {
-            *((volatile unsigned char*)input + 0x234) = 1;
-            ((PF_ReplayStop)(uintptr_t)0x432020)(input);
-            g_pauseReplayHandled = 1;
-            Log("ReplayPause: title chosen, replay stopped");
-        } else if (st == 5) {
-            g_pauseReplayHandled = 1;
-        }
-    }
 }
 
 static void PatchPauseKeys(void) {
@@ -1190,7 +1205,12 @@ static void PatchReplayPause(void) {
     p[8] = 0xeb;
     VirtualProtect(p + 8, 1, old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, sizeof(orig));
-    Log("ReplayPause: patched (pause menu opens during replay playback)");
+
+    HookCall(0x413d04, 0x431850, (void*)&ReplayPauseOpenHook);
+    HookCall(0x419c03, 0x431880, (void*)&ReplayPauseResumeHook);
+    HookCall(0x419c69, 0x4318a0, (void*)&ReplayPauseExitHook);
+
+    Log("ReplayPause: patched (pause open/resume hooks installed)");
 }
 
 static const int g_ResultRetryFix = 1;
@@ -2700,12 +2720,13 @@ static void __stdcall RetryHook(int stage) {
             int ok = ((PF_ReplayLoad)(uintptr_t)0x431fe0)(input, g_replayFileId, g_replayStage);
             Log("ReplayPause: retry reloaded replay id=%d from stage %d (ok=%d)",
                 g_replayFileId, g_replayStage, ok);
+            g_pauseReplay = 0;
             if (!ok) {
                 Log("ReplayPause: reload failed, falling back to the game retry");
-                g_pauseReplay = 0;
                 ((PF_GameStart)(uintptr_t)0x419d10)(stage);
             }
         } else {
+            g_pauseReplay = 0;
             Log("ReplayPause: retry could not reload replay (input=%p file_id=%d)",
                 input, g_replayFileIdCaptured);
             ((PF_SceneSwitch)(uintptr_t)0x4254d0)(1, 0);
@@ -2935,7 +2956,7 @@ static int __attribute__((fastcall)) ReplayLoadCaptureHook(void *input, void *ed
                                                             int replayId, int stage) {
     (void)edx;
     g_replayFileId = replayId;
-    g_replayStage = (stage == 4) ? 4 : 1;
+    g_replayStage = stage;
     g_replayFileIdCaptured = 1;
     Log("ReplayLoad: selected id=%d stage=%d", replayId, stage);
     return ((PF_ReplayLoad)(uintptr_t)0x431fe0)(input, replayId, stage);
