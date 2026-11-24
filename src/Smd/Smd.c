@@ -1073,7 +1073,6 @@ static void PatchOptionDefaults(void) {
 static const int g_PauseQRKey = 1;
 
 static const int g_ReplayPause = 1;
-static int g_pauseSeen = 0;
 static int g_pauseReplay = 0;
 static int g_pauseReplayHandled = 0;
 static DWORD g_replaySavedButtons = 0;

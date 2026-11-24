@@ -2390,7 +2390,7 @@ static HRESULT STDMETHODCALLTYPE WDD7_GetMonitorFrequency(IDirectDraw7 *self, LP
 static HRESULT STDMETHODCALLTYPE WDD7_GetScanLine(IDirectDraw7 *self, LPDWORD s) {
     return IDirectDraw7_GetScanLine(((DD7W*)self)->orig, s);
 }
-static HRESULT STDMETHODCALLTYPE WDD7_GetVerticalBlankStatus(IDirectDraw7 *self, WINBOOL *b) {
+static HRESULT STDMETHODCALLTYPE WDD7_GetVerticalBlankStatus(IDirectDraw7 *self, BOOL *b) {
     return IDirectDraw7_GetVerticalBlankStatus(((DD7W*)self)->orig, b);
 }
 static HRESULT STDMETHODCALLTYPE WDD7_Initialize(IDirectDraw7 *self, GUID *g) {
