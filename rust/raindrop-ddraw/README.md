@@ -1,4 +1,4 @@
-# raindrop-ddraw7
+# raindrop-ddraw
 
 Rust replacement for 五月雨 (Samidare)'s DirectDraw7 + Direct3D7 emulation
 layer (the `D7` emu in `src/Smd/Smd_d3d9.c`), running directly on the
@@ -36,7 +36,7 @@ layer (the `D7` emu in `src/Smd/Smd_d3d9.c`), running directly on the
     backend, there is no backend setting),
   - `D3D9` — the D3D9-based emulation (C D7 emu over the d3d9.dll in the
     game dir).
-- C hooks passed to `raindrop_ddraw7_create`: coop (hotkey subclass +
+- C hooks passed to `raindrop_ddraw_create`: coop (hotkey subclass +
   borderless setup), win (borderless at CreateDevice), flush
   (`SmdBatchFlushQuads`). VSync interval is computed C-side
   (`D7E_ConfigVsync`).
@@ -44,7 +44,7 @@ layer (the `D7` emu in `src/Smd/Smd_d3d9.c`), running directly on the
 ## Build
 
 ```
-make smd            # build/ddraw.dll (links libraindrop_ddraw7.a + libraindrop_gpu.a)
+make smd            # build/ddraw.dll (links libraindrop_ddraw.a + libraindrop_gpu.a)
 ```
 
 Requires the `wgpu-backend` feature (enabled by the Makefile rule); all

@@ -2139,9 +2139,9 @@ static HRESULT D7E_CreateDD7(void **out) {
     return DD_OK;
 }
 
-/* ---- Rust DirectDraw7/Direct3D7 layer (raindrop-ddraw7, statically linked) ---- */
-extern UINT WINAPI raindrop_ddraw7_abi_version(void);
-extern HRESULT WINAPI raindrop_ddraw7_create(void **out, UINT interval,
+/* ---- Rust DirectDraw7/Direct3D7 layer (raindrop-ddraw, statically linked) ---- */
+extern UINT WINAPI raindrop_ddraw_abi_version(void);
+extern HRESULT WINAPI raindrop_ddraw_create(void **out, UINT interval,
     void (WINAPI *coopHook)(INT_PTR), void (WINAPI *winHook)(INT_PTR), void (WINAPI *flushHook)(void));
 
 static void WINAPI D7E_RustCoopHook(INT_PTR hwnd) {
@@ -2157,7 +2157,7 @@ static void WINAPI D7E_RustFlushHook(void) {
     SmdBatchFlushQuads();
 }
 
-/* API=DirectDraw -> the DirectDraw emulation layer (raindrop-ddraw7).
+/* API=DirectDraw -> the DirectDraw emulation layer (raindrop-ddraw).
    There is no backend setting: wgpu is the only backend. */
 static int D7E_DirectDrawEmu(void) {
     static int v = -1;
@@ -2176,14 +2176,14 @@ static HRESULT D7E_CreateRust(void **out) {
         rr = dm.dmDisplayFrequency;
     int vsync = D7E_ConfigVsync(rr);
     UINT interval = vsync ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
-    HRESULT hr = raindrop_ddraw7_create(out, interval, D7E_RustCoopHook, D7E_RustWinHook, D7E_RustFlushHook);
+    HRESULT hr = raindrop_ddraw_create(out, interval, D7E_RustCoopHook, D7E_RustWinHook, D7E_RustFlushHook);
     if (hr < 0 || !*out) {
         SmdLog("Rust DirectDraw7 layer unavailable (hr=%08X); falling back to the C emu", (unsigned)hr);
         return hr;
     }
     g_d7.active = 1;
     SmdKeyLatInit();
-    SmdLog("DirectDraw7/Direct3D7: using the Rust wgpu layer (abi=%u)", raindrop_ddraw7_abi_version());
+    SmdLog("DirectDraw7/Direct3D7: using the Rust wgpu layer (abi=%u)", raindrop_ddraw_abi_version());
     return DD_OK;
 }
 
@@ -2539,7 +2539,7 @@ static HRESULT WINAPI Hook_DirectDrawCreateEx(GUID *guid, LPVOID *out, REFIID ri
         SmdLog("DirectDrawCreateEx (other) -> hr=%08X", hr);
         return hr;
     }
-    /* Forced (SMD_FORCE_D3D7_EMU=1): Rust ddraw7 first, C emu as backup. */
+    /* Forced (SMD_FORCE_D3D7_EMU=1): Rust ddraw first, C emu as backup. */
     if (g_D7Emu && D7E_Forced()) {
         if (D7E_CreateRust(out) >= 0 && *out)
             return DD_OK;
@@ -2552,7 +2552,7 @@ static HRESULT WINAPI Hook_DirectDrawCreateEx(GUID *guid, LPVOID *out, REFIID ri
         SmdLog("GraphicsAPI: using the Direct3D9 emulation (API=D3D9)");
         return D7E_CreateDD7(out);
     }
-    /* API=DirectDraw -> the DirectDraw emulation: raindrop-ddraw7 (rust),
+    /* API=DirectDraw -> the DirectDraw emulation: raindrop-ddraw (rust),
        the C D7 emu (c), or the real ddraw (system, passthrough). */
     if (g_D7Emu && D7E_DirectDrawEmu()) {
         if (D7E_CreateRust(out) >= 0 && *out)

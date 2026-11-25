@@ -1,5 +1,5 @@
 [package]
-name = "raindrop-ddraw7"
+name = "raindrop-ddraw"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"

@@ -23,10 +23,10 @@ RUSTLIB = $(RUST_TARGET_DIR)/libraindrop_gpu.a
 RUST_RUNTIME_LIBS = -ladvapi32 -lws2_32 -lbcrypt -luserenv -lole32 -loleaut32 -lsynchronization -lntdll -lopengl32 -lgdi32 -lwindowsapp
 RUST_D3D9 = rust/raindrop-d3d9/target/i686-pc-windows-gnu/release/raindrop_d3d9.dll
 RUST_D3D9LIB = rust/raindrop-d3d9/target/i686-pc-windows-gnu/release/libraindrop_d3d9.a
-RUST_DD7LIB = rust/raindrop-ddraw7/target/i686-pc-windows-gnu/release/libraindrop_ddraw7.a
+RUST_DDRAWLIB = rust/raindrop-ddraw/target/i686-pc-windows-gnu/release/libraindrop_ddraw.a
 
-$(RUST_DD7LIB): rust/raindrop-ddraw7/Cargo.toml rust/raindrop-ddraw7/src/*.rs $(RUST_D3D9LIB)
-	cd rust/raindrop-ddraw7 && $(RUST) build --target i686-pc-windows-gnu --release --features wgpu-backend
+$(RUST_DDRAWLIB): rust/raindrop-ddraw/Cargo.toml rust/raindrop-ddraw/src/*.rs $(RUST_D3D9LIB)
+	cd rust/raindrop-ddraw && $(RUST) build --target i686-pc-windows-gnu --release --features wgpu-backend
 
 $(RUST_D3D9): rust/raindrop-d3d9/Cargo.toml rust/raindrop-d3d9/src/*.rs $(RUSTLIB)
 	cd rust/raindrop-d3d9 && $(RUST) build --target i686-pc-windows-gnu --release --features wgpu-backend
@@ -74,7 +74,7 @@ smd: $(BUILD)/ddraw.dll
 # make smd-debug : Debug Smd sources -> build/debug/ddraw.dll
 smd-debug: $(BUILD)/debug/ddraw.dll
 
-$(BUILD)/debug/ddraw.dll: $(BUILD)/Smd_debug.o $(BUILD)/Smd_d3d9_debug.o $(BUILD)/Smd_controller_debug.o $(RUSTLIB) $(RUST_DD7LIB) | $(BUILD)/debug
+$(BUILD)/debug/ddraw.dll: $(BUILD)/Smd_debug.o $(BUILD)/Smd_d3d9_debug.o $(BUILD)/Smd_controller_debug.o $(RUSTLIB) $(RUST_DDRAWLIB) | $(BUILD)/debug
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldxguid $(RUST_RUNTIME_LIBS)
 
 $(BUILD)/Smd_debug.o: src/Smd/Smd.c src/Smd/Smd_internal.h src/RainUpdate.h $(VERSION_STAMP) | $(BUILD)
@@ -91,7 +91,7 @@ $(BUILD)/Smd_controller_debug.o: src/Smd/Smd_controller.c src/Smd/Smd_internal.h
 $(RUSTLIB): rust/raindrop-gpu/Cargo.toml rust/raindrop-gpu/src/lib.rs rust/raindrop-gpu/src/kernels.rs
 	cd rust/raindrop-gpu && $(RUST) build --target i686-pc-windows-gnu --release
 
-$(BUILD)/ddraw.dll: $(BUILD)/Smd.o $(BUILD)/Smd_d3d9.o $(BUILD)/Smd_controller.o $(RUSTLIB) $(RUST_DD7LIB)
+$(BUILD)/ddraw.dll: $(BUILD)/Smd.o $(BUILD)/Smd_d3d9.o $(BUILD)/Smd_controller.o $(RUSTLIB) $(RUST_DDRAWLIB)
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldxguid $(RUST_RUNTIME_LIBS)
 
 $(BUILD)/Smd.o: src/Smd/Smd.c src/Smd/Smd_internal.h src/RainUpdate.h $(VERSION_STAMP) | $(BUILD)
