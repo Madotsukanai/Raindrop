@@ -5,16 +5,7 @@
 #include <stdio.h>
 #include "d3dx9_font_compat.h"
 
-
-
-
-
-
-
-
-
 typedef struct {
-    
     DWORD Scene, SceneNext, ScenePend, Script;
     DWORD GameMode, ReplaySlot, GameModeNext, Var4d2370;
     DWORD FrameCnt;
@@ -25,15 +16,12 @@ typedef struct {
     DWORD Tasks, GpuQueue;
     DWORD Frame1, Frame2, ViewIdx;
     DWORD pdRange[6][2];
-    
     DWORD fnSE, fnTick, fnLoadGlobal, fnSaveGlobal, fnSaveGlobalRet;
     DWORD fnGetGameInfoInt, fnGetGameInfoIntRet;
     DWORD fnSetGameInfoInt, fnSetGameInfoIntRet;
     DWORD fnIsKeyPressed, fnIsKeyTriggered;
-    
     DWORD vtInput, vtJoyA, vtJoyB, vtTask;
     DWORD iatGetKeyboardState, iatXInputGetCaps, iatXInputGetState;
-    
     DWORD TransSite;
     DWORD LoadStartSite, LoadStartRet, LoadStartSkip;
     DWORD SceneCheckSite, SceneCheckRet;
@@ -63,38 +51,22 @@ typedef struct {
 } VersionSigs;
 
 static const GameAddrs ADDRS_DISC = {
-    
     0x005c073c, 0x005c0740, 0x005c0744, 0x005c0760,
-    
     0x004d2378, 0x004d237c, 0x004d2380, 0x004d2370,
-    
     0x005abb78,
-    
     0x005ac4d4, 0x005ac4dc, 0x005ac674, 0x005ac9b0, 0x005ac9b4,
-    
     0x005b8e08, 0x005b8e10, 0x005b8e14, 0x005b8e18, 0x005b8e1c, 0x005b8e20, 0x005b8e24, 0x005b8e28,
-    
     0x005b8e54, 0x005b8e58, 0x005b8e5c, 0x005b8e68,
-    
     0x005b975d, 0x005b976c, 0x005b9770, 0x005b9774, 0x5b9778,
-    
     0x005ba0a8, 0x004df338,
-    
     0x005abb70, 0x005abb74, 0x005abb80,
-    
     { { 0x005abb60, 0x005abbc0 }, { 0x005b8e00, 0x005b8e70 }, { 0x005ac4c0, 0x005ac4f0 },
       { 0x005ac670, 0x005ac680 }, { 0x004d2370, 0x004d2380 }, { 0x005c0730, 0x005c0760 } },
-    
     0x0043bf40, 0x0042a7c0, 0x0042a8e0, 0x0042c330, 0x0042c335,
-    
     0x0044fb80, 0x0044fb85, 0x0044fca0, 0x0044fca5,
-    
     0x00431760, 0x004317a0,
-    
     0x004b80c4, 0x004b83f8, 0x004b807c, 0x004b9a20,
-    
     0x0048c248, 0x0048c294, 0x0048c298,
-    
     0x00440deb,
     0x00441097, 0x004410a3, 0x004410ba,
     0x00440ff8, 0x00440ffe,
@@ -174,12 +146,9 @@ static GameAddrs g_Addrs;
 static const GameAddrs *g_A = &ADDRS_DISC;
 static VersionSigs g_Sigs;
 
-
 #define VA(x)  (g_A->x)
 #define VD(x)  (*(volatile DWORD*)(g_A->x))
 #define VB(x)  (*(volatile BYTE*)(g_A->x))
-
-
 
 static volatile DWORD g_A_SceneNext;
 static volatile DWORD g_A_LoadFlag;
@@ -202,9 +171,6 @@ static volatile int g_PracticeStage = 0;
 static volatile int g_AutoAdvanceToDifficulty = 0;
 static volatile int g_AutoNavPhase = 0;
 static volatile int g_AutoNavTimer = 0;
-
-
-
 static volatile int g_AutoNavTarget = 0;
 #define SIMKEY_NONE   0
 #define SIMKEY_DECIDE 1
@@ -261,9 +227,6 @@ static ID3DXFont *g_pTitleFont = NULL;
 static ID3DXFont *g_pFooterFont = NULL;
 static DWORD g_CurrentFontWidth = 0;
 
-
-
-
 #ifdef REFRAIN_DEBUG_BUILD
 static void LogMessage(const char *format, ...) {
     char buf[512];
@@ -308,8 +271,6 @@ static void DrawSolidRect(IDirect3DDevice9 *pDevice, float x, float y, float w, 
     pDevice->lpVtbl->SetFVF(pDevice, D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
     pDevice->lpVtbl->DrawPrimitiveUP(pDevice, D3DPT_TRIANGLESTRIP, 2, verts, sizeof(struct Vertex2D));
 }
-
-
 
 static void DrawFrame(IDirect3DDevice9 *pDevice, float x, float y, float w, float h, float t, DWORD color) {
     DrawSolidRect(pDevice, x - t, y - t, w + 2.0f * t, t, color);          
@@ -370,21 +331,17 @@ typedef struct {
     DWORD footerBorder, foot1, foot2;
 } PracticeMenuTheme;
 
-
 #define MENU_PANEL_ALPHA 0xC4
 #define PANEL_COLOR(rgb) ((((DWORD)MENU_PANEL_ALPHA) << 24) | (DWORD)(rgb))
 
 static const PracticeMenuTheme *GetPracticeMenuTheme(DWORD ch) {
     static const PracticeMenuTheme themes[3] = {
-    	
         { PANEL_COLOR(0x0D111A), 0xFF00BFFF, 0xFF335577, 0x88004488, 0x55112233, 0xFFFFCC00, 0xFF88AABB,
           0x660077CC, 0x44005588, 0xFFFFFF00, 0xFF00FFCC, 0xFFAAAAAA, 0xFF666666, 0xFF555555, 0xFF333333,
           0xFF335577, 0xFF88DDFF, 0xFF6699BB },
-        
         { PANEL_COLOR(0x2A1022), 0xFFFF88CC, 0xFFC0609C, 0x88C83C90, 0x55702C58, 0xFFFFE08A, 0xFFFFCCE4,
           0x66E048A8, 0x44B83C88, 0xFFFFFF88, 0xFFFFAADE, 0xFFFFD6EA, 0xFFD296B4, 0xFFA87890, 0xFF8C6078,
           0xFFC0609C, 0xFFFFC4E2, 0xFFE0A0C0 },
-        
         { PANEL_COLOR(0x0D1A14), 0xFF28B898, 0xFF33574D, 0x880C5848, 0x55143328, 0xFFFFCC66, 0xFF99CCBB,
           0x66208870, 0x44185850, 0xFFFFFF66, 0xFF66FFD8, 0xFFB0DDCC, 0xFF668877, 0xFF446655, 0xFF335544,
           0xFF33574D, 0xFF88DDCC, 0xFF669988 }
@@ -416,9 +373,6 @@ typedef struct {
 
 #define MENU_ITEM_COUNT 5
 
-
-
-
 static inline int IsStageReached(int stage) {
     if (stage <= 1) return 1;
     if (stage > MENU_ITEM_COUNT) return 0;
@@ -427,9 +381,6 @@ static inline int IsStageReached(int stage) {
     if (IsBadReadPtr(p, 4)) return 0;
     return *p != 0;
 }
-
-
-
 
 static inline int GetSelectableStageCount(void) {
     DWORD diff = VD(Diff);
@@ -593,9 +544,6 @@ typedef unsigned char (__attribute__((thiscall)) *PFN_IsKey)(void *this, int key
 static PFN_IsKey orig_IsKeyPressed = NULL;
 static PFN_IsKey orig_IsKeyTriggered = NULL;
 static volatile int g_PauseMenuOpen = 0;
-
-
-
 static volatile DWORD g_LastPauseOpenTick = 0;
 static void PauseDiagKey(int key);
 
@@ -873,10 +821,6 @@ static volatile DWORD g_LatFrameCount = 0;
 typedef BOOL (WINAPI *PFN_GetKeyboardState_t)(PBYTE);
 static PFN_GetKeyboardState_t orig_GetKeyboardState = NULL;
 
-
-
-
-
 static int GameLooksPaused(void) {
     static DWORD lastFrame = 0;
     static DWORD lastScene = 0xFFFFFFFF;
@@ -889,8 +833,6 @@ static int GameLooksPaused(void) {
     DWORD sc = VD(Scene);
     DWORD now = GetTickCount();
     if (!primed || sc != lastScene) {
-        
-
         primed = 1;
         lastScene = sc;
         lastFrame = fr;
@@ -902,16 +844,12 @@ static int GameLooksPaused(void) {
     if (fr != lastFrame) {
         lastFrame = fr;
         lastChange = now;
-        
-
         if (!framePaused) return 0;
         if (now - lastChange < 300) return framePaused;
         framePaused = 0;
         return 0;
     }
     if (th != lastThrottle) {
-        
-
         lastThrottle = th;
         lastChange = now;
         framePaused = 0;
@@ -938,15 +876,10 @@ static BOOL WINAPI Mine_GetKeyboardState(PBYTE p) {
 
         int paused = GameLooksPaused();
         DWORD now = GetTickCount();
-        
-
         int hotkeyArmed = g_PauseMenuOpen ||
                           (g_LastPauseOpenTick != 0 && now - g_LastPauseOpenTick < 10000);
         if (inStage) {
             if (escDown && !escWasDown) {
-                
-
-
                 g_PauseMenuOpen = 1;
                 g_LastPauseOpenTick = now;
                 LogMessage("Pause menu state: open (ESC edge, scene %lu)", scene);
@@ -1407,11 +1340,6 @@ unsigned char __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key)
 
     unsigned char res = orig_IsKeyTriggered(this, key);
     if (res) PauseDiagKey(key);
-    
-
-
-
-
     if (res && key == 0x1B &&
         ((currentScene >= 2 && currentScene <= 7) || currentScene == 10)) {
         if (!g_PauseMenuOpen)
@@ -2832,7 +2760,6 @@ DWORD __cdecl HandleTrans(void) {
         return prevScene;
     }
 
-    
     if (g_AutoAdvanceToDifficulty && g_AutoNavTarget == 1 && nextScene >= 3 && nextScene <= 8) {
         LogMessage("Trans: blocking stage load while auto-navigating to the desktop (prev=%lu next=%lu)",
                    prevScene, nextScene);
@@ -3208,15 +3135,6 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
 }
 
 #ifdef REFRAIN_DEBUG_BUILD
-
-
-
-
-
-
-
-
-
 static volatile DWORD g_WvIdx, g_WvEbx, g_WvEsi, g_WvRet;
 static volatile DWORD g_ViewIdxWriteRet = 0;
 static volatile DWORD g_LastLoggedIdx = 0xFFFFFFFF;
@@ -3634,15 +3552,12 @@ static void DetectVersion(void) {
     memcpy(&g_Addrs, tmpl, sizeof(g_Addrs));
     memcpy(&g_Sigs, g_IsSteam ? &SIGS_STEAM : &SIGS_DISC, sizeof(g_Sigs));
 
-    
     DWORD *p = (DWORD*)&g_Addrs;
     for (size_t i = 0; i < sizeof(g_Addrs) / sizeof(DWORD); i++) {
         if (p[i] != 0) p[i] += g_BaseDelta;
     }
 
     g_A = &g_Addrs;
-
-    
 
     g_A_SceneNext = g_A->SceneNext;
     g_A_LoadFlag = g_A->LoadFlag;
@@ -3659,7 +3574,6 @@ static void DetectVersion(void) {
     g_GetGameInfoIntFn = g_A->fnGetGameInfoInt;
     g_RefRainCfgRetAddr = g_A->RefRainCfgRet;
 
-    
     g_ReturnAddr = g_A->SceneCheckRet;
     g_EndSceneRetAddr = g_A->EndSceneRet;
     g_LoadStartRetAddr = g_A->LoadStartRet;
@@ -3668,7 +3582,6 @@ static void DetectVersion(void) {
     g_PreTickTarget = g_A->fnTick;
     g_SaveReplayHdrRetAddr = g_A->SaveReplayHdrRet;
 
-    
     orig_IsKeyPressed = (PFN_IsKey)g_A->fnIsKeyPressed;
     orig_IsKeyTriggered = (PFN_IsKey)g_A->fnIsKeyTriggered;
 

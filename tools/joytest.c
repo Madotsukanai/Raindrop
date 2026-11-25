@@ -1,21 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #define WIN32_LEAN_AND_MEAN
 #define DIRECTINPUT_VERSION 0x0800
 #define CINTERFACE
@@ -26,7 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
 
 static DWORD g_t0;
 #define TS ((unsigned)(GetTickCount() - g_t0))
@@ -47,7 +28,6 @@ static int SrcAdd(const char *fmt, ...) {
     g_src[i].seen = 0;
     return i;
 }
-
 
 typedef struct { int src; int have; JOYINFOEX last; int lastRet; } WinmmSlot;
 static WinmmSlot g_wm[16];
@@ -109,7 +89,6 @@ static void WinmmPoll(void) {
     }
 }
 
-
 typedef struct { WORD wButtons; BYTE lt, rt; SHORT lx, ly, rx, ry; } XIPad;
 typedef struct { DWORD packet; XIPad pad; } XIState;
 typedef DWORD (WINAPI *PF_XIGet)(DWORD, XIState*);
@@ -160,7 +139,6 @@ static void XInputPoll(void) {
     }
 }
 
-
 typedef struct {
     char name[80];
     char inst[80];
@@ -176,7 +154,6 @@ static DiDev g_di[16];
 static int g_diN;
 static LPDIRECTINPUT8A g_dinput;
 static HWND g_hwnd;
-
 
 static DIOBJECTDATAFORMAT g_smdObj[140];
 static DIDATAFORMAT g_smdFmt;
@@ -265,7 +242,6 @@ static BOOL CALLBACK DiEnumCb(const DIDEVICEINSTANCEA *inst, void *ctx) {
             d->min[k] = -1000;
             d->max[k] = 1000;
             if (FAILED(hr)) {
-                
                 DIPROPRANGE g;
                 memset(&g, 0, sizeof(g));
                 g.diph.dwSize = sizeof(g);
@@ -343,7 +319,6 @@ static void DirectInputPoll(void) {
     }
 }
 
-
 static void RawList(void) {
     UINT n = 0, i;
     RAWINPUTDEVICELIST *list;
@@ -377,7 +352,6 @@ static void RawList(void) {
     free(list);
 }
 
-
 int main(int argc, char **argv) {
     int seconds = argc > 1 ? atoi(argv[1]) : 20;
     int i;
@@ -405,7 +379,6 @@ int main(int argc, char **argv) {
     }
     printf("\n--- summary: which sources saw input ---\n");
     for (i = 0; i < g_srcN; i++) {
-        
         if (strncmp(g_src[i].name, "XInput user", 11) == 0 && !g_src[i].seen && !g_xiWasConnected[g_src[i].name[12] - '0'])
             continue;
         printf("  %-60s %s\n", g_src[i].name, g_src[i].seen ? "INPUT SEEN" : "no input (neutral all the time)");

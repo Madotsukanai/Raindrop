@@ -7,10 +7,6 @@ typedef struct ID3DXFont ID3DXFont;
 typedef ID3DXFont *LPD3DXFONT;
 typedef struct ID3DXSprite ID3DXSprite;
 
-
-
-
-
 typedef struct ID3DXFontVtbl {
     HRESULT (STDMETHODCALLTYPE *QueryInterface)(ID3DXFont *, REFIID, void **);   /*  0 */
     ULONG (STDMETHODCALLTYPE *AddRef)(ID3DXFont *);                              /*  1 */
@@ -36,7 +32,6 @@ typedef struct ID3DXFontVtbl {
 struct ID3DXFont {
     const ID3DXFontVtbl *lpVtbl;
 };
-
 
 typedef char d3dx9_font_vtbl_layout_check[
     (offsetof(ID3DXFontVtbl, DrawTextA) == 14 * sizeof(void *)) ? 1 : -1];

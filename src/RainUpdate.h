@@ -1,5 +1,3 @@
-
-
 #ifndef RAIN_UPDATE_H
 #define RAIN_UPDATE_H
 
@@ -39,7 +37,6 @@ static int RuHasSection(const char *buf, const char *name) {
     }
     return 0;
 }
-
 
 static void RainUpdateEnsureIni(void) {
     static const char block[] = "[General]\r\nUpdateCheck=1\r\nUpdateSkip=\r\n\r\n";
@@ -116,7 +113,6 @@ static void RainUpdateInit(HMODULE module) {
             g_ruUpdateSkip[0] ? g_ruUpdateSkip : "none");
     }
 }
-
 
 typedef struct {
     char *data;
@@ -236,7 +232,6 @@ static int UpdateParseString(const char *from, const char *end, char *out, size_
     const char *p = from;
     size_t n = 0;
     if (!p || !end) return 0;
-    
     if (*p == '"') {
         p++;
         while (p < end && *p != '"') p++;
@@ -308,7 +303,6 @@ static int UpdateHexByte(char c) {
     return -1;
 }
 
-
 static int UpdateDigestBytes(const char *digest, unsigned char out[32]) {
     int hi, lo, i;
     if (_strnicmp(digest, "sha256:", 7) != 0) return 0;
@@ -321,7 +315,6 @@ static int UpdateDigestBytes(const char *digest, unsigned char out[32]) {
     }
     return 1;
 }
-
 
 typedef struct {
     uint32_t h[8];
@@ -496,8 +489,6 @@ static int UpdateMessageBox(const char *title, const char *text, DWORD type) {
     MultiByteToWideChar(CP_UTF8, 0, text, -1, textW, 3072);
     return MessageBoxW(NULL, textW, titleW, type);
 }
-
-
 
 static void UpdateScheduleRestart(const char *dllPath) {
     char batPath[MAX_PATH], exePath[MAX_PATH], cmd[MAX_PATH * 2];

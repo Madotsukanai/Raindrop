@@ -76,11 +76,7 @@ void SmdLogOpen(void) { LogOpen(); }
 #define Log SmdLog
 #include "../RainUpdate.h"
 
-
-
 static int g_PrEx = 1;
-
-
 
 int SmdIniBool(const char *value, int def) {
     if (!_stricmp(value, "1") || !_stricmp(value, "on") ||
@@ -89,7 +85,6 @@ int SmdIniBool(const char *value, int def) {
         !_stricmp(value, "false") || !_stricmp(value, "no")) return 0;
     return def;
 }
-
 
 static char *IniFindSection(char *buf, const char *name) {
     size_t len = strlen(name);
@@ -101,9 +96,6 @@ static char *IniFindSection(char *buf, const char *name) {
     }
     return NULL;
 }
-
-
-
 
 static void IniAddGeneralSection(const char *path) {
     static const char prefix[] = "[General]\r\nPrEx=1\r\nUpdateCheck=1\r\nUpdateSkip=\r\n\r\n";
@@ -124,8 +116,6 @@ static void IniAddGeneralSection(const char *path) {
         char *g = IniFindSection(buf, "graphics");
         size_t gAt = g ? (size_t)(g - buf) : 0;
         size_t nl = (g && gAt > 0 && buf[gAt - 1] != '\n') ? 2 : 0;  
-
-
         char *out = (char*)malloc(gAt + plen + nl + (size_t)fsize - gAt + 1);
         if (out) {
             size_t at = 0;
@@ -155,8 +145,6 @@ static void IniAddGeneralSection(const char *path) {
     }
     free(buf);
 }
-
-
 
 static void IniAddGraphicsSection(const char *path) {
     static const char block[] = "\r\n[Graphics]\r\nAPI=DirectDraw\r\nVSync=auto\r\n";
@@ -286,8 +274,6 @@ void SmdTriggerWindowFallback(const char *why) {
 
     if (!g_AutoWindowFallback || g_fallbackInstance) return;
     Log("WindowFallback: %s -> relaunching in window mode", why);
-    
-
     EnumWindows(HideOwnWindowProc, 0);
     GetModuleFileNameA(NULL, exe, MAX_PATH);
     strcpy(dir, exe);
@@ -310,9 +296,6 @@ void SmdTriggerWindowFallback(const char *why) {
         free(cmd);
         Log("WindowFallback: new process started (pid=%lu), exiting", (unsigned long)newPid);
         if (g_log) fflush(g_log);
-        
-
-
         TerminateProcess(GetCurrentProcess(), 0);
         ExitProcess(0);
     }
@@ -504,12 +487,6 @@ static void FlushStats(LONGLONG now) {
     g_presses = 0;
 }
 
-
-
-
-
-
-
 static void PressShared(LONGLONG d) {
     EnterCriticalSection(&g_cs);
     {
@@ -521,10 +498,6 @@ static void PressShared(LONGLONG d) {
                 StatAdd(&g_stLatFirst, TicksToMs(d - p->t));
                 p->counted = 1;
 #ifdef SMD_DEBUG_BUILD
-                
-
-
-
                 SmdLog("KeyLat: press->present %.2f ms (press->frame end %.2f, frame start->press %.2f)",
                        TicksToMs(d - p->t), TicksToMs(d - p->t),
                        frameStart ? TicksToMs(p->t - frameStart) : -1.0);
@@ -584,9 +557,6 @@ static void FinishPresent(IDirectDrawSurface7 *s, int flip, LARGE_INTEGER a, LAR
     QueryPerformanceCounter(&d);
     OnPresent(a.QuadPart, b.QuadPart, c.QuadPart, d.QuadPart, flip, 0);
 }
-
-
-
 
 #ifdef SMD_DEBUG_BUILD
 #define SMD_KEYLAT_AUTORUN 1
@@ -656,8 +626,6 @@ static void SmdWineForceBorderless(HWND hwnd) {
                  SWP_FRAMECHANGED | SWP_SHOWWINDOW);
 }
 
-
-
 static void SmdWineStretchPrimary(IDirectDrawSurface7 *self, LPDIRECTDRAWSURFACE7 src, LPRECT sr) {
     static int logged, fsLogged, dbg;
     HDC wdc = NULL;
@@ -678,8 +646,6 @@ static void SmdWineStretchPrimary(IDirectDrawSurface7 *self, LPDIRECTDRAWSURFACE
     memset(&sd, 0, sizeof(sd)); sd.dwSize = sizeof(sd);
     if (SUCCEEDED(IDirectDrawSurface7_GetSurfaceDesc(src, &sd)) && sd.dwWidth && sd.dwHeight) { sw = (int)sd.dwWidth; sh = (int)sd.dwHeight; }
     if (sr) { sw = sr->right - sr->left; sh = sr->bottom - sr->top; }
-    
-
     if (sw > 800 || sh > 600) { sw = 640; sh = 480; sr = NULL; }
     if (cw <= sw + 8 && ch <= sh + 8) {
         SmdWineForceBorderless(hw);
@@ -690,8 +656,6 @@ static void SmdWineStretchPrimary(IDirectDrawSurface7 *self, LPDIRECTDRAWSURFACE
         if (dbg < 5) { dbg++; Log("WineStretch: skip client=%dx%d src=%dx%d hw=%p", cw, ch, sw, sh, hw); }
         return;
     }
-    
-
     {
         HDC pdc = NULL;
         {
@@ -720,9 +684,6 @@ static void SmdWineStretchPrimary(IDirectDrawSurface7 *self, LPDIRECTDRAWSURFACE
 }
 
 
-
-
-
 static HRESULT STDMETHODCALLTYPE Hook_Blt(IDirectDrawSurface7 *self, LPRECT dr, LPDIRECTDRAWSURFACE7 src,
                                           LPRECT sr, DWORD flags, LPDDBLTFX fx) {
     LARGE_INTEGER a, b;
@@ -741,11 +702,8 @@ static HRESULT STDMETHODCALLTYPE Hook_Blt(IDirectDrawSurface7 *self, LPRECT dr, 
         if (!hw || !IsWindow(hw)) hw = GetForegroundWindow();
         if (hw && GetClientRect(hw, &cr)) { cw = cr.right - cr.left; ch = cr.bottom - cr.top; }
         if (cw <= 648 && ch <= 488 && hw) { SmdWineForceBorderless(hw); if (GetClientRect(hw,&cr)){cw=cr.right-cr.left;ch=cr.bottom-cr.top;} }
-        
-
         useDr = dr; useSr = sr;
     }
-    
     int isPresent = (self == g_primary && src);
     QueryPerformanceCounter(&a);
     HRESULT hr = g_origBlt(self, useDr, src, useSr, flags, fx);
@@ -790,16 +748,10 @@ static int g_titleMainMenuPrev = 0;
 
 typedef unsigned char (__attribute__((thiscall)) *PF_InputKey)(void *self, int id);
 
-
-
-
 static int TitleEscDown(void *input) {
     return input && !IsBadReadPtr(input, 0x140) &&
            ((*((unsigned char*)input + 8 + 0x1b)) & 0x80) != 0;
 }
-
-
-
 
 static void TitleCancelFrameTick(void) {
     void *input = *(void**)(uintptr_t)0x46bbec;
@@ -943,16 +895,6 @@ static void OptionApplyDefaults(void *opt, int page) {
     playSe((void*)(uintptr_t)0x4ea3a8, 0, 0xff);
 }
 
-
-
-
-
-
-
-
-
-
-
 static int g_OptionDefaultLabelReady;
 
 static void OptionDefaultDraw(void *opt) {
@@ -998,10 +940,6 @@ static unsigned char __attribute__((fastcall)) OptionUpdateHook(void *opt) {
         confirmHeld = (edge(input, 4) || enterNow) ? 1 : 0;
         chooseDefault = virtualCursor == 7 && (edge(input, 4) || (enterNow && !g_optPrevEnter));
         g_optPrevEnter = enterNow;
-        
-
-
-
         if (virtualCursor == 7) {
             int exitChoices = *(volatile int*)(uintptr_t)(0x453c84 + 7 * 4);
             OPT_F(opt, 0x3310) = (confirmHeld || exitChoices <= 0) ? 6 : 7;
@@ -1031,11 +969,9 @@ static unsigned char __attribute__((fastcall)) OptionUpdateHook(void *opt) {
             else
                 newV = newReal;
             OPT_F(opt, 0x3310) = newV;
-            
             for (i = 0; i < 8; i++) OPT_F(opt, 0x3e8 + i * 0xe8 + 0x20) = 0x66;
             if (newV >= 0 && newV <= 6) OPT_F(opt, 0x3e8 + newV * 0xe8 + 0x20) = 0xff;
             else if (newV == 8) OPT_F(opt, 0x3e8 + 7 * 0xe8 + 0x20) = 0xff;
-            
             if (newV == 7) *(volatile unsigned char*)(uintptr_t)0x4e9244 = 0;
         }
         return result;
@@ -1045,7 +981,6 @@ static unsigned char __attribute__((fastcall)) OptionUpdateHook(void *opt) {
 static unsigned char __attribute__((fastcall)) OptionDrawHook(void *opt) {
     unsigned char result;
     if (OPT_F(opt, 0x3308) == 1) {
-        
         *(double*)((char*)opt + 0x3e8 + 7 * 0xe8 + 0x10) = 378.0;
     }
     result = ((PF_OptionUpdate)(uintptr_t)0x41c1d0)(opt);
@@ -1082,7 +1017,6 @@ static void PatchOptionDefaults(void) {
     if (!HookCall(0x423f0e, 0x41c1d0, (void*)&OptionDrawHook))
         Log("OptionDefault: draw hook failed");
     {
-        
         static const unsigned char panelOrig[5] = { 0x68, 0x40, 0x01, 0x00, 0x00 };
         unsigned char *pp = (unsigned char*)0x41c2a2;
         DWORD oldp;
@@ -1118,7 +1052,6 @@ typedef int (__attribute__((thiscall)) *PF_ReplayLoad)(void *input, int replayId
 typedef void (__cdecl *PF_SceneSwitch)(int a, int b);
 
 static void PauseReplayRestore(void) {
-    
 }
 
 static unsigned char __attribute__((thiscall)) ReplayPauseOpenHook(void *input) {
@@ -1167,8 +1100,6 @@ static void __attribute__((thiscall)) ReplayPauseExitHook(void *input) {
 
 static void __attribute__((fastcall)) PauseUpdateHook(void *menu) {
     void *input = *(void**)(uintptr_t)0x46bbec;
-    
-
     if (input && menu && OPT_F(menu, 0x538) == 6 && OPT_F(menu, 0xc) == 0) {
         PF_InputKey rawkey = (PF_InputKey)(uintptr_t)0x431500;
         int next = 0;
@@ -1344,14 +1275,6 @@ static void PatchReplayStage(void) {
 }
 
 // ------------------------------------------------------------------------
-
-
-
-
-
-
-
-
 // ------------------------------------------------------------------------
 
 static unsigned char g_rnEdit[32];          
@@ -1370,28 +1293,18 @@ static int           g_rnPrevF2;
 static int           g_rnPrevEnter;         
 static int           g_rnPrevEsc;           
 
-
-
-
-
 #define RR_MAX_IN_COUNT (0x4f1a0 / 2)
-
-
-
 
 static int RrDecodeChunk(const void *src, int srcLen, void *dst, int dstLen) {
     void *r = ((void * (__cdecl *)(const void*, int, void*, int))(uintptr_t)0x410970)(src, srcLen, dst, dstLen);
     return r == dst;
 }
 
-
-
 static int RnLoadHdr(int id, unsigned char hdr0xE0[0xe0]) {
     void *input = *(void**)(uintptr_t)0x46bbec;
     if (!input || IsBadReadPtr(input, 0x10)) return 0;
     return ((int (__attribute__((thiscall)) *)(void *, int, void *))(uintptr_t)0x431bd0)(input, id, hdr0xE0);
 }
-
 
 static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
     char path[MAX_PATH];
@@ -1429,7 +1342,6 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
         return 0;
     }
 
-    
     old_seed = *(unsigned int*)(old_hdr + 4);
     ((void (__cdecl *)(unsigned int))(uintptr_t)0x405200)(old_seed);
     memcpy(dec16, old_hdr + 0x10, 16);
@@ -1459,7 +1371,6 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
     }
     fclose(f);
 
-    
     new_cmp_hdr = ((void* (__cdecl *)(const void*, int, int*))(uintptr_t)0x4106e0)(hdr0xE0, 0xe0, &new_cmp_hdr_len);
     if (!new_cmp_hdr || new_cmp_hdr_len <= 0) {
         if (cmp_inp) free(cmp_inp);
@@ -1467,19 +1378,13 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
         return 0;
     }
 
-    
     memcpy(new_hdr, "SMDR", 4);
-
-    
-
 
     inp_crc = 0;
     {
         unsigned int inCount = *(unsigned int*)(hdr0xE0 + 0x18);
         unsigned char *decInp;
         if (inCount > RR_MAX_IN_COUNT) inCount = RR_MAX_IN_COUNT;
-        
-
         decInp = inCount ? (unsigned char*)malloc((size_t)inCount * 2 + 0x1000) : NULL;
         if (inCount && !decInp) {
             ((void (__cdecl *)(void*))(uintptr_t)0x434fad)(new_cmp_hdr);
@@ -1505,11 +1410,9 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
     }
     *(unsigned int*)(new_hdr + 8) = inp_crc;
 
-    
     hdr_crc = ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(hdr0xE0, 0xe0);
     *(unsigned int*)(new_hdr + 0x0c) = hdr_crc;
 
-    
     memcpy(new_dec16, dec16, 16);
     *(unsigned short*)(new_dec16 + 0) = version;
     *(unsigned short*)(new_dec16 + 2) = (unsigned short)(0x20 + new_cmp_hdr_len);
@@ -1517,18 +1420,15 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
     *(unsigned short*)(new_dec16 + 14) = (unsigned short)new_cmp_hdr_len;
     memcpy(new_hdr + 0x10, new_dec16, 16);
 
-    
     *(unsigned int*)(new_hdr + 0x04) = 0xdeadbeef;
     new_seed = ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(new_hdr, 0x20);
     *(unsigned int*)(new_hdr + 0x04) = new_seed;
 
-    
     ((void (__cdecl *)(unsigned int))(uintptr_t)0x405200)(new_seed);
     for (i = 0; i < 16; i++) {
         (new_hdr + 0x10)[i] ^= (unsigned char)(((unsigned int (__cdecl *)(void))(uintptr_t)0x405250)() & 0xff);
     }
 
-    
     f = fopen(path, "wb");
     if (!f) {
         ((void (__cdecl *)(void*))(uintptr_t)0x434fad)(new_cmp_hdr);
@@ -1549,7 +1449,6 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
     Log("ReplayRename: saved %s (hdr_len=%d, inp_len=%ld, seed=0x%08x)",
         path, new_cmp_hdr_len, cmp_inp_len, new_seed);
 
-    
     if (menu) {
         int curPage = *(int*)((char*)menu + 0x27f0);
         ((void (__attribute__((thiscall)) *)(void*, int))(uintptr_t)0x4215c0)(menu, curPage);
@@ -1558,22 +1457,7 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
 }
 
 // ------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // ------------------------------------------------------------------------
-
 
 static int RrVerify(unsigned char *buf, long size, unsigned short wantFmt,
                     unsigned short *outFmt, unsigned short *outInpOff,
@@ -1595,8 +1479,6 @@ static int RrVerify(unsigned char *buf, long size, unsigned short wantFmt,
 
     *outHdrOk = 0;
 
-    
-
     memcpy(dec16, buf + 0x10, 16);
     ((void (__cdecl *)(unsigned int))(uintptr_t)0x405200)(seed);
     for (i = 0; i < 16; i++) {
@@ -1612,7 +1494,6 @@ static int RrVerify(unsigned char *buf, long size, unsigned short wantFmt,
 
     if (fmt != wantFmt) fail = 1;
 
-    
     {
         unsigned int r;
         memcpy(enc16, buf + 0x10, 16);             
@@ -1624,7 +1505,6 @@ static int RrVerify(unsigned char *buf, long size, unsigned short wantFmt,
         if (r != seed) fail = 1;
     }
 
-    
     if (mode == 0) {
         if (size >= 0x100) {
             memcpy(outHdr, buf + 0x20, 0xe0);
@@ -1640,7 +1520,6 @@ static int RrVerify(unsigned char *buf, long size, unsigned short wantFmt,
         fail = 1;
     }
 
-    
     count = *outHdrOk ? *(unsigned int*)(outHdr + 0x18) : 0;
     if (count > RR_MAX_IN_COUNT) count = RR_MAX_IN_COUNT;
     decInp = (unsigned char*)malloc(count ? (size_t)count * 2 + 0x1000 : 1);
@@ -1668,8 +1547,6 @@ static int RrVerify(unsigned char *buf, long size, unsigned short wantFmt,
     return (int)fail;
 }
 
-
-
 static int RrRepairFile(const char *path) {
     FILE *f;
     long size;
@@ -1695,8 +1572,6 @@ static int RrRepairFile(const char *path) {
     fclose(f);
     if (memcmp(buf, "SMDR", 4) != 0) { free(hdr); free(buf); return 0; }
 
-    
-
     {
         void *input = *(void**)(uintptr_t)0x46bbec;
         unsigned short want = 0;
@@ -1709,7 +1584,6 @@ static int RrRepairFile(const char *path) {
 
     Log("ReplayRepair: %s fails verification, repairing", path);
 
-    
     seed = *(unsigned int*)(buf + 4);
     memcpy(dec16, buf + 0x10, 16);
     ((void (__cdecl *)(unsigned int))(uintptr_t)0x405200)(seed);
@@ -1722,7 +1596,6 @@ static int RrRepairFile(const char *path) {
     cmpInpLen = *(unsigned int*)(dec16 + 0x0a);
     hdrLen = *(unsigned short*)(dec16 + 0x0e);
 
-    
     {
         void *input = *(void**)(uintptr_t)0x46bbec;
         if (input && !IsBadReadPtr(input, 2)) {
@@ -1731,7 +1604,6 @@ static int RrRepairFile(const char *path) {
         }
     }
 
-    
     hdrOk = 0;
     if (mode == 0 && size >= 0x100) {
         memcpy(hdr, buf + 0x20, 0xe0);
@@ -1757,7 +1629,6 @@ static int RrRepairFile(const char *path) {
         return 0;
     }
 
-    
     {
         unsigned short want = (unsigned short)(0x20 + hdrLen);
         if ((long)(0x20 + hdrLen) > size || want < 0x20) {
@@ -1768,13 +1639,11 @@ static int RrRepairFile(const char *path) {
         if (inpOff != want) { inpOff = want; changed = 1; }
     }
 
-    
     if ((long)inpOff + (long)cmpInpLen > size) {
         cmpInpLen = (unsigned int)(size - (long)inpOff);
         changed = 1;
     }
 
-    
     count = *(unsigned int*)(hdr + 0x18);
     if (count > RR_MAX_IN_COUNT) count = RR_MAX_IN_COUNT;
     {
@@ -1790,7 +1659,6 @@ static int RrRepairFile(const char *path) {
             } else {
                 gotInp = RrDecodeChunk(buf + inpOff, (int)cmpInpLen, decInp, (int)(count * 2));
                 if (!gotInp && (long)inpOff + (long)cmpInpLen != size && size - (long)inpOff > 0) {
-                    
                     gotInp = RrDecodeChunk(buf + inpOff, (int)(size - inpOff), decInp, (int)(count * 2));
                     if (gotInp) { cmpInpLen = (unsigned int)(size - (long)inpOff); changed = 1; }
                 }
@@ -1815,7 +1683,6 @@ static int RrRepairFile(const char *path) {
         return 0;
     }
 
-    
     *(unsigned short*)(dec16 + 0) = fmt;
     *(unsigned short*)(dec16 + 2) = inpOff;
     *(unsigned short*)(dec16 + 4) = mode;
@@ -1823,7 +1690,6 @@ static int RrRepairFile(const char *path) {
     *(unsigned short*)(dec16 + 0x0e) = hdrLen;
     *(unsigned int*)(buf + 8) = inpCrc;
     *(unsigned int*)(buf + 0x0c) = hdrCrc;
-    
     *(unsigned int*)(buf + 0x04) = 0xdeadbeef;
     memcpy(buf + 0x10, dec16, 16);
     newSeed = ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(buf, 0x20);
@@ -1842,7 +1708,6 @@ static int RrRepairFile(const char *path) {
         path, (unsigned)fmt, (unsigned)inpOff, (unsigned)mode, (unsigned)hdrLen, cmpInpLen, inpCrc, hdrCrc, newSeed);
     return 1;
 }
-
 
 static int RrRepairId(void *input, int id) {
     char path[MAX_PATH];
@@ -1863,8 +1728,6 @@ static int __attribute__((fastcall)) RrMenuReaderHook(void *input, void *edx, in
     return r;
 }
 
-
-
 static int __attribute__((fastcall)) RrPlaybackLoaderHook(void *self, void *edx,
                                                           const char *file, int a2, int a3) {
     RrRepairFile(file);
@@ -1877,13 +1740,11 @@ static void PatchReplayRepair(void) {
         Log("ReplayRepair: unexpected image base, skipped");
         return;
     }
-    
     n += HookCall(0x4216c7, 0x431bd0, (void*)&RrMenuReaderHook);
     n += HookCall(0x421c0f, 0x431bd0, (void*)&RrMenuReaderHook);
     n += HookCall(0x421c49, 0x431bd0, (void*)&RrMenuReaderHook);
     n += HookCall(0x4221b7, 0x431bd0, (void*)&RrMenuReaderHook);
     n += HookCall(0x4223fc, 0x431bd0, (void*)&RrMenuReaderHook);
-    
     n += HookCall(0x4236db, 0x431d30, (void*)&RrPlaybackLoaderHook);
     n += HookCall(0x425bfa, 0x431d30, (void*)&RrPlaybackLoaderHook);
     n += HookCall(0x43200b, 0x431d30, (void*)&RrPlaybackLoaderHook);
@@ -1899,7 +1760,6 @@ static void RnSyncRowText(void *menu) {
     row_str = *(char**)(row + 0xc0);
     if (!row_str || IsBadWritePtr(row_str, 20)) return;
 
-    
     memcpy(row_str + 3, g_rnEdit, 16);
 }
 
@@ -1922,7 +1782,6 @@ static void RnOpen(void *menu, int id) {
     g_rnEscCooldown = 0;
     g_rnEnterCooldown = 0;
 
-    
     r = id & 0xf;
     row = (char*)menu + 0x3a8 + r * 0x130;
     if (!IsBadReadPtr(row, 0x130)) {
@@ -1933,7 +1792,6 @@ static void RnOpen(void *menu, int id) {
         }
     }
 
-    
     memset(g_rnEdit, ' ', 16);
     g_rnEdit[16] = 0;
 
@@ -1964,12 +1822,10 @@ static void RnCommit(void *menu) {
     size_t plen;
     if (!g_rnActive) return;
 
-    
     p = (const char*)g_rnEdit;
     while (*p == ' ') p++;
 
     if (!*p) {
-        
         RnCancel(menu);
         return;
     }
@@ -1979,7 +1835,6 @@ static void RnCommit(void *menu) {
     if (plen > 15) plen = 15;
     memcpy(finalName, p, plen);
 
-    
     memset(g_rnHdr + 0x30, 0, 16);
     memcpy(g_rnHdr + 0x30, finalName, 16);
 
@@ -2029,7 +1884,6 @@ static void RnDrawCaret(void *menu) {
     row = (char*)menu + 0x3a8 + r * 0x130;
     if (IsBadReadPtr(row, 0x130) || !*(void**)(row + 0xe0)) return;
 
-    
     if ((g_rnTick & 0x10) != 0) {
         char caretRow[0x130] __attribute__((aligned(16)));
         memcpy(caretRow, row, sizeof(caretRow));
@@ -2049,15 +1903,12 @@ static void RnDrawCaret(void *menu) {
 }
 
 static void __attribute__((fastcall)) ReplayDrawHook(void *menu) {
-    
     ((void (__attribute__((thiscall)) *)(void*))(uintptr_t)0x421d40)(menu);
 
-    
     if (g_rnActive) {
         RnDrawCaret(menu);
     }
 }
-
 
 static void RnTick(void *menu, void *input) {
     unsigned char *keys = (unsigned char*)input + 8;
@@ -2074,7 +1925,6 @@ static void RnTick(void *menu, void *input) {
     int escRaw   = ((keys[VK_ESCAPE] & 0x80) != 0) || ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0);
     int f2Raw    = ((keys[VK_F2] & 0x80) != 0) || ((GetAsyncKeyState(VK_F2) & 0x8000) != 0);
 
-    
     if (g_rnActive && *(unsigned char*)((char*)menu + 0x27f4) != 0) {
         RnCancel(menu);
     }
@@ -2103,7 +1953,6 @@ static void RnTick(void *menu, void *input) {
         *(unsigned*)prevButtons |= (1u << 4);
     }
 
-    
     f2Down = f2Raw;
     f2Trigger = f2Down && !g_rnPrevF2;
     g_rnPrevF2 = f2Down;
@@ -2119,7 +1968,6 @@ static void RnTick(void *menu, void *input) {
     if (g_rnActive) {
         g_rnTick++;
         RnSyncRowText(menu);
-        
         keys[VK_RETURN] = 0;
         latch[VK_RETURN] = 1;
         keys[VK_ESCAPE] = 0;
@@ -2144,7 +1992,6 @@ static void RnTick(void *menu, void *input) {
             return;
         }
 
-        
         for (vk = 0; vk < 256; vk++) {
             if (vk == VK_ESCAPE || vk == VK_RETURN || vk == VK_F2 || vk == VK_SHIFT) continue;
             int isDown = ((GetAsyncKeyState(vk) & 0x8000) != 0) || ((keys[vk] & 0x80) != 0);
@@ -2168,7 +2015,6 @@ static void RnTick(void *menu, void *input) {
             if (!triggered) continue;
 
             if (vk == VK_BACK || vk == VK_DELETE) {
-                
                 memmove(g_rnEdit + 1, g_rnEdit, 15);
                 g_rnEdit[0] = ' ';
                 g_rnEdit[16] = 0;
@@ -2176,7 +2022,6 @@ static void RnTick(void *menu, void *input) {
             } else {
                 char ch = RnGetAsciiChar(vk, shift);
                 if (ch) {
-                    
                     memmove(g_rnEdit, g_rnEdit + 1, 15);
                     g_rnEdit[15] = (unsigned char)ch;
                     g_rnEdit[16] = 0;
@@ -2185,7 +2030,6 @@ static void RnTick(void *menu, void *input) {
             }
         }
     } else {
-        
         if (f2Trigger && *(unsigned char*)((char*)menu + 0x27f4) == 0) {
             int curId = *(int*)((char*)menu + 0x27e4);
             RnOpen(menu, curId);
@@ -2261,32 +2105,12 @@ static void PatchReplayRenameInput(void) {
 typedef unsigned char (__attribute__((fastcall)) *PF_ReplaySavePromptUpdate)(void *obj);
 typedef void (__attribute__((thiscall)) *PF_ReplaySaveInputAction)(void *input);
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 static const int g_ReplaySaveCancel = 1;
-
-
-
-
 
 static int ReplaySaveKeyDown(void *input, int vk) {
     return input && vk >= 0 && vk < 0x100 &&
            (((unsigned char*)input)[8 + vk] & 0x80) != 0;
 }
-
-
 
 static int ReplaySaveCancelDown(void *input) {
     return ReplaySaveKeyDown(input, 0x1b) || ReplaySaveKeyDown(input, 0x58);
@@ -2298,8 +2122,6 @@ static int g_replaySaveArmed = 0;
 static unsigned char __attribute__((fastcall)) ReplaySavePromptUpdateHook(void *obj) {
     unsigned char *o = (unsigned char*)obj;
     void *input = *(void**)(uintptr_t)0x46bbec;
-
-    
 
     if (obj && o[4] && input && !IsBadReadPtr(input, 0x240)) {
         if (g_replaySaveArmedObj != obj || *(int*)(o + 0x490) == 0) {
@@ -2379,7 +2201,6 @@ static unsigned char __attribute__((fastcall)) ReplayInputQueryHook(void *self, 
     (void)edx;
     FpuEnforce("input", -1);
     PauseReplayRestore();
-    
     if (g_exSimulatingStageFrame) return 0;
     result = g_replayInputQueryOrig(self, id, delay);
     if (playback && g_replayInputQueryLogRemaining) {
@@ -2543,7 +2364,6 @@ static volatile int g_exMuteSe = 0;
 static int g_exBgmMuted = 0;
 static int g_exBgmSavedVol = 0;
 
-
 static void ExBgmMuteSync(void) {
     int shouldMute = g_exMuteSe || g_practiceBgmSeekPending || g_exBoss1BgmPending;
     if (shouldMute && !g_exBgmMuted) {
@@ -2650,7 +2470,6 @@ static void ExOnGameStart(int stage) {
     g_exBossReturnAtFrame = 0;
     g_exBossClearSim = 0;
     g_exStartReq = 0;
-    
     if (g_exBossRun >= 1) ExDlgInstall();
     if (g_exBossRun >= 1) ExClearHookInstall();
     if (stage == 4) {
@@ -2686,12 +2505,10 @@ static void ExOnRetry(int stage) {
 static int g_practiceReturn = 0;   
 static int g_lastPracticeCursor = -2; 
 
-
 static void __stdcall GameStartHook(int stage) {
     int practiceStart = g_practiceScorePending && stage == g_practiceScoreStage;
     g_practiceReturn = (*(volatile unsigned char*)(uintptr_t)0x4dade0 != 0);
     {
-        
         unsigned *gs = (unsigned*)(uintptr_t)0x4e93c8;
         unsigned cursorPlus1 = gs ? *gs ? *(unsigned*)(*gs + 0x10) : 0 : 0;
         if (cursorPlus1 >= 1 && cursorPlus1 <= 0x40)
@@ -2896,18 +2713,9 @@ static void PerfFlush(int frame) {
 }
 
 #ifdef SMD_DEBUG_BUILD
-
-
-
-
-
-
 static void DebugDisablePlayerHitbox(void) {
     static int on = 1, logged = 0, dumpN = 0, playbackWarned = 0;
     void *body = *(void **)(uintptr_t)0x4e9ac0;
-    
-
-
     {
         void *input = *(void **)(uintptr_t)0x46bbec;
         int playback = input && !IsBadReadPtr(input, 0x235) &&
@@ -3055,8 +2863,6 @@ static void PracticeRowsExpand(void *obj) {
     double *firstY = (double*)((char*)obj + 0x100 + 0x10);
     double *secondY = (double*)((char*)obj + 0x100 + 0xe8 + 0x10);
     if (*secondY - *firstY >= 0x30) return;
-    
-
     for (i = 1; i < 5; i++) {
         double *y = (double*)((char*)obj + 0x100 + 0xe8 * i + 0x10);
         *y += (i < 4) ? i * 0x20 : 0x60;
@@ -3409,8 +3215,6 @@ static void ExSkipTo(int target, int area) {
     n = *headp;
 
     {
-        
-
         unsigned *q, *keepBgm = NULL;
         int bestT = -1, exact = 0;
         for (q = *headp; q; q = (unsigned*)q[0]) {
@@ -4156,11 +3960,6 @@ static int ExFastForwardBoss2Transition(int from) {
     return *(volatile int*)(uintptr_t)0x4dadf8;
 }
 
-
-
-
-
-
 static int ExFastForwardBossReturn(int from) {
     int f;
     int limit = from + 12000;
@@ -4198,17 +3997,11 @@ static int ExFastForwardBossReturn(int from) {
     return endFrame;
 }
 
-
-
 #define EX_TR_N 40
 #define EX_TR_FRAMES 2400
 static const int g_ExDlgTrace = 0;      
-
 static const int g_ExBossDlgSkip = 1;
 static const int g_ExBossDlgDump = 0;   
-
-
-
 #define EX_B1_DLG_FIRST 649740
 #define EX_B1_DLG_LO 649400
 #define EX_B1_DLG_END 650448
@@ -4222,7 +4015,6 @@ static unsigned g_trSeen[EX_TR_SEEN];
 static int g_trLines = 0;
 static volatile int g_trDlgArmed = 0;
 
-
 static int ExTrFirst(int op, int ip) {
     unsigned key = ((unsigned)op << 24) ^ (unsigned)ip ^ 0x80000000u;
     unsigned h = (key * 2654435761u) >> 19, n;
@@ -4234,7 +4026,6 @@ static int ExTrFirst(int op, int ip) {
 }
 
 static void ExDumpScript(void *args, int ip) {
-    
     const unsigned char *base = (const unsigned char*)args - 4 - ip;
     int from = 649600, to = 650800, a;
 
@@ -4270,8 +4061,6 @@ static unsigned char ExTrCommon(int i, void *thr, void *args) {
             *(volatile int*)(uintptr_t)0x4dadf8, action);
     }
     if (skipIntro) {
-        
-
         if (g_dlgSkipLog < 12) {
             g_dlgSkipLog++;
             Log("ExArea: Boss 1 intro dialogue skipped (ip=%d line=%d frame=%d sim=%d)", ip,
@@ -4359,11 +4148,6 @@ static void ExDlgInstall(void) {
     ExTraceStart(-1);
 }
 
-
-
-
-
-
 static PF_Op g_exClearOrig = NULL;
 static int g_exClearHooked = 0;
 static int g_exClearLog = 0;
@@ -4375,9 +4159,6 @@ static unsigned char __attribute__((fastcall)) ExReturnPracticeTitleUpdate(void 
     unsigned char result;
     result = ((PF_TitleUpdate)(uintptr_t)0x421040)(obj, edx);
     if (g_exReturnPracticeMenuPending && obj) {
-        
-
-
         char *title = *(char**)(uintptr_t)0x4e93c8;
         if (title && !IsBadReadPtr(title, 0x23300)) {
             g_exReturnPracticeMenuPending = 0;
@@ -4420,11 +4201,6 @@ static void PatchExReturnPracticeTitleUpdate(void) {
     Log("ExArea: title update hook installed");
 }
 
-
-
-
-
-
 static const int g_ReturnToPractice = 1;
 typedef unsigned char (__attribute__((fastcall)) *PF_TitleInit)(void *title);
 static PF_TitleInit g_origTitleInit = NULL;
@@ -4435,8 +4211,6 @@ static int g_practiceMenuWatch = 0;
 
 typedef unsigned char (__attribute__((fastcall)) *PF_TitleUpd)(void *title);
 static PF_TitleUpd g_origTitleUpd = NULL;
-
-
 
 static int PracticeMenuOpen(char *t, const char *why) {
     char *menu = t + 0x22e90;
@@ -4452,7 +4226,6 @@ static int PracticeMenuOpen(char *t, const char *why) {
     }
     *(int*)(t + 0x2324c) = 2;
     if (g_lastPracticeCursor >= 0) {
-        
         *(unsigned char*)(menu + 8) = (unsigned char)g_lastPracticeCursor;
         Log("ReturnToPractice: cursor restored to item %d", g_lastPracticeCursor);
     }
@@ -4462,8 +4235,6 @@ static int PracticeMenuOpen(char *t, const char *why) {
     Log("ReturnToPractice: opened the Practice menu [%s]", why);
     return 1;
 }
-
-
 
 static unsigned char __attribute__((fastcall)) TitleInitHook(void *title) {
     unsigned char r = g_origTitleInit(title);
@@ -4501,8 +4272,6 @@ static unsigned char __attribute__((fastcall)) TitleUpdateHook2(void *title) {
         if (*(int*)(t + 8) != 0xc) {
             g_practiceMenuWatch = 0;
         } else if (++g_practiceMenuWatch >= 90) {
-            
-
             int fade = *(int*)(t + 0x22e90 + 0xc);
             char *menu = t + 0x22e90;
             g_practiceMenuWatch = 0;
@@ -4586,8 +4355,6 @@ static unsigned char __cdecl ExStageClearOp(void *thr, void *args) {
     }
     if (transitionClear) return 1;
     if (g_exSimulatingStageFrame && g_exRun && g_exBossRun >= 1) {
-        
-
         g_exBossClearSim = 1;
         return 1;
     }
@@ -4630,18 +4397,6 @@ static void ExClearHookInstall(void) {
     }
     Log("ExArea: stage clear opcode handler 0x42f200 not found in the opcode table");
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 static unsigned *ExFindBossCandidate(int logIt) {
     unsigned *boss = *(unsigned**)(uintptr_t)0x4dae04;
@@ -4688,7 +4443,6 @@ static void ExBoss2Step(int frame) {
         g_exBoss1Obj = boss;
         Log("ExArea: Boss 2 practice: Boss 1 object %p found (hp=%.3f)", (void*)boss, *(float*)((char*)boss + 0x48));
     } else if (boss != g_exBoss1Obj) {
-        
         g_exBoss2Kill = 0;
         g_exBoss2ObjectSeen = 1;
         Log("ExArea: Boss 2 appeared (object %p, hp=%.3f) %d frame(s) after the Boss 1 jump", (void*)boss,
@@ -4703,8 +4457,6 @@ static void ExBoss2Step(int frame) {
             Log("ExArea: Boss 2 practice: boss object %p hp %.3f -> 0 (frame %d)", (void*)boss, (double)hp, frame);
         }
     }
-    
-
     if (*((unsigned char*)boss + 0x109) != 0) {
         typedef void (__cdecl *PF_HitHandler)(void *self, void *other);
         PF_HitHandler hit = (PF_HitHandler)(uintptr_t)boss[0x818 / 4];
@@ -4912,8 +4664,6 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         return 1;
     }
     if (g_exBossRun >= 1 && !g_exBoss2Kill && !g_exSimulatingStageFrame && g_exBossRunLogged < 400) {
-        
-
         unsigned *b = *(unsigned**)(uintptr_t)0x4dae04;
         if (b != g_exLastBoss) {
             g_exBossRunLogged++;
@@ -4925,9 +4675,6 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
                 Log("ExDlg: Boss practice: current boss object -> none (frame %d, was %p) [run=%d bgm2=%d seen=%d ret=%d]",
                     frame, (void*)g_exLastBoss, g_exBossRun, g_exBoss2BgmSeen, g_exBoss2ObjectSeen, g_exBossReturnAtFrame);
                 if ((g_exBossRun == 1 || g_exBoss2BgmSeen) && !g_exBossReturnAtFrame) {
-                    
-
-
                     g_exBossReturnAtFrame = frame + 180;
                     Log("ExArea: Boss %d defeated; returning to Practice in 180 frames (at %d)",
                         g_exBossRun, g_exBossReturnAtFrame);
@@ -5017,9 +4764,6 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         if (g_exBossRun == 1) {
             target = g_exBossDefaultFrame[0];
         } else if (g_exBossRun == 2) {
-            
-
-
             target = g_exBossDefaultFrame[0];
         } else if (target <= 0 && isBoss) target = g_exBossDefaultFrame[bossIndex];
         if (target <= 0 && !isBoss && g_exArea >= 0 && g_exArea < EX_AREA_N && !g_exShorten)
@@ -5027,12 +4771,7 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         if (target > 0) {
             int startFrame = frame;
             int sel = isBoss ? 3 : ((g_exArea >= 0 && g_exArea < EX_AREA_N) ? g_exAreaBgGroup[g_exArea] : 0);
-            
-
             int areaBgMode = g_ExBgMode;
-            
-
-
             ExPracticeSave sv;
             ExPracticeSaveState(&sv);
             g_exMuteSe = 1;
@@ -5054,11 +4793,6 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
                 else
                     ExFastForward(startFrame, target);
                 if (!isBoss && g_exRun && g_exArea == 1 && sel >= 0 && sel < g_exBgGroupN) {
-                    
-
-
-
-
                     g_exBgCur = sel;
                     ExBgSeed(&g_exBgGroups[sel]);
                 }
@@ -5302,9 +5036,6 @@ static void BgmNotify(int frame, int id, const char *path) {
             g_exSimulatingStageFrame ? 1 : 0);
 }
 
-
-
-
 static int BgmDispatch(int id, const char *path) {
     int frame = *(volatile int*)(uintptr_t)0x4dadf8;
     int result;
@@ -5360,13 +5091,7 @@ static int g_audioN = 0;
 static int g_audioInitialized = 0;
 static CRITICAL_SECTION g_audioCs;
 
-
 static void AudioSuppressIfPaused(IDirectSoundBuffer *b);
-
-
-
-
-
 
 typedef struct { IDirectSoundBuffer *buf; DWORD settled, size, bps, due; int tries; } AudioChk;
 static AudioChk g_chk[16];
@@ -5492,13 +5217,7 @@ static HRESULT WINAPI DSCreateHook(LPCGUID guid, LPDIRECTSOUND *pp, LPUNKNOWN un
     return hr;
 }
 
-
 static LONG CALLBACK SeekCrashVeh(PEXCEPTION_POINTERS ep);
-
-
-
-
-
 
 typedef void *(__cdecl *PF_GetCurrentMusicSnap)(void);
 
@@ -5555,19 +5274,8 @@ static void AudioRingSnapshot(const char *when) {
     }
 }
 
-
-
-
-
-
-
-
 typedef unsigned char (__attribute__((thiscall)) *PF_MusicPump)(void *);
 static PF_MusicPump g_origMusicPump = NULL;
-
-
-
-
 
 static volatile int g_audioPaused = 0;
 
@@ -5580,8 +5288,6 @@ static unsigned char __attribute__((thiscall)) MusicPumpHook(void *music) {
     }
     return g_origMusicPump ? g_origMusicPump(music) : 1;
 }
-
-
 
 static int AudioSuppressBuffer(IDirectSoundBuffer *b, const char *why) {
     DWORD st = 0;
@@ -5600,12 +5306,10 @@ static int AudioSuppressBuffer(IDirectSoundBuffer *b, const char *why) {
             g_audio[i].looping ? "looping" : "one-shot", (unsigned long)g_audio[i].pos);
         return 1;
     }
-    
     IDirectSoundBuffer_Stop(b);
     Log("PauseAudio: %s unknown buffer %p stopped", why, (void*)b);
     return 1;
 }
-
 
 static void AudioSuppressIfPaused(IDirectSoundBuffer *b) {
     if (!g_audioPaused || !b) return;
@@ -5613,7 +5317,6 @@ static void AudioSuppressIfPaused(IDirectSoundBuffer *b) {
     AudioSuppressBuffer(b, "new");
     LeaveCriticalSection(&g_audioCs);
 }
-
 
 static void AudioEnforceSilence(void) {
     int i;
@@ -5847,13 +5550,6 @@ static int PracticeSeekBgmInner(int seconds) {
             (unsigned)positionHr);
         return 0;
     }
-    /* Refilling the ring via the game's rebuffer(0x4133b0) crashes on some paths (Stage 1 MidBoss
-       practice seek) with a null deref inside the rebuffer, and is racy with the loader/streaming
-       thread.  The decoder source is already seeked; clear the stale ring to silence and restart
-       playback so the refill replaces it with seeked audio.  Do not touch music+0x4c/+0x50/+0x54/+0x58
-       (stream cursor state) — altering them misaligns refill (silence/delayed/wrong offset) and
-       touching +0x58 crashed rebuffer.  Without rebuffer the ring/cursor alignment is imperfect, so
-       playback starts near (not exactly at) the seek target; this is preferable to a crash. */
     {
         DSBCAPS caps;
         void *p1 = NULL, *p2 = NULL;
@@ -5877,7 +5573,6 @@ static int PracticeSeekBgmInner(int seconds) {
     return 1;
 }
 
-
 static LONG CALLBACK SeekCrashVeh(PEXCEPTION_POINTERS ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION ||
@@ -5897,8 +5592,6 @@ static LONG CALLBACK SeekCrashVeh(PEXCEPTION_POINTERS ep) {
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
-
-
 
 static int PracticeSeekBgm(int seconds) {
     typedef void *(__cdecl *PF_GetCurrentMusic)(void);
@@ -5932,7 +5625,6 @@ static void AudioChkTick(void) {
                 if (g_audio[k].buf == b) { alive = 1; break; }
             if (!alive) { g_chk[i] = g_chk[g_chkN - 1]; g_chkN--; continue; }
             if (SUCCEEDED(IDirectSoundBuffer_GetCurrentPosition(b, &pos, NULL))) {
-                
                 elapsed = (now - c->due) + 150;
                 exp = c->settled + elapsed * c->bps / 1000;
                 exp %= c->size;
@@ -5990,8 +5682,6 @@ static DWORD WINAPI PauseAudioThread(LPVOID unused) {
             }
             AudioResume(doPlay);
         } else if (cur) {
-            
-
             DWORD now = GetTickCount();
             static DWORD lastEnforce;
             if (now - lastEnforce >= 100) {
@@ -6219,8 +5909,6 @@ static void BatchApplyTexture(void) {
     }
 }
 
-
-
 void SmdBatchFlushQuads(void) {
     int q = g_bquads;
     if (q > 0) {
@@ -6350,15 +6038,11 @@ static const int g_FrameWaitSleep = 1;
 static const double g_FrameWaitMarginMs = 2.0;
 static const double g_FrameWaitMarginHiResMs = 0.7;
 
-
-
 typedef void (__cdecl *PF_DrawNumber)(int value, int font, int x, int y, int unk1, int a, int g, int b, int color);
 static LARGE_INTEGER g_fpsSampleTime;
 static unsigned int g_fpsSampleFrames;
 static double g_fpsTenths; 
 static int g_fpsDotLogged;
-
-
 
 static void __attribute__((noinline)) GameBlitGlyph(void *tex, int dstX, int dstY, int srcH, int srcW, int srcX, int srcY, int color) {
     struct { uintptr_t fn; void *tex; int a[10]; } s;
@@ -6372,7 +6056,6 @@ static void __attribute__((noinline)) GameBlitGlyph(void *tex, int dstX, int dst
         : : [s]"r"(&s) : "eax","ecx","edx","memory");
 }
 
-
 static void __attribute__((noinline)) GameBlitGlyphScaled(void *tex, int dstX, int dstY, int dstW, int dstH,
                                                           int srcX, int srcY, int srcW, int srcH, int alpha) {
     struct { uintptr_t fn; void *tex; int a[10]; } s;
@@ -6385,9 +6068,6 @@ static void __attribute__((noinline)) GameBlitGlyphScaled(void *tex, int dstX, i
         "mov 4(%%eax), %%ecx\n\tcall *0(%%eax)"
         : : [s]"r"(&s) : "eax","ecx","edx","memory");
 }
-
-
-
 
 static void __cdecl FpsDisplayHook(int value, int font, int x, int y, int unk1, int a, int g, int b, int color) {
     LARGE_INTEGER now;
@@ -6423,17 +6103,11 @@ static void __cdecl FpsDisplayHook(int value, int font, int x, int y, int unk1, 
     ip = v / 10;
     tenths = v % 10;
 
-    
     digitW = cw[font] ? cw[font] : 8;
     cellW = gw[font] ? gw[font] : digitW;
     cellH = gh[font] ? gh[font] : digitW;
     baseSY = sy[font];
     baseSX = sx[font];
-
-    
-
-
-    
 
     dotGW = gw[4] ? gw[4] : cellW;
     dotGH = gh[4] ? gh[4] : cellH;
@@ -6442,12 +6116,7 @@ static void __cdecl FpsDisplayHook(int value, int font, int x, int y, int unk1, 
     dotSize = dotGW;
     oneSX = 0;
     slot = digitW * 2 / 3 > 4 ? digitW * 2 / 3 : 4;  
-    
-
-
     tenthX = x + digitW * (count - 1);
-    
-    
     dotDW = dotGH * 3 / 2;
     dotDH = dotGW * 3 / 2;
     dotX = tenthX - slot + (slot - dotDW) / 2 + 3;
@@ -6472,9 +6141,6 @@ static void PatchFpsDisplay(void) {
     n = HookCall(0x414abf, 0x416010, (void*)&FpsDisplayHook);
     Log("FpsDisplay: %s (1 decimal)", n ? "patched" : "skipped");
 }
-
-
-
 
 static HANDLE g_fwTimer = NULL;
 static int g_fwTimerInit = 0;
@@ -6502,13 +6168,10 @@ static void FrameWaitInit(void) {
 typedef unsigned (__attribute__((fastcall)) *PF_FrameTimer)(int *ctx);
 int SmdD3D9GetVsync(void);
 
-
 #ifdef SMD_DEBUG_BUILD
 static volatile LONG g_frameSeq = 0;        
 static volatile DWORD g_frameSeqTick = 0;   
 static volatile DWORD g_mainThreadId = 0;
-
-
 
 static DWORD WINAPI FreezeWatchThread(LPVOID arg) {
     LONG lastSeq = 0;
@@ -6560,15 +6223,11 @@ static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
 #endif
 
     if (vsync) {
-        
-
         TitleCancelFrameTick();
         SmdControllerPoll();
         BatchTryInstall();
         return ((PF_FrameTimer)(uintptr_t)0x424f20)(ctx);
     }
-
-    
 
     if (!g_ftInit) {
         g_ftInit = 1;
@@ -6583,8 +6242,6 @@ static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
     targetCounts = g_ftFreq.QuadPart / fps;
 
     QueryPerformanceCounter(&now);
-
-    
 
     if (now.QuadPart > g_ftNextTick.QuadPart + targetCounts * 2 ||
         now.QuadPart < g_ftNextTick.QuadPart - targetCounts * 2) {
@@ -6614,7 +6271,6 @@ static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
             g_fwSpins++;
         }
 
-        
         for (;;) {
             QueryPerformanceCounter(&now);
             if (now.QuadPart >= g_ftNextTick.QuadPart) break;
@@ -6625,15 +6281,12 @@ static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
         }
     }
 
-    
     g_ftNextTick.QuadPart += targetCounts;
 
-    
     TitleCancelFrameTick();
     SmdControllerPoll();
     BatchTryInstall();
 
-    
     {
         int idx = ctx[65]; 
         ctx[3] = 0; 
@@ -6698,15 +6351,6 @@ static void PatchKeepRunningInactive(void) {
     Log("KeepActive: game active-state flag is held while the window is unfocused");
 }
 
-
-
-
-
-
-
-
-
-
 typedef void (__cdecl *PF_SceneSwitch)(int scene, int force);
 
 static void __cdecl StageEndSceneHook(int scene, int force) {
@@ -6741,8 +6385,6 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
         LogOpen();
-        
-
         SetErrorMode(SetErrorMode(0) | SEM_FAILCRITICALERRORS);
         QueryPerformanceFrequency(&g_qpcFreq);
         Log("process attach (pid=%lu)", GetCurrentProcessId());

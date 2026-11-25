@@ -19,24 +19,6 @@
 #endif
 #include "Smd_internal.h"
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 typedef unsigned (__stdcall *PF_XInputGetState)(unsigned id, void *state);
 typedef MMRESULT (WINAPI *PF_JoyGetCapsA)(UINT id, LPJOYCAPSA caps, UINT cb);
 typedef MMRESULT (WINAPI *PF_JoyGetPosEx)(UINT id, LPJOYINFOEX info);
@@ -94,12 +76,6 @@ static unsigned g_diScans;
 static unsigned g_diEnumSeen;   
 static JOYCAPSA g_joyCapsId;     
 
-/* Raw hidraw fallback (Wine/Proton on Linux): Wine's winmm and dinput backends can
-   misparse some pads (confirmed broken for Switch Pro Controller 057E:2009 on
-   hid-nintendo — a counting field lands in buttons/axes and the hat sticks at UP).
-   Reading the Linux hidraw report directly via Z:\dev\hidraw* bypasses all of that.
-   On real Windows, Z:\dev\hidraw* does not exist, so this never activates and the
-   normal XInput/DirectInput/winmm paths are used unchanged. */
 #define HIDRAW_MAX 16
 #define HIDRAW_REP 64
 static HANDLE g_hidHandle = INVALID_HANDLE_VALUE;
@@ -120,8 +96,6 @@ static void JoyHidrawClose(void) {
 }
 
 static int JoyHidrawMatch(unsigned short vid, unsigned short pid) {
-    
-
     return vid == 0x057Eu && pid == 0x2009u;   
 }
 
@@ -144,7 +118,6 @@ static int JoyHidrawOpen(int idx) {
         CloseHandle(h);
     }
     if (rd) {
-        
         end = (unsigned char*)buf + rd;
         for (p = (unsigned char*)buf; p < end; p += strlen((char*)p) + 1) {
             if (strncmp((char*)p, "HID_ID=", 7) == 0) {
@@ -154,8 +127,6 @@ static int JoyHidrawOpen(int idx) {
             if (p + strlen((char*)p) + 1 >= end) break;
         }
     }
-    /* sysfs unreadable? fall back to matching the known-broken pad by trying to read:
-       open the hidraw node and peek a report — if it looks like Switch Pro 0x30, accept */
     if (!vid && !pid) {
         HANDLE hp = CreateFileA(dev, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
             OPEN_EXISTING, 0, NULL);
@@ -240,38 +211,31 @@ static void JoyHidParseSwitchPro(const unsigned char *r, DWORD n) {
     unsigned b3, b4, b5, dw = 0;
     if (n < 12 || r[0] != 0x30) return;
     b3 = r[3]; b4 = r[4]; b5 = r[5];
-    
     if (b3 & 0x08) dw |= JOY_BUTTON1;  
     if (b3 & 0x04) dw |= JOY_BUTTON2;  
     if (b3 & 0x02) dw |= JOY_BUTTON3;  
     if (b3 & 0x01) dw |= JOY_BUTTON4;  
     if (b3 & 0x40) dw |= JOY_BUTTON8;  
     if (b3 & 0x80) dw |= JOY_BUTTON16; 
-    
     if (b4 & 0x02) dw |= JOY_BUTTON5;  
     if (b4 & 0x01) dw |= JOY_BUTTON6;  
     if (b4 & 0x08) dw |= JOY_BUTTON9;  
     if (b4 & 0x04) dw |= JOY_BUTTON10; 
-    
     if (b5 & 0x40) dw |= JOY_BUTTON7;  
     if (b5 & 0x80) dw |= JOY_BUTTON15; 
-    
     if (b5 & 0x02)      g_hidState.dwPOV = 0;      
     else if (b5 & 0x04) g_hidState.dwPOV = 9000;   
     else if (b5 & 0x01) g_hidState.dwPOV = 18000;  
     else if (b5 & 0x08) g_hidState.dwPOV = 27000;  
     else                g_hidState.dwPOV = 0xFFFF;
-    
     if ((b5 & 0x0A) == 0x0A) g_hidState.dwPOV = 4500;   
     if ((b5 & 0x06) == 0x06) g_hidState.dwPOV = 13500;  
     if ((b5 & 0x05) == 0x05) g_hidState.dwPOV = 22500;  
     if ((b5 & 0x09) == 0x09) g_hidState.dwPOV = 31500;  
 
     g_hidState.dwButtons = dw;
-    
     g_hidState.dwXpos = JoyHidStick12(r[6], r[7]);
     g_hidState.dwYpos = 65535u - JoyHidStick12hi(r[7], r[8]); 
-    
     if (n >= 12) {
         g_hidState.dwZpos = JoyHidStick12(r[9], r[10]);
         g_hidState.dwRpos = 65535u - JoyHidStick12hi(r[10], r[11]);
@@ -284,7 +248,6 @@ static void JoyHidrawPoll(void) {
     int drain = 0;
     JoyHidrawScan();
     if (g_hidHandle == INVALID_HANDLE_VALUE) return;
-    
     for (;;) {
         if (g_hidPending) {
             if (WaitForSingleObject(g_hidEv, 0) != WAIT_OBJECT_0) break;
@@ -315,7 +278,6 @@ static int JoyHidrawState(JOYINFOEX *out) {
     ji0 = g_hidState;
     ji0.dwSize = sizeof(ji0);
     ji0.dwFlags = JOY_RETURNALL;
-    
     *out = ji0;
     return 1;
 }
@@ -331,8 +293,6 @@ static void JoyLogCapsConnected(unsigned id, unsigned connected)
     (void)id; (void)connected;
 #endif
 }
-
-
 
 static BOOL CALLBACK JoyFindOwnWindowProc(HWND h, LPARAM lp) {
     DWORD pid = 0;
@@ -390,9 +350,7 @@ static void JoyDirectInputFormatInit(void) {
     g_diFormatReady = 1;
 }
 
-
 static void JoyPovToAxes(DWORD pov, DWORD *xpos, DWORD *ypos) {
-    
     if (pov == 0xFFFFu || pov == 0xFFFFFFFFu) return;
     if (pov <= 4500 || pov >= 31500) *ypos = 0;          
     else if (pov >= 13500 && pov <= 22500) *ypos = 65535; 
@@ -441,8 +399,6 @@ static BOOL CALLBACK JoyEnumDirectInput(const DIDEVICEINSTANCEA *instance, void 
         HRESULT hrSet, hrGet;
         axisRange.diph.dwObj = DIDFT_ABSAXIS | DIDFT_MAKEINSTANCE(g_diAxisInstance[i]);
         hrSet = IDirectInputDevice8_SetProperty(device, DIPROP_RANGE, &axisRange.diph);
-        
-
         hrGet = IDirectInputDevice8_GetProperty(device, DIPROP_RANGE, &axisRange.diph);
         if (SUCCEEDED(hrGet)) {
             g_diAxisMin[g_diCount][i] = axisRange.lMin;
@@ -515,8 +471,6 @@ static void JoyDirectInputScan(void) {
             if (oldCount != g_diCount || g_diScans <= 3)
                 SmdLog("JoyBridge: DirectInput scan #%u: EnumDevices hr=%08X, %u device(s) enumerated, %u usable (was %u), window=%p, took %.2f ms",
                     g_diScans, (unsigned)ehr, g_diEnumSeen, g_diCount, oldCount, (void*)hwnd, took);
-            
-
             if (took > 50.0)
                 SmdLog("JoyBridge: DirectInput scan #%u took %.1f ms (slow)", g_diScans, took);
             if (g_diCount == oldCount && SUCCEEDED(ehr)) {
@@ -527,7 +481,6 @@ static void JoyDirectInputScan(void) {
         }
     }
 }
-
 
 static void JoyCopyState(JOYINFOEX *dst, const JOYINFOEX *src) {
     dst->dwXpos = src->dwXpos;
@@ -604,9 +557,6 @@ static int JoyDirectInputState(unsigned id, JOYINFOEX *out) {
     return 1;
 }
 
-
-
-
 static void JoyLogPoll(unsigned id, const char *src, const JOYINFOEX *ji) {
     static unsigned calls;
     calls++;
@@ -636,7 +586,6 @@ static void JoyLogStateChange(const char *source, unsigned id, const JOYINFOEX *
 }
 #endif
 
-
 static void JoyNativeToJi(const JOYINFOEX *nat, JOYINFOEX *ji, DWORD requestedSize, DWORD requestedFlags);
 static unsigned JoyNativeRead(unsigned id, JOYINFOEX *exe);
 static void JoyLogNativeCaps(void) {
@@ -654,9 +603,6 @@ static void JoyLogNativeCaps(void) {
             SmdLog("JoyBridge: native winmm joystick id=%u: not available (%u)", id, r);
     }
 }
-
-
-
 
 static void JoyClassifyNatives(void) {
     unsigned id;
@@ -690,10 +636,6 @@ static void JoyIoInit(void) {
     JoyLogNativeCaps();
     JoyClassifyNatives();
 }
-
-
-
-
 
 static int JoyXinputLooksDead(unsigned id, PF_XInputGetState fn, const unsigned char *st) {
     unsigned char st2[64];
@@ -735,7 +677,6 @@ static int JoyXInputGrab(unsigned id, void *state) {
     return 0;
 }
 
-
 static unsigned JoyNativeRead(unsigned id, JOYINFOEX *exe) {
     unsigned r;
     memset(exe, 0, sizeof(*exe));
@@ -749,8 +690,6 @@ static unsigned JoyNativeRead(unsigned id, JOYINFOEX *exe) {
 }
 
 static void PatchJoyImports(void);
-
-
 
 static unsigned __stdcall JoyGetNumDevs(void) {
     unsigned native, reported;
@@ -781,10 +720,6 @@ static unsigned JoyNativeBest(void);
 static int JoyDirectInputState(unsigned id, JOYINFOEX *out);
 static unsigned __stdcall JoyGetCapsA(unsigned id, JOYCAPSA *jc, unsigned cb);
 
-
-
-
-
 static void JoyVirtualCaps(JOYCAPSA *jc, const char *name, WORD mid, WORD pid) {
     memset(jc, 0, sizeof(*jc));
     jc->wMid = mid;
@@ -802,9 +737,6 @@ static void JoyVirtualCaps(JOYCAPSA *jc, const char *name, WORD mid, WORD pid) {
     jc->wCaps = JOY_CAPS_BRIDGED;
 }
 
-
-
-
 static unsigned __stdcall JoyGetCapsA(unsigned id, JOYCAPSA *jc, unsigned cb) {
     int xi;
 #ifdef SMD_DEBUG_BUILD
@@ -817,10 +749,6 @@ static unsigned __stdcall JoyGetCapsA(unsigned id, JOYCAPSA *jc, unsigned cb) {
     xi = JoyXInputGrab(id, &(unsigned char[16]){0});
     JoyLogCapsConnected(id, (unsigned)xi);
     if (id == 0) {
-        
-
-
-
         JoyVirtualCaps(jc, "Smd Bridged Pad", 0x57E, 0x2009);
         return JOYERR_NOERROR;
     }
@@ -834,14 +762,11 @@ static unsigned __stdcall JoyGetCapsA(unsigned id, JOYCAPSA *jc, unsigned cb) {
     return JOYERR_UNPLUGGED;
 }
 
-
 static int JoyStateNeutral(const JOYINFOEX *j) {
     long dx = (long)j->dwXpos - 32768L, dy = (long)j->dwYpos - 32768L;
     return j->dwButtons == 0 && (j->dwPOV == 0xFFFFu || j->dwPOV == 0xFFFFFFFFu) &&
            dx > -16000 && dx < 16000 && dy > -16000 && dy < 16000;
 }
-
-
 
 static void JoyNativeToJi(const JOYINFOEX *nat, JOYINFOEX *ji, DWORD requestedSize, DWORD requestedFlags) {
     int count = 0;
@@ -849,23 +774,13 @@ static void JoyNativeToJi(const JOYINFOEX *nat, JOYINFOEX *ji, DWORD requestedSi
     *ji = *nat;
     ji->dwSize = requestedSize;
     ji->dwFlags = requestedFlags;
-    /* POV 0 = d-pad UP (valid).  Do not neutralize it — an old heuristic for Wine's
-       broken backends ate real UP presses; the hidraw/DI fixes make that unnecessary. */
-    
-
-
     ji->dwButtons &= 0xFFFFu;
     b = ji->dwButtons;
     while (b) { b &= (b - 1); count++; }
     ji->dwButtonNumber = (DWORD)count;
-    
-
     if (ji->dwPOV != 0xFFFFu && ji->dwPOV != 0xFFFFFFFFu)
         JoyPovToAxes(ji->dwPOV, &ji->dwXpos, &ji->dwYpos);
 }
-
-
-
 
 static unsigned g_nativeBestId = 0xFFFFFFFFu;
 static unsigned g_nativeSaneMask;   
@@ -893,12 +808,6 @@ static unsigned JoyNativeBest(void) {
     g_nativeBestId = best;
     return best;
 }
-
-
-
-
-
-
 
 static unsigned g_nativeServingId = 0xFFFFFFFFu;
 
@@ -949,11 +858,6 @@ static unsigned JoyPickNative(void) {
     return firstSane;
 }
 
-
-
-
-
-
 static int g_diServingId = -1;
 
 static int JoyPickDI(void) {
@@ -980,10 +884,6 @@ static int JoyPickDI(void) {
     return first;
 }
 
-
-
-
-
 static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
     DWORD requestedSize = ji ? ji->dwSize : 0, requestedFlags = ji ? ji->dwFlags : 0;
     JOYINFOEX st;
@@ -993,13 +893,8 @@ static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
 
     if (id == 0) {
         int haveNative = 0;
-        
-
         JoyHidrawPoll();
         if (g_hidReady) {
-            
-
-
             JOYINFOEX hs = g_hidState;
             hs.dwSize = sizeof(hs);
             hs.dwFlags = JOY_RETURNALL;
@@ -1011,9 +906,6 @@ static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
             g_joyPlugged[id] = 1;
             return JOYERR_NOERROR;
         }
-        
-
-
         JoyDirectInputScan();
         {
             JOYINFOEX diSt;
@@ -1028,8 +920,6 @@ static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
                 return JOYERR_NOERROR;
             }
         }
-        
-
         {
             JOYINFOEX natSt;
             unsigned nativeId = JoyPickNative();
@@ -1047,7 +937,6 @@ static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
                 }
             }
         }
-        
         if (JoyXInputGrab(id, &st)) {
             unsigned char *x = (unsigned char*)&st;
             unsigned short btn = *(unsigned short*)(x + 4);
@@ -1073,7 +962,6 @@ static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
             if (lt >= 0x40)                     dwButtons |= JOY_BUTTON15;
             if (rt >= 0x40)                     dwButtons |= JOY_BUTTON16;
 
-            
             memset(&st, 0, sizeof(st));
             st.dwXpos = (DWORD)((int)sLX + 32768);
             st.dwYpos = (DWORD)(32768 - (int)sLY);
@@ -1094,7 +982,6 @@ static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
             else if (btn & XI_ID_DPAD_DOWN)     st.dwPOV = 18000;
             else if (btn & XI_ID_DPAD_LEFT)     st.dwPOV = 27000;
             else                                st.dwPOV = 0xFFFF;     
-            
             JoyPovToAxes(st.dwPOV, &st.dwXpos, &st.dwYpos);
             if (!JoyStateNeutral(&st)) {
                 JoyNativeToJi(&st, ji, requestedSize, requestedFlags);
@@ -1107,7 +994,6 @@ static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
             }
         }
         if (haveNative) {
-            
 #ifdef SMD_DEBUG_BUILD
             {
                 JOYINFOEX tr = *ji;
@@ -1139,9 +1025,6 @@ static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
         return JOYERR_NOERROR;
     }
     if (id == 0) {
-        
-
-
         memset(ji, 0, requestedSize);
         ji->dwSize = requestedSize;
         ji->dwFlags = requestedFlags;
@@ -1165,8 +1048,6 @@ static unsigned __stdcall JoyGetPosEx(unsigned id, JOYINFOEX *ji) {
     return JOYERR_UNPLUGGED;
 }
 
-
-
 static unsigned __stdcall JoyGetPos(unsigned id, JOYINFO *ji) {
     JOYINFOEX ex;
     unsigned r;
@@ -1188,9 +1069,6 @@ static unsigned __stdcall JoyGetPos(unsigned id, JOYINFO *ji) {
     ji->wButtons = (WORD)ex.dwButtons;
     return JOYERR_NOERROR;
 }
-
-
-
 
 static void PatchJoyImports(void) {
     HMODULE mod = GetModuleHandleA(NULL);
@@ -1247,7 +1125,6 @@ static void PatchJoyImports(void) {
             }
         }
     }
-    
     if (foundWinmm) g_joyImportsPatched = 1;
     if (patched)
         SmdLog("JoyBridge: winmm import table patched (%d entr%s)", patched, patched == 1 ? "y" : "ies");

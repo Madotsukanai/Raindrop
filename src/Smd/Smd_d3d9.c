@@ -19,7 +19,6 @@
 #endif
 #include "Smd_internal.h"
 
-
 static int g_fullscreenRequested = 0;
 static int g_displayModeFailures = 0;
 static int g_d7Vsync = 1;   
@@ -31,8 +30,6 @@ static void ExeDirFile(const char *name, char *out) {
     if (slash) *(slash + 1) = 0;
     strcat(out, name);
 }
-
-
 
 #ifdef SMD_DEBUG_BUILD
 static unsigned g_d7TraceTotal;
@@ -54,8 +51,6 @@ static void TraceHitN(const char *name, unsigned long a, unsigned long b) {
 #define SMD_D3D7_EMU 1
 #endif
 static const int g_D7Emu = SMD_D3D7_EMU;
-
-
 static const int g_D7PureDevice = 1;
 
 static const GUID k_D7_IID_Unknown = { 0x00000000, 0x0000, 0x0000, { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
@@ -132,7 +127,6 @@ static struct {
     void *devTex[8];            
 } g_d7 = { 0, NULL, 640, 480 };
 
-
 static void D7_SetFVF(DWORD fvf) {
     if (!g_d7.dev || g_d7.fvf == fvf) return;
     g_d7.fvf = fvf;
@@ -148,7 +142,6 @@ static void D7_SetTex(DWORD stage, IDirect3DTexture9 *t) {
 
 int SmdD3D9EmuActive(void) { return g_d7.active; }
 static int D7_EmuActive(void) { return g_d7.active; }
-
 
 #define D7_BATCH_FVF 0x1c4
 #define D7_BATCH_MAX 1024
@@ -186,7 +179,6 @@ static int D7_Warn(unsigned bit) {
     g_d7.warned |= bit;
     return 1;
 }
-
 
 static unsigned char g_d7Exp[9][256];   
 static int g_d7ExpInit = 0;
@@ -277,7 +269,6 @@ static const struct { DWORD flags, bpp, r, g, b, a; } k_d7Fmts[] = {
     { DDPF_RGB,                    16, 0x00007C00, 0x000003E0, 0x0000001F, 0 }
 };
 
-
 static D7Surf *D7_SurfNew(int w, int h, const DDPIXELFORMAT *pf, DWORD caps) {
     D7Surf *s = (D7Surf*)calloc(1, sizeof(*s));
     if (!s) return NULL;
@@ -340,7 +331,6 @@ static ULONG STDMETHODCALLTYPE ES_Release(void *self) {
     return 0;
 }
 
-
 static void D7_MarkDirty(D7Surf *s, const RECT *r) {
     RECT c;
     if (!r) {
@@ -366,7 +356,6 @@ static void D7_MarkDirty(D7Surf *s, const RECT *r) {
     }
 }
 
-
 static const DWORD *D7_Lut16(const D7Fmt *f) {
     static struct { DWORD m[4]; DWORD *t; } cache[4];
     static int ncache = 0;
@@ -386,7 +375,6 @@ static const DWORD *D7_Lut16(const D7Fmt *f) {
     ncache++;
     return t;
 }
-
 
 static IDirect3DTexture9 *D7_GetTex(D7Surf *s) {
     D3DLOCKED_RECT lr;
@@ -424,7 +412,6 @@ static IDirect3DTexture9 *D7_GetTex(D7Surf *s) {
                         memcpy(dp, sp, (size_t)n * sizeof(DWORD));
                         continue;
                     }
-                    
                     DWORD m3 = s->fmt.m[3], addA = m3 ? 0u : 0xFF000000u, keyv = s->keyLo & ~m3;
                     const DWORD *sd = (const DWORD*)sp;
                     for (x = 0; x < n; x++) {
@@ -505,7 +492,6 @@ static void D7_Fill(D7Surf *d, const RECT *rIn, DWORD raw) {
     D7_MarkDirty(d, &r);
 }
 
-
 typedef IDirect3D9 *(WINAPI *PF_D7Create9)(UINT);
 
 static void D7_ApplyRS(DWORD st, DWORD v) {
@@ -544,7 +530,6 @@ static void D7_Reapply(void) {
     }
 }
 
-
 static void D7_SetupBorderless(HWND hwnd) {
     MONITORINFO mi;
     HMONITOR mon;
@@ -570,9 +555,6 @@ static void D7_SetupBorderless(HWND hwnd) {
         (long)(mi.rcMonitor.right - mi.rcMonitor.left), (long)(mi.rcMonitor.bottom - mi.rcMonitor.top),
         (long)mi.rcMonitor.left, (long)mi.rcMonitor.top);
 }
-
-
-
 
 static void D7_BringToFront(HWND hwnd) {
     HWND fg;
@@ -601,8 +583,6 @@ static void D7_BringToFront(HWND hwnd) {
     }
     SmdLog("Foreground: window %p %s", (void*)hwnd, GetForegroundWindow() == hwnd ? "is now in the foreground" : "could not be brought to the foreground");
 }
-
-
 
 static void D7_SetWindowed(int windowed) {
     HWND hwnd = g_d7.hwnd;
@@ -639,7 +619,6 @@ static void D7_SetWindowed(int windowed) {
     g_d7.fsCw = g_d7.fsCh = 0;
     InvalidateRect(hwnd, NULL, TRUE);
 }
-
 
 static void D7_SeedState(void) {
     IDirect3DDevice9 *dev = g_d7.dev;
@@ -750,8 +729,6 @@ static int D7_InitD3D9(void) {
     return 1;
 }
 
-
-
 static HRESULT D7_PresentFS(void) {
     RECT cr, dr;
     int cw, ch, w, h;
@@ -785,12 +762,6 @@ static HRESULT D7_PresentFS(void) {
     return IDirect3DDevice9_Present(g_d7.dev, NULL, &dr, NULL, NULL);
 }
 
-
-
-
-
-
-
 static LARGE_INTEGER g_paceFreq;
 static LARGE_INTEGER g_lastPresent;
 static double g_costEwmaMs;
@@ -801,8 +772,6 @@ static const double D7_PACE_INTERVAL_MS = 16.666667;
 
 static double D7PaceWait(void);
 static int SmdIsWine(void);
-
-
 
 static int g_paceNeeded = -1;   
 static LARGE_INTEGER g_rateStart;
@@ -824,12 +793,8 @@ static int D7PaceEnabled(void) {
 }
 
 static double D7PaceWait(void) {
-    
-
     return 0.0;
 }
-
-
 
 static void D7RateGuard(void) {
     LARGE_INTEGER now;
@@ -872,8 +837,6 @@ static void D7_Present(void) {
     SmdKeyLatNote(t1.QuadPart);   
     {
         static unsigned presentSeq;
-        
-
         if ((++presentSeq % 10) == 0 || cost > 8.0)
             SmdLog("D7Present: hr=%08X elapsed=%.2f ms pace=%.2f ms", (unsigned)hr, cost, paceMs);
     }
@@ -891,12 +854,6 @@ static void D7_Present(void) {
         }
     }
 }
-
-
-
-
-
-
 
 typedef struct { float x, y, z, rhw; DWORD color; float u, v; } D7Quad;
 #define D7_QUAD_FVF (D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1)
@@ -937,7 +894,6 @@ static int D7_BltToDev(const RECT *drIn, D7Surf *s, const RECT *srIn, int useKey
     t = D7_GetTex(s);
     if (!t) return 0;
 
-    
     x0 = (float)dr.left - 0.5f;   y0 = (float)dr.top - 0.5f;
     x1 = (float)dr.right - 0.5f;  y1 = (float)dr.bottom - 0.5f;
     u0 = (float)sr.left / (float)s->w;   v0 = (float)sr.top / (float)s->h;
@@ -947,9 +903,6 @@ static int D7_BltToDev(const RECT *drIn, D7Surf *s, const RECT *srIn, int useKey
     q[1].x = x1; q[1].y = y0; q[1].u = u1; q[1].v = v0;
     q[2].x = x0; q[2].y = y1; q[2].u = u0; q[2].v = v1;
     q[3].x = x1; q[3].y = y1; q[3].u = u1; q[3].v = v1;
-
-    
-
 
     D7_BatchFlush();
     rsVal[0] = FALSE; rsVal[1] = FALSE; rsVal[2] = FALSE; rsVal[3] = D3DCULL_NONE; rsVal[4] = FALSE;
@@ -984,10 +937,8 @@ static int D7_BltToDev(const RECT *drIn, D7Surf *s, const RECT *srIn, int useKey
     return 1;
 }
 
-
 #define D7FN(name, ret, ...) \
     static HRESULT STDMETHODCALLTYPE name(void *self, ##__VA_ARGS__) { (void)self; return (ret); }
-
 
 static HRESULT STDMETHODCALLTYPE ES_QueryInterface(void *self, const GUID *riid, void **out) {
     if (!out) return E_POINTER;
@@ -1017,7 +968,6 @@ static HRESULT STDMETHODCALLTYPE ES_Blt(void *self, RECT *dr, void *srcp, RECT *
         if (s && (s == g_d7.back3d || (s->caps & DDSCAPS_3DDEVICE) || s == d->back)) {
             D7_Present();
         } else if (s && g_d7.dev) {
-            
             if (!D7_BltToDev(dr, s, sr, (flags & DDBLT_KEYSRC) ? 1 : 0) && D7_Warn(D7W_PRIMBLT))
                 SmdLog("D3D7 emu: Blt to the primary surface failed (invalid rectangle or texture)");
             D7_Present();
@@ -1204,7 +1154,6 @@ static HRESULT STDMETHODCALLTYPE ES_Lock(void *self, RECT *r, DDSURFACEDESC2 *d,
 
 static HRESULT STDMETHODCALLTYPE ES_Unlock(void *self, RECT *r) {
     D7Surf *s = (D7Surf*)self;
-    
     if (!s->lockRO) D7_MarkDirty(s, s->lockFull ? NULL : &s->lockRc);
     s->lockRO = 0;
     s->lockFull = 1;
@@ -1295,7 +1244,6 @@ static void *g_d7SurfVt[49] = {
     (void*)ES_ChangeUniquenessValue, (void*)ES_SetPriority, (void*)ES_GetPriority,
     (void*)ES_SetLOD, (void*)ES_GetLOD
 };
-
 
 static HRESULT STDMETHODCALLTYPE EV_QueryInterface(void *self, const GUID *riid, void **out) {
     if (!out) return E_POINTER;
@@ -1438,8 +1386,6 @@ static UINT D7_FvfStride(DWORD fvf) {
     return st;
 }
 
-
-
 static void D7_CkBegin(void) {
     D7_ApplyRS(D3DRS_ALPHATESTENABLE, TRUE);
     D7_ApplyRS(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
@@ -1551,7 +1497,6 @@ static void *g_d7DevVt[49] = {
     (void*)EV_GetLightEnable, (void*)EV_SetClipPlane, (void*)EV_GetClipPlane, (void*)EV_GetInfo
 };
 
-
 static HRESULT STDMETHODCALLTYPE E3_QueryInterface(void *self, const GUID *riid, void **out) {
     if (!out) return E_POINTER;
     *out = NULL;
@@ -1590,7 +1535,6 @@ static void *g_d7D3DVt[8] = {
     (void*)E3_CreateDevice, (void*)E3_CreateVertexBuffer, (void*)E3_EnumZBufferFormats,
     (void*)E3_EvictManagedTextures
 };
-
 
 static HRESULT STDMETHODCALLTYPE ED_QueryInterface(void *self, const GUID *riid, void **out) {
     if (!out) return E_POINTER;
@@ -1673,12 +1617,6 @@ static HRESULT STDMETHODCALLTYPE ED_GetDisplayMode(void *self, DDSURFACEDESC2 *d
     return DD_OK;
 }
 
-
-
-
-
-
-
 static volatile LONG g_enterMask = 0;
 typedef SHORT (WINAPI *PF_KeyStateFn)(int);
 typedef BOOL (WINAPI *PF_KbStateFn)(PBYTE);
@@ -1704,7 +1642,6 @@ static char *WndModeReadFile(const char *path, size_t *outN) {
     return buf;
 }
 
-
 static int WndModeFind(const char *buf, size_t n, size_t *vs, size_t *ve) {
     size_t i = 0;
     while (i < n) {
@@ -1723,7 +1660,6 @@ static int WndModeFind(const char *buf, size_t n, size_t *vs, size_t *ve) {
     }
     return 0;
 }
-
 
 static int ReadWndModeConfig(void) {
     char path[MAX_PATH];
@@ -1818,7 +1754,6 @@ static BOOL WINAPI Hook_GetKeyboardState(PBYTE keys) {
     return r;
 }
 
-
 static int HookIat(const char *func, void *hook, void **orig) {
     BYTE *base = (BYTE*)GetModuleHandleA(NULL);
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER*)base;
@@ -1874,7 +1809,6 @@ static LRESULT CALLBACK SmdWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     return CallWindowProcA(g_origWndProc, h, m, w, l);
 }
-
 
 static void HotkeyAttach(HWND hwnd) {
     LONG_PTR prev;
@@ -1940,7 +1874,6 @@ D7FN(ED_CreateClipper, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
 D7FN(ED_CreatePalette, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c, DWORD d)
 D7FN(ED_DuplicateSurface, DDERR_UNSUPPORTED, DWORD a, DWORD b)
 typedef HRESULT (WINAPI *PF_D7EnumModes)(DDSURFACEDESC2*, void*);
-
 
 static HRESULT STDMETHODCALLTYPE ED_EnumDisplayModes(void *self, DWORD flags, DDSURFACEDESC2 *filter, void *ctx, PF_D7EnumModes cb) {
     static const struct { int w, h, bpp; } modes[] = {
@@ -2046,11 +1979,6 @@ static int SmdIsWine(void) {
     return v;
 }
 
-
-
-
-
-
 static const char *g_d7VsyncSrc = "display refresh";
 
 static const char *D7E_VsyncSource(void) { return g_d7VsyncSrc; }
@@ -2114,11 +2042,6 @@ static int D7E_ConfigD3D9(void) {
                 SmdLog("Created raindrop.ini with default Graphics API");
             }
         }
-        
-
-
-
-
         GetPrivateProfileStringA("Graphics", "API", "\x1notconfigured", value, sizeof(value), path);
         useD3D9 = (_stricmp(value, "D3D9") == 0 || _stricmp(value, "Direct3D9") == 0);
         if (_stricmp(value, "\x1notconfigured") == 0) {
@@ -2142,11 +2065,6 @@ static int D7E_ConfigD3D9(void) {
 
 static void D7E_BindPrivateExports(HMODULE real);
 
-
-
-
-
-
 static void SmdFwdDefault(void) {}
 #define SMD_FWD_STUB(name) \
     __attribute__((used)) static void *SmdFwdPtr_##name = (void*)SmdFwdDefault; \
@@ -2167,8 +2085,6 @@ static void D7E_BindPrivateExports(HMODULE real) {
 }
 
 static void D7E_SaveFallbackAPI(void) {
-    
-
     D7E_WriteConfigAPI("D3D9");
     g_D7E_ConfigCreated = 0;
     SmdLog("Saved D3D9 fallback to raindrop.ini");
@@ -2199,7 +2115,6 @@ static FARPROC p_DllUnregisterServer;
 
 static void LoadReal(void) {
     if (g_real) return;
-    
     
     char sys[MAX_PATH];
     GetSystemDirectoryA(sys, MAX_PATH);
@@ -2291,7 +2206,6 @@ static HRESULT STDMETHODCALLTYPE WDD7_QueryInterface(IDirectDraw7 *self, REFIID 
                 (unsigned)riid->Data4[4], (unsigned)riid->Data4[5],
                 (unsigned)riid->Data4[6], (unsigned)riid->Data4[7], hr);
         else if (0 && IsEqualCLSID(riid, &k_IID_IDirect3D7))
-            
         return hr;
     }
     IDirectDraw7_AddRef(w->orig);
@@ -2684,14 +2598,5 @@ __declspec(dllexport) HRESULT WINAPI DllUnregisterServer(void) {
     if (!p_DllUnregisterServer) return E_FAIL;
     return ((PF_FPOCH)p_DllUnregisterServer)();
 }
-
-
-
-
-
-
-
-
-
 
 typedef void (__cdecl *PF_SceneSwitch)(int scene, int force);
