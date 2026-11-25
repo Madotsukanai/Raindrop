@@ -1,0 +1,27 @@
+[package]
+name = "raindrop-d3d9"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Rust d3d9.dll for Raindrop: system-d3d9 proxy by default, optional wgpu-backed IDirect3DDevice9 emulation"
+
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+raindrop-gpu = { path = "../raindrop-gpu" }
+wgpu = { version = "26", optional = true, default-features = false, features = ["vulkan", "gles", "wgsl"] }
+raw-window-handle = "0.6"
+fearless_simd = "1.3.0"
+
+[features]
+default = []
+wgpu-backend = ["dep:wgpu", "raindrop-gpu/wgpu-backend"]
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+strip = "debuginfo"
+
+[lints.rust]
+fn_to_numeric_cast_any = "allow"

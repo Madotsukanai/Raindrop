@@ -20,7 +20,20 @@ SMD_INCLUDES = -Irust/raindrop-gpu/include
 RUST = cargo
 RUST_TARGET_DIR = rust/raindrop-gpu/target/i686-pc-windows-gnu/release
 RUSTLIB = $(RUST_TARGET_DIR)/libraindrop_gpu.a
-RUST_RUNTIME_LIBS = -ladvapi32 -lws2_32 -lbcrypt -luserenv -lole32 -loleaut32 -lsynchronization -lntdll
+RUST_RUNTIME_LIBS = -ladvapi32 -lws2_32 -lbcrypt -luserenv -lole32 -loleaut32 -lsynchronization -lntdll -lopengl32 -lgdi32 -lwindowsapp
+RUST_D3D9 = rust/raindrop-d3d9/target/i686-pc-windows-gnu/release/raindrop_d3d9.dll
+RUST_D3D9LIB = rust/raindrop-d3d9/target/i686-pc-windows-gnu/release/libraindrop_d3d9.a
+
+$(RUST_D3D9): rust/raindrop-d3d9/Cargo.toml rust/raindrop-d3d9/src/*.rs $(RUSTLIB)
+	cd rust/raindrop-d3d9 && $(RUST) build --target i686-pc-windows-gnu --release --features wgpu-backend
+
+$(RUST_D3D9LIB): $(RUST_D3D9)
+
+# make rust-d3d9 : Rust d3d9.dll (proxy default / wgpu backend via raindrop.ini)
+rust-d3d9: $(BUILD)/rust/d3d9.dll
+
+$(BUILD)/rust/d3d9.dll: $(RUST_D3D9) | $(BUILD)/rust
+	cp $< $@
 # -static keeps libwinpthread / libgcc from becoming DLL imports, so the shims
 # stay single-file deployable now that the Rust kernels are linked in.
 LDFLAGS = -shared -static -static-libgcc -s -Wl,--kill-at
@@ -36,8 +49,8 @@ debug: refrain-debug smd-debug
 # real system d3d9.dll after installing this mod's hooks.
 refrain: $(BUILD)/d3d9.dll
 
-$(BUILD)/d3d9.dll: $(BUILD)/RefRain.o
-	$(CC) -o $@ $^ $(LDFLAGS) -lwinmm
+$(BUILD)/d3d9.dll: $(BUILD)/RefRain.o $(RUST_D3D9LIB)
+	$(CC) -o $@ $^ $(LDFLAGS) -lwinmm $(RUST_RUNTIME_LIBS)
 
 $(BUILD)/RefRain.o: src/RefRain.c src/d3dx9_font_compat.h src/RainUpdate.h $(VERSION_STAMP) | $(BUILD)
 	$(CC) -c -o $@ src/RefRain.c $(CFLAGS)
@@ -45,8 +58,8 @@ $(BUILD)/RefRain.o: src/RefRain.c src/d3dx9_font_compat.h src/RainUpdate.h $(VER
 # make refrain-debug : same, with logging (raindrop.log) enabled -> build/debug/d3d9.dll
 refrain-debug: $(BUILD)/debug/d3d9.dll
 
-$(BUILD)/debug/d3d9.dll: $(BUILD)/RefRain_debug.o | $(BUILD)/debug
-	$(CC) -o $@ $^ $(LDFLAGS) -lwinmm
+$(BUILD)/debug/d3d9.dll: $(BUILD)/RefRain_debug.o $(RUST_D3D9LIB) | $(BUILD)/debug
+	$(CC) -o $@ $^ $(LDFLAGS) -lwinmm $(RUST_RUNTIME_LIBS)
 
 $(BUILD)/RefRain_debug.o: src/RefRain.c src/d3dx9_font_compat.h src/RainUpdate.h $(VERSION_STAMP) | $(BUILD)
 	$(CC) -c -o $@ src/RefRain.c $(CFLAGS) -DREFRAIN_DEBUG_BUILD
@@ -89,10 +102,13 @@ $(BUILD)/Smd_controller.o: src/Smd/Smd_controller.c src/Smd/Smd_internal.h | $(B
 $(BUILD):
 	mkdir -p $@
 
+$(BUILD)/rust:
+	mkdir -p $@
+
 $(BUILD)/debug:
 	mkdir -p $@
 
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all debug refrain refrain-debug smd smd-debug clean
+.PHONY: all debug refrain refrain-debug smd smd-debug rust-d3d9 clean

@@ -17,7 +17,9 @@ VERSION_STAMP = build\.version-nmake
 RUSTLIB = rust\raindrop-gpu\target\i686-pc-windows-msvc\release\libraindrop_gpu.lib
 RUST_INCPATH = /Irust\raindrop-gpu\include
 # Rust runtime libs needed when linking the staticlib into the DLL.
-RUST_RUNTIME_LIBS = ws2_32.lib bcrypt.lib userenv.lib synchronization.lib ntdll.lib advapi32.lib
+RUST_RUNTIME_LIBS = ws2_32.lib bcrypt.lib userenv.lib synchronization.lib ntdll.lib advapi32.lib ole32.lib oleaut32.lib
+# raindrop-d3d9 static lib (wgpu backend, linked into the C d3d9.dll)
+RUST_D3D9LIB = rust\raindrop-d3d9\target\i686-pc-windows-msvc\release\libraindrop_d3d9.lib
 
 # Sync the VERSION macro in the sources from the VERSION file.
 $(VERSION_STAMP): VERSION
@@ -36,17 +38,22 @@ smd: build\ddraw.dll
 
 smd-debug: build\debug\ddraw.dll
 
+rust-d3d9:
+	cd rust\raindrop-d3d9 && cargo build --target i686-pc-windows-msvc --release --features wgpu-backend
+	@if not exist build\rust mkdir build\rust
+	@copy /Y rust\raindrop-d3d9\target\i686-pc-windows-msvc\release\raindrop_d3d9.dll build\rust\d3d9.dll
+
 build:
 	@if not exist build mkdir build
 
 build\debug: build
 	@if not exist build\debug mkdir build\debug
 
-build\d3d9.dll: src\RefRain.c src\RainUpdate.h src\d3dx9_font_compat.h def\d3d9.def build $(VERSION_STAMP)
-	$(CLANG_CL) $(TARGET) $(CFLAGS) /LD src\RefRain.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\d3d9.def user32.lib winmm.lib
+build\d3d9.dll: src\RefRain.c src\RainUpdate.h src\d3dx9_font_compat.h def\d3d9.def $(RUST_D3D9LIB) build $(VERSION_STAMP)
+	$(CLANG_CL) $(TARGET) $(CFLAGS) /LD src\RefRain.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\d3d9.def user32.lib winmm.lib $(RUST_D3D9LIB) $(RUST_RUNTIME_LIBS)
 
-build\debug\d3d9.dll: src\RefRain.c src\RainUpdate.h src\d3dx9_font_compat.h def\d3d9.def build\debug $(VERSION_STAMP)
-	$(CLANG_CL) $(TARGET) $(CFLAGS) /DREFRAIN_DEBUG_BUILD /LD src\RefRain.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\d3d9.def user32.lib winmm.lib
+build\debug\d3d9.dll: src\RefRain.c src\RainUpdate.h src\d3dx9_font_compat.h def\d3d9.def $(RUST_D3D9LIB) build\debug $(VERSION_STAMP)
+	$(CLANG_CL) $(TARGET) $(CFLAGS) /DREFRAIN_DEBUG_BUILD /LD src\RefRain.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\d3d9.def user32.lib winmm.lib $(RUST_D3D9LIB) $(RUST_RUNTIME_LIBS)
 
 build\ddraw.dll: src\Smd\Smd.c src\RainUpdate.h src\Smd\Smd_d3d9.c src\Smd\Smd_controller.c src\Smd\Smd_internal.h rust\raindrop-gpu\include\raindrop_gpu.h $(RUSTLIB) def\ddraw.def build $(VERSION_STAMP)
 	$(CLANG_CL) $(TARGET) $(CFLAGS) $(RUST_INCPATH) /LD src\Smd\Smd.c src\Smd\Smd_d3d9.c src\Smd\Smd_controller.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\ddraw.def /FORCE:MULTIPLE user32.lib gdi32.lib dxguid.lib $(RUSTLIB) $(RUST_RUNTIME_LIBS)

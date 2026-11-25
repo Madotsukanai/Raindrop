@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 use wgpu::{
-    Backends, Device, Extent3d, Instance, InstanceDescriptor, InstanceFlags, Origin3d,
+    Adapter, Backends, Device, Extent3d, Instance, InstanceDescriptor, InstanceFlags, Origin3d,
     PowerPreference, Queue, RequestAdapterOptions, Texture, TextureAspect, TextureDescriptor,
     TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
     TexelCopyBufferLayout, TexelCopyTextureInfo,
@@ -22,8 +22,24 @@ use wgpu::{
 pub struct RgContext {
     #[allow(dead_code)]
     instance: Instance,
+    adapter: Adapter,
     device: Device,
     queue: Queue,
+}
+
+impl RgContext {
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+    pub fn queue(&self) -> &Queue {
+        &self.queue
+    }
+    pub fn instance(&self) -> &Instance {
+        &self.instance
+    }
+    pub fn adapter(&self) -> &Adapter {
+        &self.adapter
+    }
 }
 
 pub struct RgTexture {
@@ -31,6 +47,18 @@ pub struct RgTexture {
     pub(crate) view: TextureView,
     pub(crate) width: u32,
     pub(crate) height: u32,
+}
+
+impl RgTexture {
+    pub fn texture(&self) -> &Texture {
+        &self.texture
+    }
+    pub fn view(&self) -> &TextureView {
+        &self.view
+    }
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
 }
 
 /// Create a wgpu context. Returns null if no adapter/device is available
@@ -50,6 +78,7 @@ pub fn init() -> Option<RgContext> {
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).ok()?;
     Some(RgContext {
         instance,
+        adapter,
         device,
         queue,
     })

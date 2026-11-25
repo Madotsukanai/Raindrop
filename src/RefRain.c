@@ -1,4 +1,4 @@
-#define VERSION "0.3.2"
+#define VERSION "0.3.3"
 #include <windows.h>
 #include <d3d9.h>
 #include <mmsystem.h>
@@ -142,6 +142,7 @@ static const VersionSigs SIGS_STEAM = {
 
 static DWORD  g_BaseDelta = 0;      
 static volatile int g_IsSteam = 0;
+static int g_VersionMatched = 0;
 static GameAddrs g_Addrs;           
 static const GameAddrs *g_A = &ADDRS_DISC;
 static VersionSigs g_Sigs;
@@ -2889,11 +2890,40 @@ void __attribute__((naked)) Hook_LoadStart(void) {
 typedef IDirect3D9* (WINAPI *PFN_Direct3DCreate9)(UINT SDKVersion);
 static PFN_Direct3DCreate9 orig_Direct3DCreate9 = NULL;
 
+// ---- Rust wgpu backend (raindrop-d3d9 crate, statically linked) ---------------
+extern void *__stdcall raindrop_d3d9_create9(unsigned int SDKVersion);
+extern unsigned int __stdcall raindrop_d3d9_abi_version(void);
+static int g_rustBackend = -1; /* -1 unknown, 0 off, 1 on */
+
+static int RustBackendEnabled(void) {
+    if (g_rustBackend < 0) {
+        char path[MAX_PATH], value[64];
+        GetModuleFileNameA(NULL, path, MAX_PATH);
+        char *slash = strrchr(path, '\\');
+        if (slash) *(slash + 1) = 0;
+        strcat(path, "raindrop.ini");
+        GetPrivateProfileStringA("Graphics", "Backend", "system", value, sizeof(value), path);
+        g_rustBackend = (_stricmp(value, "wgpu") == 0) ? 1 : 0;
+    }
+    return g_rustBackend == 1;
+}
+
 #if defined(_MSC_VER)
 IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion) {
 #else
 __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion) {
 #endif
+    /* Rust wgpu backend (raindrop.ini [Graphics] Backend=wgpu). Falls back to the
+     * system d3d9 proxy when the backend is unavailable so the game keeps running. */
+    if (RustBackendEnabled()) {
+        void *obj = raindrop_d3d9_create9(SDKVersion);
+        if (obj) {
+            LogMessage("Direct3DCreate9: Rust wgpu backend (abi=%u)", raindrop_d3d9_abi_version());
+            return (IDirect3D9*)obj;
+        }
+        LogMessage("[Warn] Backend=wgpu requested but the wgpu backend is unavailable; falling back to system d3d9");
+    }
+
     if (!orig_Direct3DCreate9) {
         char sysPath[MAX_PATH];
         UINT len = GetSystemDirectoryA(sysPath, MAX_PATH);
@@ -3530,10 +3560,34 @@ static void InstallHooks(void) {
     InstallViewIdxWatch();
 }
 
+/* True when [p, p+n) is committed and readable. Keeps the signature probes
+ * safe when the DLL is loaded into a process that is not the game. */
+static int AddrReadable(const void *p, size_t n) {
+    const BYTE *addr = (const BYTE*)p, *end = addr + n;
+    while (addr < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0) return 0;
+        if (mbi.State != MEM_COMMIT) return 0;
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+        addr = (BYTE*)mbi.BaseAddress + mbi.RegionSize;
+    }
+    return 1;
+}
+
 static void DetectVersion(void) {
     BYTE *base = (BYTE*)GetModuleHandleA(NULL);
     if (!base) base = (BYTE*)0x400000;
     g_BaseDelta = (DWORD)(DWORD_PTR)base - 0x400000;
+
+    if (!AddrReadable(base + (ADDRS_STEAM.TransSite - 0x400000), 7) ||
+        !AddrReadable(base + (ADDRS_DISC.TransSite - 0x400000), 7) ||
+        !AddrReadable(base + (ADDRS_STEAM.LoadStartSite - 0x400000), 7) ||
+        !AddrReadable(base + (ADDRS_DISC.LoadStartSite - 0x400000), 7)) {
+        g_IsSteam = 0;
+        g_VersionMatched = 0;
+        LogMessage("[Warn] signature sites are not readable (not the game process); hooks skipped");
+        return;
+    }
 
     int isSteam = memcmp(base + (ADDRS_STEAM.TransSite - 0x400000), SIGS_STEAM.Trans, 5) == 0 &&
                   memcmp(base + (ADDRS_STEAM.LoadStartSite - 0x400000), SIGS_STEAM.LoadStart, 7) == 0;
@@ -3541,8 +3595,10 @@ static void DetectVersion(void) {
                  memcmp(base + (ADDRS_DISC.LoadStartSite - 0x400000), SIGS_DISC.LoadStart, 7) == 0;
     if (isSteam) {
         g_IsSteam = 1;
+        g_VersionMatched = 1;
     } else if (isDisc) {
         g_IsSteam = 0;
+        g_VersionMatched = 1;
     } else {
         g_IsSteam = 0;
         LogMessage("[Error] Unknown RefRain.exe build (neither disc nor Steam signature matched); assuming disc version");
@@ -3595,12 +3651,16 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) {
         g_hOurDll = hinstDLL;
         DisableThreadLibraryCalls(hinstDLL);
         DetectVersion();
-        LogMessage("RefRain stage select mod loaded (%s build, image base 0x%08X).",
-                   g_IsSteam ? "Steam" : "Disc", (DWORD)(DWORD_PTR)GetModuleHandleA(NULL));
-        RainUpdateInit(hinstDLL);
-        InstallHooks();
-        CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
-        if (g_PauseDiag) CreateThread(NULL, 0, PauseDiagThread, NULL, 0, NULL);
+        if (g_VersionMatched) {
+            LogMessage("RefRain stage select mod loaded (%s build, image base 0x%08X).",
+                       g_IsSteam ? "Steam" : "Disc", (DWORD)(DWORD_PTR)GetModuleHandleA(NULL));
+            RainUpdateInit(hinstDLL);
+            InstallHooks();
+            CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
+            if (g_PauseDiag) CreateThread(NULL, 0, PauseDiagThread, NULL, 0, NULL);
+        } else {
+            LogMessage("[Warn] host is not RefRain.exe; hooks skipped (graphics backend still available)");
+        }
     }
     return TRUE;
 }
