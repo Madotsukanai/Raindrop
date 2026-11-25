@@ -1,5 +1,17 @@
+.DEFAULT_GOAL := all
 CC = i686-w64-mingw32-gcc
 BUILD = build
+VERSION := $(shell tr -d '\r\n' < VERSION)
+VERSION_SOURCES := src/Smd/Smd.c src/RefRain.c
+VERSION_STAMP := $(BUILD)/.version
+
+# Keep the VERSION macro in the sources in sync with the VERSION file.
+$(VERSION_STAMP): VERSION | $(BUILD)
+	@for f in $(VERSION_SOURCES); do \
+	  sed -i 's|^#define VERSION .*|#define VERSION "$(VERSION)"|' $$f; \
+	done
+	@printf '%s\n' '$(VERSION)' > $@
+	@echo "Version synced: $(VERSION)"
 
 CFLAGS = -O2 -Wall
 SMD_CFLAGS = -O2 -Wall -Wno-unused-function -Wno-unused-variable
@@ -20,8 +32,8 @@ refrain: $(BUILD)/d3d9.dll
 $(BUILD)/d3d9.dll: $(BUILD)/RefRain.o
 	$(CC) -o $@ $^ $(LDFLAGS) -lwinmm
 
-$(BUILD)/RefRain.o: src/RefRain.c src/d3dx9_font_compat.h | $(BUILD)
-	$(CC) -c -o $@ $< $(CFLAGS)
+$(BUILD)/RefRain.o: src/RefRain.c src/d3dx9_font_compat.h src/RainUpdate.h $(VERSION_STAMP) | $(BUILD)
+	$(CC) -c -o $@ src/RefRain.c $(CFLAGS)
 
 # make refrain-debug : same, with logging (raindrop.log) enabled -> build/debug/d3d9.dll
 refrain-debug: $(BUILD)/debug/d3d9.dll
@@ -29,8 +41,8 @@ refrain-debug: $(BUILD)/debug/d3d9.dll
 $(BUILD)/debug/d3d9.dll: $(BUILD)/RefRain_debug.o | $(BUILD)/debug
 	$(CC) -o $@ $^ $(LDFLAGS) -lwinmm
 
-$(BUILD)/RefRain_debug.o: src/RefRain.c src/d3dx9_font_compat.h | $(BUILD)
-	$(CC) -c -o $@ $< $(CFLAGS) -DREFRAIN_DEBUG_BUILD
+$(BUILD)/RefRain_debug.o: src/RefRain.c src/d3dx9_font_compat.h src/RainUpdate.h $(VERSION_STAMP) | $(BUILD)
+	$(CC) -c -o $@ src/RefRain.c $(CFLAGS) -DREFRAIN_DEBUG_BUILD
 
 # make smd : Smd sources -> build/ddraw.dll
 smd: $(BUILD)/ddraw.dll
@@ -41,8 +53,8 @@ smd-debug: $(BUILD)/debug/ddraw.dll
 $(BUILD)/debug/ddraw.dll: $(BUILD)/Smd_debug.o $(BUILD)/Smd_d3d9_debug.o $(BUILD)/Smd_controller_debug.o | $(BUILD)/debug
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldxguid
 
-$(BUILD)/Smd_debug.o: src/Smd/Smd.c src/Smd/Smd_internal.h | $(BUILD)
-	$(CC) -c -o $@ $< $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS)
+$(BUILD)/Smd_debug.o: src/Smd/Smd.c src/Smd/Smd_internal.h src/RainUpdate.h $(VERSION_STAMP) | $(BUILD)
+	$(CC) -c -o $@ src/Smd/Smd.c $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS)
 
 $(BUILD)/Smd_d3d9_debug.o: src/Smd/Smd_d3d9.c src/Smd/Smd_internal.h | $(BUILD)
 	$(CC) -c -o $@ $< $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS)
@@ -53,8 +65,8 @@ $(BUILD)/Smd_controller_debug.o: src/Smd/Smd_controller.c src/Smd/Smd_internal.h
 $(BUILD)/ddraw.dll: $(BUILD)/Smd.o $(BUILD)/Smd_d3d9.o $(BUILD)/Smd_controller.o
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldxguid
 
-$(BUILD)/Smd.o: src/Smd/Smd.c src/Smd/Smd_internal.h | $(BUILD)
-	$(CC) -c -o $@ $< $(SMD_CFLAGS) $(SMD_DEFS)
+$(BUILD)/Smd.o: src/Smd/Smd.c src/Smd/Smd_internal.h src/RainUpdate.h $(VERSION_STAMP) | $(BUILD)
+	$(CC) -c -o $@ src/Smd/Smd.c $(SMD_CFLAGS) $(SMD_DEFS)
 
 $(BUILD)/Smd_d3d9.o: src/Smd/Smd_d3d9.c src/Smd/Smd_internal.h | $(BUILD)
 	$(CC) -c -o $@ $< $(SMD_CFLAGS) $(SMD_DEFS)

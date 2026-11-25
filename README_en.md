@@ -13,10 +13,24 @@ Choose the graphics API in `raindrop.ini` in the same directory as `Rain.exe`:
 ```ini
 [General]
 PrEx=1
+UpdateCheck=1
+UpdateSkip=
 [Graphics]
 API=DirectDraw
 VSync=auto
 ```
+
+| Key | Default | Description |
+|---|---|---|
+| `PrEx` | `1` | Enables the practice extensions (boss seek, rebuilt Practice menu, EX practice flow). |
+| `UpdateCheck` | `1` | Checks GitHub Releases at startup and asks whether to update when a newer version exists. |
+| `UpdateSkip` | (empty) | The tag of a declined release is recorded automatically, so that version is not offered again. No manual editing needed. |
+| `API` | `DirectDraw` | Graphics API selection (see below). |
+| `VSync` | `auto` | Display synchronisation of the built-in D3D9 implementation (see below). |
+
+Boolean values use the same format for `PrEx`, `UpdateCheck`, `VSync` and the `SMD_VSYNC` environment variable: `1` / `on` / `true` / `yes` (true) and `0` / `off` / `false` / `no` (false), case-insensitively. `VSync` additionally accepts `auto`.
+
+Missing entries are added automatically at startup.
 
 `API=DirectDraw` uses the system DirectDraw implementation and falls back to D3D9 if it is unavailable. Set `API=D3D9` to use the built-in D3D9 implementation from startup. If the file or setting is missing, `DirectDraw` is used.<br>
 On Wine/Proton, keeping the default `DirectDraw` is recommended.
@@ -34,6 +48,14 @@ VSync=auto
 ### RefRain
 
 Download `d3d9.dll` from [Releases](https://github.com/Madotsukanai/Raindrop/releases/latest), copy it to the same directory as the disc-version `RefRain.exe` (SHA-256: `db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78`) or the Steam-version `RefRain.exe` (SHA-256: `1941799d114dacbbd83a3d40c69ad4f5063ee4a175c591dc155d5deca4a6e959`), and start the game. The DLL detects which build is running at load time.
+
+`raindrop.ini` next to `RefRain.exe` uses only the auto-update settings. Missing files and entries are created automatically.
+
+```ini
+[General]
+UpdateCheck=1
+UpdateSkip=
+```
 
 To open the Practice menu, move the cursor to “DIVE 2 M.R.S.” and press the key assigned to Concept Reactor.
 

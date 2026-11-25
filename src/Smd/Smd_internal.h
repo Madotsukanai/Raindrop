@@ -5,6 +5,7 @@
 
 void SmdLog(const char *format, ...);
 void SmdLogOpen(void);
+int SmdIniBool(const char *value, int def);
 void SmdHookPrimary(IDirectDrawSurface7 *surface);
 void SmdTriggerWindowFallback(const char *reason);
 int SmdPatchVtblSlot(void **slot, void *hook, void **original);

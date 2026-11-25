@@ -8,6 +8,12 @@ CLANG_CL = clang-cl
 TARGET = --target=i686-pc-windows-msvc
 CFLAGS = /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS
 LINKFLAGS = /MACHINE:X86 /INCREMENTAL:NO /MANIFEST:NO
+VERSION_STAMP = build\.version-nmake
+
+# Sync the VERSION macro in the sources from the VERSION file.
+$(VERSION_STAMP): VERSION
+	@if not exist build mkdir build
+	@powershell -NoProfile -ExecutionPolicy Bypass -File tools\sync_version.ps1 -Stamp $(VERSION_STAMP)
 
 all: build\d3d9.dll build\ddraw.dll
 
@@ -27,16 +33,16 @@ build:
 build\debug: build
 	@if not exist build\debug mkdir build\debug
 
-build\d3d9.dll: src\RefRain.c src\d3dx9_font_compat.h def\d3d9.def build
+build\d3d9.dll: src\RefRain.c src\RainUpdate.h src\d3dx9_font_compat.h def\d3d9.def build $(VERSION_STAMP)
 	$(CLANG_CL) $(TARGET) $(CFLAGS) /LD src\RefRain.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\d3d9.def user32.lib winmm.lib
 
-build\debug\d3d9.dll: src\RefRain.c src\d3dx9_font_compat.h def\d3d9.def build\debug
+build\debug\d3d9.dll: src\RefRain.c src\RainUpdate.h src\d3dx9_font_compat.h def\d3d9.def build\debug $(VERSION_STAMP)
 	$(CLANG_CL) $(TARGET) $(CFLAGS) /DREFRAIN_DEBUG_BUILD /LD src\RefRain.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\d3d9.def user32.lib winmm.lib
 
-build\ddraw.dll: src\Smd\Smd.c src\Smd\Smd_d3d9.c src\Smd\Smd_controller.c src\Smd\Smd_internal.h def\ddraw.def build
+build\ddraw.dll: src\Smd\Smd.c src\RainUpdate.h src\Smd\Smd_d3d9.c src\Smd\Smd_controller.c src\Smd\Smd_internal.h def\ddraw.def build $(VERSION_STAMP)
 	$(CLANG_CL) $(TARGET) $(CFLAGS) /LD src\Smd\Smd.c src\Smd\Smd_d3d9.c src\Smd\Smd_controller.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\ddraw.def /FORCE:MULTIPLE user32.lib gdi32.lib dxguid.lib
 
-build\debug\ddraw.dll: src\Smd\Smd.c src\Smd\Smd_d3d9.c src\Smd\Smd_controller.c src\Smd\Smd_internal.h def\ddraw.def build\debug
+build\debug\ddraw.dll: src\Smd\Smd.c src\RainUpdate.h src\Smd\Smd_d3d9.c src\Smd\Smd_controller.c src\Smd\Smd_internal.h def\ddraw.def build\debug $(VERSION_STAMP)
 	$(CLANG_CL) $(TARGET) $(CFLAGS) /DSMD_DEBUG_BUILD /LD src\Smd\Smd.c src\Smd\Smd_d3d9.c src\Smd\Smd_controller.c /link $(LINKFLAGS) /OUT:$@ /DEF:def\ddraw.def /FORCE:MULTIPLE user32.lib gdi32.lib dxguid.lib
 
 clean:

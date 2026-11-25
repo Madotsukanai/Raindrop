@@ -2061,7 +2061,8 @@ static int D7E_ConfigVsync(UINT refresh) {
     {
         const char *env = getenv("SMD_VSYNC");
         if (env) {
-            v = atoi(env) != 0;
+            v = SmdIniBool(env, -1);
+            if (v < 0) v = atoi(env) != 0;
             g_d7VsyncSrc = "SMD_VSYNC environment";
         } else {
             char path[MAX_PATH], value[32];
@@ -2072,18 +2073,18 @@ static int D7E_ConfigVsync(UINT refresh) {
                 SmdLog("Graphics: added the missing VSync entry (VSync=auto)");
                 strcpy(value, "auto");
             }
-            if (!_stricmp(value, "on") || !_stricmp(value, "1") || !_stricmp(value, "yes")) {
-                v = 1;
-                g_d7VsyncSrc = "raindrop.ini VSync=on";
-            } else if (!_stricmp(value, "off") || !_stricmp(value, "0") || !_stricmp(value, "no")) {
-                v = 0;
-                g_d7VsyncSrc = "raindrop.ini VSync=off";
-            } else if (SmdIsWine()) {
-                v = 0;
-                g_d7VsyncSrc = "auto (Wine/Proton: compositor vblank, async present)";
-            } else {
-                v = (refresh >= 59 && refresh <= 61) ? 1 : 0;
-                g_d7VsyncSrc = "auto (display refresh)";
+            {
+                int flag = SmdIniBool(value, -1);
+                if (flag >= 0) {
+                    v = flag;
+                    g_d7VsyncSrc = flag ? "raindrop.ini VSync=on" : "raindrop.ini VSync=off";
+                } else if (SmdIsWine()) {
+                    v = 0;
+                    g_d7VsyncSrc = "auto (Wine/Proton: compositor vblank, async present)";
+                } else {
+                    v = (refresh >= 59 && refresh <= 61) ? 1 : 0;
+                    g_d7VsyncSrc = "auto (display refresh)";
+                }
             }
         }
     }

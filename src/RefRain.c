@@ -1,3 +1,4 @@
+#define VERSION "0.3.1"
 #include <windows.h>
 #include <d3d9.h>
 #include <mmsystem.h>
@@ -286,6 +287,10 @@ static inline void LogMessage(const char *format, ...) {
     (void)format;
 }
 #endif
+
+#define Log LogMessage
+#include "RainUpdate.h"
+#undef Log
 
 struct Vertex2D {
     float x, y, z, rhw;
@@ -1050,6 +1055,7 @@ static int ThiscallCallInput(DWORD obj, DWORD slotOff) {
 }
 
 __attribute__((used)) static void PreTickInputPoll(void) {
+    RainUpdateTick();
     if (!g_LatQpcFreq) return;
 
     LARGE_INTEGER li;
@@ -3678,6 +3684,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) {
         DetectVersion();
         LogMessage("RefRain stage select mod loaded (%s build, image base 0x%08X).",
                    g_IsSteam ? "Steam" : "Disc", (DWORD)(DWORD_PTR)GetModuleHandleA(NULL));
+        RainUpdateInit(hinstDLL);
         InstallHooks();
         CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
         if (g_PauseDiag) CreateThread(NULL, 0, PauseDiagThread, NULL, 0, NULL);

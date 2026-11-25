@@ -1,3 +1,4 @@
+#define VERSION "0.3.1"
 #define CINTERFACE
 #define COBJMACROS
 #define DIRECTINPUT_VERSION 0x0800
@@ -9,6 +10,7 @@
 #include <mmreg.h>
 #include <dsound.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,10 +74,21 @@ void SmdLog(const char *fmt, ...) { (void)fmt; }
 
 void SmdLogOpen(void) { LogOpen(); }
 #define Log SmdLog
+#include "../RainUpdate.h"
 
 /* [General] section of raindrop.ini.  PrEx controls the practice extensions (boss seek, the
    rebuilt Practice menu behaviour, the EX practice flow); every other mod feature is unaffected. */
 static int g_PrEx = 1;
+
+/* Shared boolean format for every ini flag: 1/on/true/yes and 0/off/false/no, case-insensitive.
+   Unrecognised values keep the caller's default (used by VSync=auto). */
+int SmdIniBool(const char *value, int def) {
+    if (!_stricmp(value, "1") || !_stricmp(value, "on") ||
+        !_stricmp(value, "true") || !_stricmp(value, "yes")) return 1;
+    if (!_stricmp(value, "0") || !_stricmp(value, "off") ||
+        !_stricmp(value, "false") || !_stricmp(value, "no")) return 0;
+    return def;
+}
 
 /* finds the "[name]" section header case-insensitively; NULL when absent */
 static char *IniFindSection(char *buf, const char *name) {
@@ -93,7 +106,7 @@ static char *IniFindSection(char *buf, const char *name) {
    "[General]\r\nPrEx=1\r\n\r\n" placed in front of [Graphics] (or at the very top), so the
    sections read in [General] -> [Graphics] order */
 static void IniAddGeneralSection(const char *path) {
-    static const char prefix[] = "[General]\r\nPrEx=1\r\n\r\n";
+    static const char prefix[] = "[General]\r\nPrEx=1\r\nUpdateCheck=1\r\nUpdateSkip=\r\n\r\n";
     size_t plen = sizeof(prefix) - 1;
     FILE *f = fopen(path, "rb");
     long fsize;
@@ -179,7 +192,7 @@ static void LoadGeneralConfig(void) {
         HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
                                   FILE_ATTRIBUTE_NORMAL, NULL);
         if (file != INVALID_HANDLE_VALUE) {
-            static const char defaults[] = "[General]\r\nPrEx=1\r\n\r\n[Graphics]\r\nAPI=DirectDraw\r\nVSync=auto\r\n";
+            static const char defaults[] = "[General]\r\nPrEx=1\r\nUpdateCheck=1\r\nUpdateSkip=\r\n\r\n[Graphics]\r\nAPI=DirectDraw\r\nVSync=auto\r\n";
             DWORD written;
             WriteFile(file, defaults, (DWORD)(sizeof(defaults) - 1), &written, NULL);
             CloseHandle(file);
@@ -200,10 +213,27 @@ static void LoadGeneralConfig(void) {
                 Log("Graphics: added the missing VSync entry (VSync=auto)");
             }
         }
+        {
+            char updateVal[32];
+            GetPrivateProfileStringA("General", "UpdateCheck", "\x1notfound", updateVal, sizeof(updateVal), path);
+            if (strcmp(updateVal, "\x1notfound") == 0) {
+                WritePrivateProfileStringA("General", "UpdateCheck", "1", path);
+                Log("General: added the missing UpdateCheck entry (UpdateCheck=1)");
+            }
+        }
+        {
+            char skipVal[64];
+            GetPrivateProfileStringA("General", "UpdateSkip", "\x1notfound", skipVal, sizeof(skipVal), path);
+            if (strcmp(skipVal, "\x1notfound") == 0) {
+                WritePrivateProfileStringA("General", "UpdateSkip", "", path);
+                Log("General: added the missing UpdateSkip entry");
+            }
+        }
     }
     GetPrivateProfileStringA("General", "PrEx", "1", value, sizeof(value), path);
-    g_PrEx = _stricmp(value, "1") == 0 || _stricmp(value, "on") == 0 || _stricmp(value, "true") == 0;
+    g_PrEx = SmdIniBool(value, 1);
     Log("General: practice extensions %s (PrEx=%s from raindrop.ini)", g_PrEx ? "enabled" : "disabled", value);
+    GetPrivateProfileStringA("General", "UpdateCheck", "1", value, sizeof(value), path);
 }
 
 static void LogWindowsVersion(void) {
@@ -6521,6 +6551,8 @@ static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
     double remMs;
     int vsync = SmdD3D9GetVsync();
 
+    RainUpdateTick();
+
 #ifdef SMD_DEBUG_BUILD
     g_mainThreadId = GetCurrentThreadId();
     InterlockedIncrement(&g_frameSeq);
@@ -6705,7 +6737,6 @@ static void PatchExNoReplaySave(void) {
     SmdLog("ExNoReplaySave: patched %d call site(s)", n);
 }
 
-
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
@@ -6718,6 +6749,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         LogWindowsVersion();
         InitFallbackInstance();
         LoadGeneralConfig();
+        RainUpdateInit((HMODULE)inst);
         PatchColorDepth32();
         PatchForceWindowMode();
         PatchTitleCancel();

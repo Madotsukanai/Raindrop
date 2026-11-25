@@ -15,10 +15,24 @@
 ```ini
 [General]
 PrEx=1
+UpdateCheck=1
+UpdateSkip=
 [Graphics]
 API=DirectDraw
 VSync=auto
 ```
+
+| 項目 | 既定値 | 内容 |
+|---|---|---|
+| `PrEx` | `1` | プラクティス拡張（ボスシーク、プラクティスメニュー、EXプラクティス）の有効/無効。 |
+| `UpdateCheck` | `1` | 起動時にGitHub Releasesを確認し、最新版があれば更新するか尋ねる。 |
+| `UpdateSkip` | （空） | 更新を断ったバージョンタグが自動記録され、そのバージョンでは再び尋ねない。手動設定不要。 |
+| `API` | `DirectDraw` | グラフィックスAPIの選択（下記参照）。 |
+| `VSync` | `auto` | 内蔵D3D9実装の表示同期（下記参照）。 |
+
+真偽値は`PrEx` / `UpdateCheck` / `VSync` / 環境変数`SMD_VSYNC`のいずれも`1` / `on` / `true` / `yes`（真）と`0` / `off` / `false` / `no`（偽）を同じ書式で使用できます（大文字小文字を区別しません）。`VSync`はさらに`auto`を指定できます。
+
+存在しない項目は起動時に自動で追加されます。
 
 `API=DirectDraw`はシステムのDirectDrawを使用します。利用できない場合はD3D9へフォールバックします。`API=D3D9`にすると、起動時から内蔵D3D9実装を使用します。ファイルまたは設定がない場合は`DirectDraw`を使用します。<br>
 Wine/Protonではデフォルトの`DirectDraw`のままにすることを推奨します。
@@ -36,6 +50,14 @@ VSync=auto
 ### RefRain
 
 [Releases](https://github.com/Madotsukanai/Raindrop/releases/latest)から`d3d9.dll`をダウンロードし、ディスク版`RefRain.exe` (SHA-256: `db092baa547241a0217ca41be8538672b79094f671884f92a32c06943c857e78`)またはSteam版`RefRain.exe` (SHA-256: 1941799d114dacbbd83a3d40c69ad4f5063ee4a175c591dc155d5deca4a6e959)と同じディレクトリにコピーしてゲームを起動してください。
+
+`RefRain.exe`と同じディレクトリの`raindrop.ini`は自動更新の設定のみを使用します。ファイルや項目がなければ自動で追加されます。
+
+```ini
+[General]
+UpdateCheck=1
+UpdateSkip=
+```
 
 「DIVE 2 M.R.S.」にカーソルを合わせ、コンセプトリアクターを入力しながら決定するとプラクティスメニューが開きます。
 
