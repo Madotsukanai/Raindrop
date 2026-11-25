@@ -33,7 +33,6 @@ Boolean values use the same format for `PrEx`, `UpdateCheck`, `VSync` and the `S
 Missing entries are added automatically at startup.
 
 `Backend=wgpu` (the default) uses the built-in DirectDraw7/Direct3D7 emulation implemented on wgpu — a Rust replacement for the game's DirectDraw/Direct3D7 usage. Only if wgpu cannot be initialised, it falls back to the built-in D3D9 implementation at runtime (the ini file is never rewritten). Set `Backend=system` to use the built-in D3D9 implementation on top of the system d3d9.dll from startup. If the file or setting is missing, `wgpu` is used.<br>
-On Wine/Proton, keeping the default `wgpu` is recommended (the system DirectDraw/Direct3D7 is unusable under Wine).
 
 Display synchronisation of the built-in graphics implementations is selected with `VSync`.
 
@@ -61,7 +60,9 @@ To open the Practice menu, move the cursor to “DIVE 2 M.R.S.” and press the 
 
 ## Building
 ### Windows
-Use `clang-cl` from an x86 Native Tools Command Prompt. Add the LLVM/Clang tools in Visual Studio Installer, then run this from the repository root. `NMakefile` uses the MSVC Windows SDK, `link.exe`, and libraries to produce x86 DLLs. The bundled D3DX9 compatibility declarations mean the legacy DirectX SDK is not required:
+Use `clang-cl` from an x86 Native Tools Command Prompt. Add the LLVM/Clang tools in Visual Studio Installer and install Rust with the 32-bit MSVC target. Running this from the repository root also builds the Rust crates (wgpu) required by `ddraw.dll` with cargo. `NMakefile` uses the MSVC Windows SDK, `link.exe`, and libraries to produce x86 DLLs. The bundled D3DX9 compatibility declarations mean the legacy DirectX SDK is not required.
+
+`nmake /f NMakefile clean` removes both `build/` and the Rust build artefacts.
 
 ```bat
 nmake /f NMakefile smd            :: Samidare: build\ddraw.dll

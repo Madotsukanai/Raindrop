@@ -35,8 +35,6 @@ VSync=auto
 存在しない項目は起動時に自動で追加されます。
 
 `Backend=wgpu`（既定）はwgpu上に実装した内蔵DirectDraw7/Direct3D7エミュレーション（DirectDraw/Direct3D7をwgpuで置き換えるRust実装）を使用します。wgpuを初期化できない場合のみ、実行時に内蔵D3D9実装へフォールバックします（`raindrop.ini`は書き換えません）。`Backend=system`にすると、システムのd3d9.dll上で動く内蔵D3D9実装を起動時から使用します。ファイルまたは設定がない場合は`wgpu`を使用します。<br>
-Wine/Protonではデフォルトの`wgpu`のままにすることを推奨します（システムのDirectDraw/D3D7はWineでは利用できないため）。
-
 内蔵グラフィックス実装の表示同期は`VSync`で選択できます。
 
 ```ini
@@ -63,7 +61,9 @@ UpdateSkip=
 
 ## ビルド
 ### Windows
-Visual Studioのx86 Native Tools環境で`clang-cl`を使います。Visual Studio InstallerでLLVM/Clangツールを追加し、リポジトリのルートで次を実行してください。`NMakefile`はMSVCのWindows SDK、`link.exe`およびライブラリを使ってx86 DLLを作成します。D3DX9ヘッダーは同梱の互換定義を使うため、旧DirectX SDKは不要です。
+Visual Studioのx86 Native Tools環境で`clang-cl`を使います。Visual Studio InstallerでLLVM/Clangツールを追加し、Rust（MSVCターゲット、32bit）をインストールしてください。リポジトリのルートで次を実行すると、`ddraw.dll`に必要なRustクレート（wgpu）もcargoで自動ビルドされます。`NMakefile`はMSVCのWindows SDK、`link.exe`およびライブラリを使ってx86 DLLを作成します。D3DX9ヘッダーは同梱の互換定義を使うため、旧DirectX SDKは不要です。
+
+`nmake /f NMakefile clean`は`build/`とRustクレートのビルド成果物を両方削除します。
 
 ```bat
 nmake /f NMakefile smd            :: 五月雨用 build\ddraw.dll
