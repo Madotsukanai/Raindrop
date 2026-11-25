@@ -586,8 +586,7 @@ static void RainUpdateTick(void) {
              "Raindrop に新しいバージョンがあります。\n\n"
              "現在のバージョン: %s\n最新のバージョン: %s\n\n"
              "%s\n\n"
-             "ダウンロードして更新しますか？\n"
-             "（更新はゲーム終了後に反映されます。再起動してください）",
+             "ダウンロードして更新しますか？\n",
              cur, tag, notes);
     ret = UpdateMessageBox("Raindrop アップデート", text,
                            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST);
