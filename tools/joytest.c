@@ -1,21 +1,21 @@
-/*
- * joytest.exe -- standalone controller diagnostic for Rain.exe / Smd.
- *
- * Reads the pad through every API layer a Windows program can use and prints what each one reports, so it
- * is visible WHICH layer (if any) receives input from the controller:
- *
- *   winmm  : joyGetDevCapsA / joyGetPosEx, ids 0..15        (what Rain.exe itself calls, via the Smd shim)
- *   XInput : XInputGetState users 0..3
- *   DInput : every attached game controller, read twice
- *              "std" = the predefined c_dfDIJoystick2 data format (DIDFT_ANYINSTANCE)
- *              "smd" = the custom data format Smd_controller.c currently uses (fixed axis instances)
- *   RawHID : the HID devices Windows/Wine exposes (list only)
- *
- * Usage:   wine joytest.exe [seconds]        (default 20)
- * Press buttons / move sticks / the d-pad while it runs.  At the end a summary says which sources saw input.
- *
- * Build:   i686-w64-mingw32-gcc -O2 -Wall -Wno-format -s -o joytest.exe joytest.c -lwinmm -ldinput8 -ldxguid -luuid -luser32
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #define WIN32_LEAN_AND_MEAN
 #define DIRECTINPUT_VERSION 0x0800
 #define CINTERFACE
@@ -27,7 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ---------------------------------------------------------------- helpers */
+
 static DWORD g_t0;
 #define TS ((unsigned)(GetTickCount() - g_t0))
 #define MAXSRC 64
@@ -48,7 +48,7 @@ static int SrcAdd(const char *fmt, ...) {
     return i;
 }
 
-/* ---------------------------------------------------------------- winmm */
+
 typedef struct { int src; int have; JOYINFOEX last; int lastRet; } WinmmSlot;
 static WinmmSlot g_wm[16];
 static UINT g_wmCount;
@@ -109,7 +109,7 @@ static void WinmmPoll(void) {
     }
 }
 
-/* ---------------------------------------------------------------- XInput */
+
 typedef struct { WORD wButtons; BYTE lt, rt; SHORT lx, ly, rx, ry; } XIPad;
 typedef struct { DWORD packet; XIPad pad; } XIState;
 typedef DWORD (WINAPI *PF_XIGet)(DWORD, XIState*);
@@ -160,13 +160,13 @@ static void XInputPoll(void) {
     }
 }
 
-/* ---------------------------------------------------------------- DirectInput */
+
 typedef struct {
     char name[80];
     char inst[80];
     DWORD type;
     GUID guid;
-    LPDIRECTINPUTDEVICE8A dev[2];       /* 0 = std format, 1 = smd format */
+    LPDIRECTINPUTDEVICE8A dev[2];       
     int src[2];
     DIJOYSTATE2 last[2];
     int have[2];
@@ -177,7 +177,7 @@ static int g_diN;
 static LPDIRECTINPUT8A g_dinput;
 static HWND g_hwnd;
 
-/* the custom format Smd_controller.c uses today (axes with fixed instance numbers) */
+
 static DIOBJECTDATAFORMAT g_smdObj[140];
 static DIDATAFORMAT g_smdFmt;
 static const DWORD g_smdAxisInst[8] = { 0, 0, 0, 0, 0, 0, 0, 1 };
@@ -265,7 +265,7 @@ static BOOL CALLBACK DiEnumCb(const DIDEVICEINSTANCEA *inst, void *ctx) {
             d->min[k] = -1000;
             d->max[k] = 1000;
             if (FAILED(hr)) {
-                /* fall back to whatever range the device reports for X */
+                
                 DIPROPRANGE g;
                 memset(&g, 0, sizeof(g));
                 g.diph.dwSize = sizeof(g);
@@ -343,7 +343,7 @@ static void DirectInputPoll(void) {
     }
 }
 
-/* ---------------------------------------------------------------- raw HID list */
+
 static void RawList(void) {
     UINT n = 0, i;
     RAWINPUTDEVICELIST *list;
@@ -377,7 +377,7 @@ static void RawList(void) {
     free(list);
 }
 
-/* ---------------------------------------------------------------- main */
+
 int main(int argc, char **argv) {
     int seconds = argc > 1 ? atoi(argv[1]) : 20;
     int i;
@@ -405,7 +405,7 @@ int main(int argc, char **argv) {
     }
     printf("\n--- summary: which sources saw input ---\n");
     for (i = 0; i < g_srcN; i++) {
-        /* XInput users that never existed are not interesting */
+        
         if (strncmp(g_src[i].name, "XInput user", 11) == 0 && !g_src[i].seen && !g_xiWasConnected[g_src[i].name[12] - '0'])
             continue;
         printf("  %-60s %s\n", g_src[i].name, g_src[i].seen ? "INPUT SEEN" : "no input (neutral all the time)");

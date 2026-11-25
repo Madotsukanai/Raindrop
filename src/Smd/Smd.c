@@ -1,4 +1,4 @@
-#define VERSION "0.3.1"
+#define VERSION "0.3.2"
 #define CINTERFACE
 #define COBJMACROS
 #define DIRECTINPUT_VERSION 0x0800
@@ -76,12 +76,12 @@ void SmdLogOpen(void) { LogOpen(); }
 #define Log SmdLog
 #include "../RainUpdate.h"
 
-/* [General] section of raindrop.ini.  PrEx controls the practice extensions (boss seek, the
-   rebuilt Practice menu behaviour, the EX practice flow); every other mod feature is unaffected. */
+
+
 static int g_PrEx = 1;
 
-/* Shared boolean format for every ini flag: 1/on/true/yes and 0/off/false/no, case-insensitive.
-   Unrecognised values keep the caller's default (used by VSync=auto). */
+
+
 int SmdIniBool(const char *value, int def) {
     if (!_stricmp(value, "1") || !_stricmp(value, "on") ||
         !_stricmp(value, "true") || !_stricmp(value, "yes")) return 1;
@@ -90,7 +90,7 @@ int SmdIniBool(const char *value, int def) {
     return def;
 }
 
-/* finds the "[name]" section header case-insensitively; NULL when absent */
+
 static char *IniFindSection(char *buf, const char *name) {
     size_t len = strlen(name);
     char *p = buf;
@@ -102,9 +102,9 @@ static char *IniFindSection(char *buf, const char *name) {
     return NULL;
 }
 
-/* when the ini exists but has no [General] section yet, rewrite it with
-   "[General]\r\nPrEx=1\r\n\r\n" placed in front of [Graphics] (or at the very top), so the
-   sections read in [General] -> [Graphics] order */
+
+
+
 static void IniAddGeneralSection(const char *path) {
     static const char prefix[] = "[General]\r\nPrEx=1\r\nUpdateCheck=1\r\nUpdateSkip=\r\n\r\n";
     size_t plen = sizeof(prefix) - 1;
@@ -123,9 +123,9 @@ static void IniAddGeneralSection(const char *path) {
     if (!IniFindSection(buf, "general")) {
         char *g = IniFindSection(buf, "graphics");
         size_t gAt = g ? (size_t)(g - buf) : 0;
-        size_t nl = (g && gAt > 0 && buf[gAt - 1] != '\n') ? 2 : 0;  /* prepend CRLF when the
-                                                                       [Graphics] line is not
-                                                                       preceded by one */
+        size_t nl = (g && gAt > 0 && buf[gAt - 1] != '\n') ? 2 : 0;  
+
+
         char *out = (char*)malloc(gAt + plen + nl + (size_t)fsize - gAt + 1);
         if (out) {
             size_t at = 0;
@@ -156,8 +156,8 @@ static void IniAddGeneralSection(const char *path) {
     free(buf);
 }
 
-/* appends "[Graphics]\\r\\nAPI=DirectDraw\\r\\nVSync=auto\\r\\n" to the end when the ini exists without a
-   [Graphics] section (DirectDraw is the same default the API selector uses unconfigured) */
+
+
 static void IniAddGraphicsSection(const char *path) {
     static const char block[] = "\r\n[Graphics]\r\nAPI=DirectDraw\r\nVSync=auto\r\n";
     FILE *f = fopen(path, "rb");
@@ -173,7 +173,7 @@ static void IniAddGraphicsSection(const char *path) {
     buf[fsize] = 0;
     fclose(f);
     if (!IniFindSection(buf, "graphics")) {
-        size_t skip = ((fsize > 0) && buf[fsize - 1] == '\n') ? 2 : 0;  /* block starts with CRLF */
+        size_t skip = ((fsize > 0) && buf[fsize - 1] == '\n') ? 2 : 0;  
         f = fopen(path, "ab");
         if (f) {
             fwrite(block + skip, 1, sizeof(block) - 1 - skip, f);
@@ -286,8 +286,8 @@ void SmdTriggerWindowFallback(const char *why) {
 
     if (!g_AutoWindowFallback || g_fallbackInstance) return;
     Log("WindowFallback: %s -> relaunching in window mode", why);
-    /* Hide this process's windows at once: starting the new process and shutting down can take a while and a
-       visible window that does not pump messages shows up as "not responding". */
+    
+
     EnumWindows(HideOwnWindowProc, 0);
     GetModuleFileNameA(NULL, exe, MAX_PATH);
     strcpy(dir, exe);
@@ -310,9 +310,9 @@ void SmdTriggerWindowFallback(const char *why) {
         free(cmd);
         Log("WindowFallback: new process started (pid=%lu), exiting", (unsigned long)newPid);
         if (g_log) fflush(g_log);
-        /* TerminateProcess instead of ExitProcess: ExitProcess runs every DLL's detach code and waits for
-           other threads (audio, timing, controller threads) and DirectX cleanup, which can hang when one of
-           them holds a lock.  The new process only needs this one to be gone. */
+        
+
+
         TerminateProcess(GetCurrentProcess(), 0);
         ExitProcess(0);
     }
@@ -504,12 +504,12 @@ static void FlushStats(LONGLONG now) {
     g_presses = 0;
 }
 
-/* Press->present latency tracking shared by both present paths (real ddraw Blt/Flip and the
-   D3D7 emu Present): every observed key press is timestamped by KeyThread, and each frame
-   present consumes the pending presses.  latFirst = press -> the first present after the press
-   (assuming the press was captured by that frame's input read), latGuar = press -> the first
-   present started at least one full boundary after the press (press is guaranteed to be in
-   that frame's input sample). */
+
+
+
+
+
+
 static void PressShared(LONGLONG d) {
     EnterCriticalSection(&g_cs);
     {
@@ -521,10 +521,10 @@ static void PressShared(LONGLONG d) {
                 StatAdd(&g_stLatFirst, TicksToMs(d - p->t));
                 p->counted = 1;
 #ifdef SMD_DEBUG_BUILD
-                /* Per-press detail: press -> this present done, and where in the frame the press
-                   landed relative to the frame start (previous present done).  A press after the
-                   frame start was still sampled by that frame's input read; a press before it had
-                   to wait for the next frame. */
+                
+
+
+
                 SmdLog("KeyLat: press->present %.2f ms (press->frame end %.2f, frame start->press %.2f)",
                        TicksToMs(d - p->t), TicksToMs(d - p->t),
                        frameStart ? TicksToMs(p->t - frameStart) : -1.0);
@@ -585,9 +585,9 @@ static void FinishPresent(IDirectDrawSurface7 *s, int flip, LARGE_INTEGER a, LAR
     OnPresent(a.QuadPart, b.QuadPart, c.QuadPart, d.QuadPart, flip, 0);
 }
 
-/* Key latency measurement: debug builds always observe presses (release builds require
-   SMD_KEYLAT=1).  Every observed key press is timestamped, and the stats line reports
-   press->present latency continuously. */
+
+
+
 #ifdef SMD_DEBUG_BUILD
 #define SMD_KEYLAT_AUTORUN 1
 #else
@@ -656,8 +656,8 @@ static void SmdWineForceBorderless(HWND hwnd) {
                  SWP_FRAMECHANGED | SWP_SHOWWINDOW);
 }
 
-/* Wine: when the game blits to the primary in "fullscreen", the 640x480 image can
-   land in the top-left of a larger (or badly sized) window.  Stretch to the window. */
+
+
 static void SmdWineStretchPrimary(IDirectDrawSurface7 *self, LPDIRECTDRAWSURFACE7 src, LPRECT sr) {
     static int logged, fsLogged, dbg;
     HDC wdc = NULL;
@@ -678,8 +678,8 @@ static void SmdWineStretchPrimary(IDirectDrawSurface7 *self, LPDIRECTDRAWSURFACE
     memset(&sd, 0, sizeof(sd)); sd.dwSize = sizeof(sd);
     if (SUCCEEDED(IDirectDrawSurface7_GetSurfaceDesc(src, &sd)) && sd.dwWidth && sd.dwHeight) { sw = (int)sd.dwWidth; sh = (int)sd.dwHeight; }
     if (sr) { sw = sr->right - sr->left; sh = sr->bottom - sr->top; }
-    /* Wine reports a 1920x1080 desktop-sized surface in "fullscreen" while rendering
-       640x480 content into its top-left; stretch the game rect to the window. */
+    
+
     if (sw > 800 || sh > 600) { sw = 640; sh = 480; sr = NULL; }
     if (cw <= sw + 8 && ch <= sh + 8) {
         SmdWineForceBorderless(hw);
@@ -690,8 +690,8 @@ static void SmdWineStretchPrimary(IDirectDrawSurface7 *self, LPDIRECTDRAWSURFACE
         if (dbg < 5) { dbg++; Log("WineStretch: skip client=%dx%d src=%dx%d hw=%p", cw, ch, sw, sh, hw); }
         return;
     }
-    /* Blit to the primary DC (overwrites the 640x480 top-left region), then
-       stretch that region to fill the window. */
+    
+
     {
         HDC pdc = NULL;
         {
@@ -719,9 +719,9 @@ static void SmdWineStretchPrimary(IDirectDrawSurface7 *self, LPDIRECTDRAWSURFACE
     }
 }
 
-/* Real-ddraw present pacing was removed for minimum input latency: the previous pre-present
-   alignment wait (up to ~4 ms) delayed every present, so with a tick-aligned game loop the
-   blit/flip is submitted as soon as the frame is ready. */
+
+
+
 
 static HRESULT STDMETHODCALLTYPE Hook_Blt(IDirectDrawSurface7 *self, LPRECT dr, LPDIRECTDRAWSURFACE7 src,
                                           LPRECT sr, DWORD flags, LPDDBLTFX fx) {
@@ -741,11 +741,11 @@ static HRESULT STDMETHODCALLTYPE Hook_Blt(IDirectDrawSurface7 *self, LPRECT dr, 
         if (!hw || !IsWindow(hw)) hw = GetForegroundWindow();
         if (hw && GetClientRect(hw, &cr)) { cw = cr.right - cr.left; ch = cr.bottom - cr.top; }
         if (cw <= 648 && ch <= 488 && hw) { SmdWineForceBorderless(hw); if (GetClientRect(hw,&cr)){cw=cr.right-cr.left;ch=cr.bottom-cr.top;} }
-        /* Wine ddraw Blt-scaling on a desktop-sized primary is unstable; keep native blit.
-           Run in a window (WndMode) + gamescope for stable fullscreen scaling. */
+        
+
         useDr = dr; useSr = sr;
     }
-    /* Hook_Blt: primary-present blits are measured, never paced */
+    
     int isPresent = (self == g_primary && src);
     QueryPerformanceCounter(&a);
     HRESULT hr = g_origBlt(self, useDr, src, useSr, flags, fx);
@@ -790,17 +790,17 @@ static int g_titleMainMenuPrev = 0;
 
 typedef unsigned char (__attribute__((thiscall)) *PF_InputKey)(void *self, int id);
 
-/* The input object keeps physical key states at +8 (0x80 = down).  The game's key
-   query helpers only expose an edge, so a held ESC looks like a fresh press again
-   after a scene change.  Read the level directly for the cancel carryover guard. */
+
+
+
 static int TitleEscDown(void *input) {
     return input && !IsBadReadPtr(input, 0x140) &&
            ((*((unsigned char*)input + 8 + 0x1b)) & 0x80) != 0;
 }
 
-/* Called once per frame: arm the carryover when the title main menu (state 2) is
-   re-entered from a submenu while ESC is still held, so that leftover press is
-   not treated as a fresh cancel that would move the cursor to Exit. */
+
+
+
 static void TitleCancelFrameTick(void) {
     void *input = *(void**)(uintptr_t)0x46bbec;
     void *title = *(void**)(uintptr_t)0x4e93c8;
@@ -915,7 +915,7 @@ static int OptionVolume(int off, int vol);
 static int HookCall(DWORD callAddr, DWORD target, void *hook);
 
 static char g_OptionDefaultRow[0xe8] __attribute__((aligned(16)));
-static void *g_OptionDefaultScene;  /* first texture of the option screen the row was built for */
+static void *g_OptionDefaultScene;  
 static int g_OptionDefaultRowInit;
 static char g_OptionDefaultLabelRow[0xe8] __attribute__((aligned(16)));
 static void *g_OptionDefaultLabelScene;
@@ -943,16 +943,16 @@ static void OptionApplyDefaults(void *opt, int page) {
     playSe((void*)(uintptr_t)0x4ea3a8, 0, 0xff);
 }
 
-/*
- * The Default row is a text row like those of the replay menu (0x421350): it needs a 256x256 text
- * surface created by the game's 0x4097b0 (width, height, name 0x45b1c4, flag 1).  Option object
- * layout: +0x00/+0x04/+0x08/+0x0c are the four label textures loaded from the archive and +0x10 is an
- * embedded font object (ctor 0x407ec0, init 0x407fa0, dtor 0x407f30) - not a texture, so it must never
- * be handed to the row setup (0x41ff10) / text (0x41ff80) functions.
- * The option screen is rebuilt (textures re-created by 0x41ad00) every time the title screen is built,
- * so the row and its surface are rebuilt whenever +0x00 changes.  The game's native text renderer is
- * used so this label shares the option menu's built-in font style.
- */
+
+
+
+
+
+
+
+
+
+
 static int g_OptionDefaultLabelReady;
 
 static void OptionDefaultDraw(void *opt) {
@@ -998,10 +998,10 @@ static unsigned char __attribute__((fastcall)) OptionUpdateHook(void *opt) {
         confirmHeld = (edge(input, 4) || enterNow) ? 1 : 0;
         chooseDefault = virtualCursor == 7 && (edge(input, 4) || (enterNow && !g_optPrevEnter));
         g_optPrevEnter = enterNow;
-        /* virtual cursor: 0..6 as in the game, 7 = Default, 8 = Exit (the game's row 7).  While Default is
-           selected the game is run with its cursor on the Exit row, which has no value to change with
-           left/right and highlights nothing we show; on a confirm press it is run on row 6 instead, where
-           confirm does nothing, so that the game does not leave the screen. */
+        
+
+
+
         if (virtualCursor == 7) {
             int exitChoices = *(volatile int*)(uintptr_t)(0x453c84 + 7 * 4);
             OPT_F(opt, 0x3310) = (confirmHeld || exitChoices <= 0) ? 6 : 7;
@@ -1027,15 +1027,15 @@ static unsigned char __attribute__((fastcall)) OptionUpdateHook(void *opt) {
             else if (virtualCursor >= 8)
                 newV = up ? 7 : (down ? newReal : 8);
             else if (newReal == 7)
-                newV = up ? 8 : 7;      /* down from SE Volume enters Default, up from the top wraps to Exit */
+                newV = up ? 8 : 7;      
             else
                 newV = newReal;
             OPT_F(opt, 0x3310) = newV;
-            /* label highlight: rows 0..6 as the game, virtual 8 = Exit (row 7), Default is drawn separately */
+            
             for (i = 0; i < 8; i++) OPT_F(opt, 0x3e8 + i * 0xe8 + 0x20) = 0x66;
             if (newV >= 0 && newV <= 6) OPT_F(opt, 0x3e8 + newV * 0xe8 + 0x20) = 0xff;
             else if (newV == 8) OPT_F(opt, 0x3e8 + 7 * 0xe8 + 0x20) = 0xff;
-            /* the game's hold-left-on-Exit counter must not run while Default is selected */
+            
             if (newV == 7) *(volatile unsigned char*)(uintptr_t)0x4e9244 = 0;
         }
         return result;
@@ -1045,7 +1045,7 @@ static unsigned char __attribute__((fastcall)) OptionUpdateHook(void *opt) {
 static unsigned char __attribute__((fastcall)) OptionDrawHook(void *opt) {
     unsigned char result;
     if (OPT_F(opt, 0x3308) == 1) {
-        /* Exit row (row 7, y double at +0x10) one slot lower: Default takes its place */
+        
         *(double*)((char*)opt + 0x3e8 + 7 * 0xe8 + 0x10) = 378.0;
     }
     result = ((PF_OptionUpdate)(uintptr_t)0x41c1d0)(opt);
@@ -1082,7 +1082,7 @@ static void PatchOptionDefaults(void) {
     if (!HookCall(0x423f0e, 0x41c1d0, (void*)&OptionDrawHook))
         Log("OptionDefault: draw hook failed");
     {
-        /* the page-1 panel (0x4241d0 call at 0x41c2a2: push 0x140 = height 320) grows by one row (40) */
+        
         static const unsigned char panelOrig[5] = { 0x68, 0x40, 0x01, 0x00, 0x00 };
         unsigned char *pp = (unsigned char*)0x41c2a2;
         DWORD oldp;
@@ -1118,7 +1118,7 @@ typedef int (__attribute__((thiscall)) *PF_ReplayLoad)(void *input, int replayId
 typedef void (__cdecl *PF_SceneSwitch)(int a, int b);
 
 static void PauseReplayRestore(void) {
-    /* Handled synchronously by ReplayPauseResumeHook at 0x419c03 */
+    
 }
 
 static unsigned char __attribute__((thiscall)) ReplayPauseOpenHook(void *input) {
@@ -1167,8 +1167,8 @@ static void __attribute__((thiscall)) ReplayPauseExitHook(void *input) {
 
 static void __attribute__((fastcall)) PauseUpdateHook(void *menu) {
     void *input = *(void**)(uintptr_t)0x46bbec;
-    /* menu+0xc is the command input mode flag (set when the 4th item is chosen); the typed letters must not
-       act as the Q/R shortcuts while a command is being entered. */
+    
+
     if (input && menu && OPT_F(menu, 0x538) == 6 && OPT_F(menu, 0xc) == 0) {
         PF_InputKey rawkey = (PF_InputKey)(uintptr_t)0x431500;
         int next = 0;
@@ -1344,55 +1344,55 @@ static void PatchReplayStage(void) {
 }
 
 // ------------------------------------------------------------------------
-// ReplayRename: In replay list (state +0x27f4 == 0), pressing F2 activates
-// in-place score name editing for the highlighted replay (+0x27e4).
-// A blinking horizontal underline ('_') appears beneath the character at
-// the cursor position (starts at the 1st character of the score name).
-// Keys from keyboard edit the score name in real-time.
-// Pressing Enter or F2 saves the new name to replay\replay%03d.dat with
-// valid LZSS compression and CRC checksums, and reloads the menu page.
-// Pressing Esc cancels and restores the original name.
+
+
+
+
+
+
+
+
 // ------------------------------------------------------------------------
 
-static unsigned char g_rnEdit[32];          /* name being edited (null terminated) */
-static int           g_rnCursor;            /* cursor column in score name 0..15 */
-static int           g_rnActive;            /* 1 = edit mode active */
-static int           g_rnId;                /* replay ID 0..999 */
-static int           g_rnTick;              /* frame counter for blinking */
-static unsigned char g_rnHdr[0xe0];         /* uncompressed 224-byte header */
-static char          g_rnOrigRowText[20];   /* backup of original row score name */
-static unsigned char g_rnPrevKeys[256];     /* keyboard edge tracking */
-static int           g_rnRepeatKey;         /* key currently held down */
-static int           g_rnRepeatTimer;       /* repeat delay / interval timer */
-static int           g_rnEscCooldown;       /* frames to suppress ESC after cancelling */
-static int           g_rnEnterCooldown;     /* frames to suppress Enter/F2 after commit */
-static int           g_rnPrevF2;            /* F2 edge tracking */
-static int           g_rnPrevEnter;         /* Enter edge tracking */
-static int           g_rnPrevEsc;           /* Esc edge tracking */
+static unsigned char g_rnEdit[32];          
+static int           g_rnCursor;            
+static int           g_rnActive;            
+static int           g_rnId;                
+static int           g_rnTick;              
+static unsigned char g_rnHdr[0xe0];         
+static char          g_rnOrigRowText[20];   
+static unsigned char g_rnPrevKeys[256];     
+static int           g_rnRepeatKey;         
+static int           g_rnRepeatTimer;       
+static int           g_rnEscCooldown;       
+static int           g_rnEnterCooldown;     
+static int           g_rnPrevF2;            
+static int           g_rnPrevEnter;         
+static int           g_rnPrevEsc;           
 
-/* Max uncompressed inputs bytes the game uses for a replay (0x4f1a0), i.e. the
-   input count cap.  The playback loader (0x431d30) LZSS-decodes the inputs chunk
-   into a 0x4f1a0-byte buffer and CRCs the first 2 * count bytes of it, where
-   count is the dword at hdr0xE0 + 0x18. */
+
+
+
+
 #define RR_MAX_IN_COUNT (0x4f1a0 / 2)
 
-/* The game's LZSS decoder (0x410970): cdecl(src, srcLen, dst, dstLen).  Returns
-   dst when exactly dstLen bytes were produced, NULL on failure (and frees dst
-   when it had to allocate it itself). */
+
+
+
 static int RrDecodeChunk(const void *src, int srcLen, void *dst, int dstLen) {
     void *r = ((void * (__cdecl *)(const void*, int, void*, int))(uintptr_t)0x410970)(src, srcLen, dst, dstLen);
     return r == dst;
 }
 
-/* Reads 224-byte uncompressed header of replay id using the game's reader (0x431bd0).
-   Returns 1 if valid, 0 if not found or corrupted. */
+
+
 static int RnLoadHdr(int id, unsigned char hdr0xE0[0xe0]) {
     void *input = *(void**)(uintptr_t)0x46bbec;
     if (!input || IsBadReadPtr(input, 0x10)) return 0;
     return ((int (__attribute__((thiscall)) *)(void *, int, void *))(uintptr_t)0x431bd0)(input, id, hdr0xE0);
 }
 
-/* Writes updated score name into replay\replay%03d.dat and refreshes the replay menu. */
+
 static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
     char path[MAX_PATH];
     FILE *f;
@@ -1429,7 +1429,7 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
         return 0;
     }
 
-    /* Decrypt the 16 bytes in old header using MT19937 seeded with old_seed */
+    
     old_seed = *(unsigned int*)(old_hdr + 4);
     ((void (__cdecl *)(unsigned int))(uintptr_t)0x405200)(old_seed);
     memcpy(dec16, old_hdr + 0x10, 16);
@@ -1459,7 +1459,7 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
     }
     fclose(f);
 
-    /* Compress updated 0xe0 header with the game's LZSS encoder (0x4106e0) */
+    
     new_cmp_hdr = ((void* (__cdecl *)(const void*, int, int*))(uintptr_t)0x4106e0)(hdr0xE0, 0xe0, &new_cmp_hdr_len);
     if (!new_cmp_hdr || new_cmp_hdr_len <= 0) {
         if (cmp_inp) free(cmp_inp);
@@ -1467,19 +1467,19 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
         return 0;
     }
 
-    /* Prepare new 0x20 header */
+    
     memcpy(new_hdr, "SMDR", 4);
 
-    /* Checksum of the inputs chunk.  The playback loader (0x431d30) verifies this CRC
-       over the *uncompressed* inputs (2 bytes * input count, the count is the dword at
-       hdr0xE0 + 0x18), not over the compressed chunk, so decompress it first. */
+    
+
+
     inp_crc = 0;
     {
         unsigned int inCount = *(unsigned int*)(hdr0xE0 + 0x18);
         unsigned char *decInp;
         if (inCount > RR_MAX_IN_COUNT) inCount = RR_MAX_IN_COUNT;
-        /* +0x1000 slack: the game's LZSS decoder writes literal tokens without
-           checking dstLen, so a malformed stream can overrun the buffer */
+        
+
         decInp = inCount ? (unsigned char*)malloc((size_t)inCount * 2 + 0x1000) : NULL;
         if (inCount && !decInp) {
             ((void (__cdecl *)(void*))(uintptr_t)0x434fad)(new_cmp_hdr);
@@ -1505,11 +1505,11 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
     }
     *(unsigned int*)(new_hdr + 8) = inp_crc;
 
-    /* Checksum of uncompressed 0xe0 header */
+    
     hdr_crc = ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(hdr0xE0, 0xe0);
     *(unsigned int*)(new_hdr + 0x0c) = hdr_crc;
 
-    /* Prepare 16-byte payload */
+    
     memcpy(new_dec16, dec16, 16);
     *(unsigned short*)(new_dec16 + 0) = version;
     *(unsigned short*)(new_dec16 + 2) = (unsigned short)(0x20 + new_cmp_hdr_len);
@@ -1517,18 +1517,18 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
     *(unsigned short*)(new_dec16 + 14) = (unsigned short)new_cmp_hdr_len;
     memcpy(new_hdr + 0x10, new_dec16, 16);
 
-    /* Checksum of 0x20 header with 0xdeadbeef at +0x04 */
+    
     *(unsigned int*)(new_hdr + 0x04) = 0xdeadbeef;
     new_seed = ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(new_hdr, 0x20);
     *(unsigned int*)(new_hdr + 0x04) = new_seed;
 
-    /* Encrypt 16 bytes with MT19937 seeded with new_seed */
+    
     ((void (__cdecl *)(unsigned int))(uintptr_t)0x405200)(new_seed);
     for (i = 0; i < 16; i++) {
         (new_hdr + 0x10)[i] ^= (unsigned char)(((unsigned int (__cdecl *)(void))(uintptr_t)0x405250)() & 0xff);
     }
 
-    /* Write back to file */
+    
     f = fopen(path, "wb");
     if (!f) {
         ((void (__cdecl *)(void*))(uintptr_t)0x434fad)(new_cmp_hdr);
@@ -1549,7 +1549,7 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
     Log("ReplayRename: saved %s (hdr_len=%d, inp_len=%ld, seed=0x%08x)",
         path, new_cmp_hdr_len, cmp_inp_len, new_seed);
 
-    /* Refresh replay menu list using game's page loader (0x4215c0) */
+    
     if (menu) {
         int curPage = *(int*)((char*)menu + 0x27f0);
         ((void (__attribute__((thiscall)) *)(void*, int))(uintptr_t)0x4215c0)(menu, curPage);
@@ -1558,23 +1558,23 @@ static int RnSaveReplay(void *menu, int id, const unsigned char hdr0xE0[0xe0]) {
 }
 
 // ------------------------------------------------------------------------
-// ReplayRepair: replay files whose stored checksums do not match their
-// contents fail to load with "Data Checksum Error...".  RrRepairFile verifies
-// a replay the same way the game does (format word, CRC of the uncompressed
-// 0xe0 header, CRC of the 0x20 header with 0xdeadbeef at +0x04, CRC of the
-// decompressed inputs) and, when a check fails, re-derives every checksum
-// and layout field from the current file contents and rewrites the file:
-//   - format word restored from the replay manager's expected value
-//   - header chunk length re-found by LZSS-decode scan when unusable
-//   - inputs offset fixed to 0x20 + header chunk length
-//   - inputs chunk length fixed to the remaining file size when out of range
-//   - all three checksums recomputed and the 16-byte payload re-encrypted
-// The compressed chunks are kept byte-identical.  Hooks on the replay menu
-// reader (0x431bd0) and the playback loader (0x431d30) run the repair around
-// the game's own load, so edited or corrupted replays load again.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // ------------------------------------------------------------------------
 
-/* Verifies the file like the game does.  Returns 0 when every check passes. */
+
 static int RrVerify(unsigned char *buf, long size, unsigned short wantFmt,
                     unsigned short *outFmt, unsigned short *outInpOff,
                     unsigned short *outMode, unsigned int *outCmpInpLen,
@@ -1595,8 +1595,8 @@ static int RrVerify(unsigned char *buf, long size, unsigned short wantFmt,
 
     *outHdrOk = 0;
 
-    /* decrypt the 16-byte payload (game seeds MT19937 with the stored seed) and
-       parse the layout fields from it */
+    
+
     memcpy(dec16, buf + 0x10, 16);
     ((void (__cdecl *)(unsigned int))(uintptr_t)0x405200)(seed);
     for (i = 0; i < 16; i++) {
@@ -1612,19 +1612,19 @@ static int RrVerify(unsigned char *buf, long size, unsigned short wantFmt,
 
     if (fmt != wantFmt) fail = 1;
 
-    /* CRC of the 0x20 header with 0xdeadbeef at +0x04 and the decrypted payload */
+    
     {
         unsigned int r;
-        memcpy(enc16, buf + 0x10, 16);             /* payload as stored */
+        memcpy(enc16, buf + 0x10, 16);             
         *(unsigned int*)(buf + 4) = 0xdeadbeef;
         memcpy(buf + 0x10, dec16, 16);
         r = ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(buf, 0x20);
         *(unsigned int*)(buf + 4) = seed;
-        memcpy(buf + 0x10, enc16, 16);             /* restore encrypted payload */
+        memcpy(buf + 0x10, enc16, 16);             
         if (r != seed) fail = 1;
     }
 
-    /* decompress the 0xe0 header and check its CRC */
+    
     if (mode == 0) {
         if (size >= 0x100) {
             memcpy(outHdr, buf + 0x20, 0xe0);
@@ -1640,7 +1640,7 @@ static int RrVerify(unsigned char *buf, long size, unsigned short wantFmt,
         fail = 1;
     }
 
-    /* CRC of the decompressed inputs */
+    
     count = *outHdrOk ? *(unsigned int*)(outHdr + 0x18) : 0;
     if (count > RR_MAX_IN_COUNT) count = RR_MAX_IN_COUNT;
     decInp = (unsigned char*)malloc(count ? (size_t)count * 2 + 0x1000 : 1);
@@ -1668,13 +1668,13 @@ static int RrVerify(unsigned char *buf, long size, unsigned short wantFmt,
     return (int)fail;
 }
 
-/* Rewrites the replay at path with recomputed checksums/fields.  Returns 1 when
-   the file was repaired, 0 when nothing was wrong or it is beyond repair. */
+
+
 static int RrRepairFile(const char *path) {
     FILE *f;
     long size;
     unsigned char *buf;
-    unsigned char *hdr;    /* heap with slack: decode may overrun 0xe0 on bad input */
+    unsigned char *hdr;    
     unsigned char dec16[16];
     unsigned int seed, inpCrc, hdrCrc, newSeed, count, i;
     unsigned short fmt, inpOff, mode, hdrLen;
@@ -1695,21 +1695,21 @@ static int RrRepairFile(const char *path) {
     fclose(f);
     if (memcmp(buf, "SMDR", 4) != 0) { free(hdr); free(buf); return 0; }
 
-    /* expected format word from the replay manager object (same source the
-       game's reader compares against) */
+    
+
     {
         void *input = *(void**)(uintptr_t)0x46bbec;
         unsigned short want = 0;
         if (input && !IsBadReadPtr(input, 2)) want = *(unsigned short*)input;
         if (RrVerify(buf, size, want, &fmt, &inpOff, &mode, &cmpInpLen, &hdrLen, hdr, &hdrOk) == 0) {
             free(hdr); free(buf);
-            return 0;   /* file is already consistent */
+            return 0;   
         }
     }
 
     Log("ReplayRepair: %s fails verification, repairing", path);
 
-    /* decrypt payload */
+    
     seed = *(unsigned int*)(buf + 4);
     memcpy(dec16, buf + 0x10, 16);
     ((void (__cdecl *)(unsigned int))(uintptr_t)0x405200)(seed);
@@ -1722,7 +1722,7 @@ static int RrRepairFile(const char *path) {
     cmpInpLen = *(unsigned int*)(dec16 + 0x0a);
     hdrLen = *(unsigned short*)(dec16 + 0x0e);
 
-    /* format word */
+    
     {
         void *input = *(void**)(uintptr_t)0x46bbec;
         if (input && !IsBadReadPtr(input, 2)) {
@@ -1731,7 +1731,7 @@ static int RrRepairFile(const char *path) {
         }
     }
 
-    /* header chunk: recover hdrLen by decode scan when it does not decode */
+    
     hdrOk = 0;
     if (mode == 0 && size >= 0x100) {
         memcpy(hdr, buf + 0x20, 0xe0);
@@ -1757,7 +1757,7 @@ static int RrRepairFile(const char *path) {
         return 0;
     }
 
-    /* inputs offset: must sit right after the header chunk */
+    
     {
         unsigned short want = (unsigned short)(0x20 + hdrLen);
         if ((long)(0x20 + hdrLen) > size || want < 0x20) {
@@ -1768,13 +1768,13 @@ static int RrRepairFile(const char *path) {
         if (inpOff != want) { inpOff = want; changed = 1; }
     }
 
-    /* inputs chunk length: fix when it runs past EOF (trailing bytes are kept) */
+    
     if ((long)inpOff + (long)cmpInpLen > size) {
         cmpInpLen = (unsigned int)(size - (long)inpOff);
         changed = 1;
     }
 
-    /* checksums */
+    
     count = *(unsigned int*)(hdr + 0x18);
     if (count > RR_MAX_IN_COUNT) count = RR_MAX_IN_COUNT;
     {
@@ -1790,7 +1790,7 @@ static int RrRepairFile(const char *path) {
             } else {
                 gotInp = RrDecodeChunk(buf + inpOff, (int)cmpInpLen, decInp, (int)(count * 2));
                 if (!gotInp && (long)inpOff + (long)cmpInpLen != size && size - (long)inpOff > 0) {
-                    /* stored inputs length is suspect: try the whole remainder */
+                    
                     gotInp = RrDecodeChunk(buf + inpOff, (int)(size - inpOff), decInp, (int)(count * 2));
                     if (gotInp) { cmpInpLen = (unsigned int)(size - (long)inpOff); changed = 1; }
                 }
@@ -1815,7 +1815,7 @@ static int RrRepairFile(const char *path) {
         return 0;
     }
 
-    /* write fields back into the payload */
+    
     *(unsigned short*)(dec16 + 0) = fmt;
     *(unsigned short*)(dec16 + 2) = inpOff;
     *(unsigned short*)(dec16 + 4) = mode;
@@ -1823,7 +1823,7 @@ static int RrRepairFile(const char *path) {
     *(unsigned short*)(dec16 + 0x0e) = hdrLen;
     *(unsigned int*)(buf + 8) = inpCrc;
     *(unsigned int*)(buf + 0x0c) = hdrCrc;
-    /* re-seed: CRC over the 0x20 header with 0xdeadbeef at +0x04 and the plain payload */
+    
     *(unsigned int*)(buf + 0x04) = 0xdeadbeef;
     memcpy(buf + 0x10, dec16, 16);
     newSeed = ((unsigned int (__cdecl *)(const void*, int))(uintptr_t)0x410c10)(buf, 0x20);
@@ -1843,7 +1843,7 @@ static int RrRepairFile(const char *path) {
     return 1;
 }
 
-/* Repair-on-failure wrapper for the replay menu reader call sites. */
+
 static int RrRepairId(void *input, int id) {
     char path[MAX_PATH];
     if (id < 0 || id > 999) return 0;
@@ -1863,8 +1863,8 @@ static int __attribute__((fastcall)) RrMenuReaderHook(void *input, void *edx, in
     return r;
 }
 
-/* Repair-before-load wrapper for the playback loader call sites.  RrRepairFile
-   is a no-op when the file already verifies. */
+
+
 static int __attribute__((fastcall)) RrPlaybackLoaderHook(void *self, void *edx,
                                                           const char *file, int a2, int a3) {
     RrRepairFile(file);
@@ -1877,13 +1877,13 @@ static void PatchReplayRepair(void) {
         Log("ReplayRepair: unexpected image base, skipped");
         return;
     }
-    /* replay menu reader (0x431bd0, thiscall, ret 0x8) call sites */
+    
     n += HookCall(0x4216c7, 0x431bd0, (void*)&RrMenuReaderHook);
     n += HookCall(0x421c0f, 0x431bd0, (void*)&RrMenuReaderHook);
     n += HookCall(0x421c49, 0x431bd0, (void*)&RrMenuReaderHook);
     n += HookCall(0x4221b7, 0x431bd0, (void*)&RrMenuReaderHook);
     n += HookCall(0x4223fc, 0x431bd0, (void*)&RrMenuReaderHook);
-    /* playback loader (0x431d30, thiscall, ret 0xc) call sites */
+    
     n += HookCall(0x4236db, 0x431d30, (void*)&RrPlaybackLoaderHook);
     n += HookCall(0x425bfa, 0x431d30, (void*)&RrPlaybackLoaderHook);
     n += HookCall(0x43200b, 0x431d30, (void*)&RrPlaybackLoaderHook);
@@ -1899,7 +1899,7 @@ static void RnSyncRowText(void *menu) {
     row_str = *(char**)(row + 0xc0);
     if (!row_str || IsBadWritePtr(row_str, 20)) return;
 
-    /* g_rnEdit is exactly 16 characters right-aligned */
+    
     memcpy(row_str + 3, g_rnEdit, 16);
 }
 
@@ -1917,12 +1917,12 @@ static void RnOpen(void *menu, int id) {
 
     g_rnId = id;
     g_rnActive = 1;
-    g_rnCursor = 15;  /* Cursor stays at the right end */
-    g_rnTick = 16;    /* Caret immediately visible on frame 0 */
+    g_rnCursor = 15;  
+    g_rnTick = 16;    
     g_rnEscCooldown = 0;
     g_rnEnterCooldown = 0;
 
-    /* Save original row score name text for clean cancel on ESC */
+    
     r = id & 0xf;
     row = (char*)menu + 0x3a8 + r * 0x130;
     if (!IsBadReadPtr(row, 0x130)) {
@@ -1933,7 +1933,7 @@ static void RnOpen(void *menu, int id) {
         }
     }
 
-    /* Start with a blank input field (16 spaces) */
+    
     memset(g_rnEdit, ' ', 16);
     g_rnEdit[16] = 0;
 
@@ -1964,12 +1964,12 @@ static void RnCommit(void *menu) {
     size_t plen;
     if (!g_rnActive) return;
 
-    /* Trim leading spaces for storage */
+    
     p = (const char*)g_rnEdit;
     while (*p == ' ') p++;
 
     if (!*p) {
-        /* If blank (no characters typed), cancel and restore original name */
+        
         RnCancel(menu);
         return;
     }
@@ -1979,7 +1979,7 @@ static void RnCommit(void *menu) {
     if (plen > 15) plen = 15;
     memcpy(finalName, p, plen);
 
-    /* Update score name in 0xe0 header (0x30..0x3f) */
+    
     memset(g_rnHdr + 0x30, 0, 16);
     memcpy(g_rnHdr + 0x30, finalName, 16);
 
@@ -2023,13 +2023,13 @@ static void RnDrawCaret(void *menu) {
     int col;
 
     if (!g_rnActive || !menu) return;
-    if (*(unsigned char*)((char*)menu + 0x27f4) != 0) return; /* Only in replay list */
+    if (*(unsigned char*)((char*)menu + 0x27f4) != 0) return; 
 
     r = g_rnId & 0xf;
     row = (char*)menu + 0x3a8 + r * 0x130;
     if (IsBadReadPtr(row, 0x130) || !*(void**)(row + 0xe0)) return;
 
-    /* Blink caret every 16 frames */
+    
     if ((g_rnTick & 0x10) != 0) {
         char caretRow[0x130] __attribute__((aligned(16)));
         memcpy(caretRow, row, sizeof(caretRow));
@@ -2043,22 +2043,22 @@ static void RnDrawCaret(void *menu) {
         *(double*)(caretRow + 8) = row_x + col * char_w;
         *(double*)(caretRow + 0x10) = row_y + 1.0;
         *(char**)(caretRow + 0xc0) = "_";
-        *(int*)(caretRow + 0xd8) = 0x00ffffff; /* white */
+        *(int*)(caretRow + 0xd8) = 0x00ffffff; 
         ((void (__cdecl *)(void *, int))(uintptr_t)0x420270)(caretRow, 0);
     }
 }
 
 static void __attribute__((fastcall)) ReplayDrawHook(void *menu) {
-    /* 1. Call original replay menu drawer (0x421d40) */
+    
     ((void (__attribute__((thiscall)) *)(void*))(uintptr_t)0x421d40)(menu);
 
-    /* 2. If editing score name, render the blinking caret/underline */
+    
     if (g_rnActive) {
         RnDrawCaret(menu);
     }
 }
 
-/* RnTick is called every frame from ReplayUpdateHook */
+
 static void RnTick(void *menu, void *input) {
     unsigned char *keys = (unsigned char*)input + 8;
     unsigned char *latch = (unsigned char*)input + 0x130;
@@ -2074,7 +2074,7 @@ static void RnTick(void *menu, void *input) {
     int escRaw   = ((keys[VK_ESCAPE] & 0x80) != 0) || ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0);
     int f2Raw    = ((keys[VK_F2] & 0x80) != 0) || ((GetAsyncKeyState(VK_F2) & 0x8000) != 0);
 
-    /* Cancel editing if menu state changed away from replay list */
+    
     if (g_rnActive && *(unsigned char*)((char*)menu + 0x27f4) != 0) {
         RnCancel(menu);
     }
@@ -2103,7 +2103,7 @@ static void RnTick(void *menu, void *input) {
         *(unsigned*)prevButtons |= (1u << 4);
     }
 
-    /* Edge detection for F2, Esc, Enter checking BOTH GetAsyncKeyState and game's keys buffer */
+    
     f2Down = f2Raw;
     f2Trigger = f2Down && !g_rnPrevF2;
     g_rnPrevF2 = f2Down;
@@ -2119,7 +2119,7 @@ static void RnTick(void *menu, void *input) {
     if (g_rnActive) {
         g_rnTick++;
         RnSyncRowText(menu);
-        /* Suppress Enter, Esc, and Decide/Cancel buttons while typing */
+        
         keys[VK_RETURN] = 0;
         latch[VK_RETURN] = 1;
         keys[VK_ESCAPE] = 0;
@@ -2144,7 +2144,7 @@ static void RnTick(void *menu, void *input) {
             return;
         }
 
-        /* Process character typing and Backspace/Delete with key-repeat */
+        
         for (vk = 0; vk < 256; vk++) {
             if (vk == VK_ESCAPE || vk == VK_RETURN || vk == VK_F2 || vk == VK_SHIFT) continue;
             int isDown = ((GetAsyncKeyState(vk) & 0x8000) != 0) || ((keys[vk] & 0x80) != 0);
@@ -2168,7 +2168,7 @@ static void RnTick(void *menu, void *input) {
             if (!triggered) continue;
 
             if (vk == VK_BACK || vk == VK_DELETE) {
-                /* Shift right, inserting space at the left */
+                
                 memmove(g_rnEdit + 1, g_rnEdit, 15);
                 g_rnEdit[0] = ' ';
                 g_rnEdit[16] = 0;
@@ -2176,7 +2176,7 @@ static void RnTick(void *menu, void *input) {
             } else {
                 char ch = RnGetAsciiChar(vk, shift);
                 if (ch) {
-                    /* Shift left, inserting new character at the right end */
+                    
                     memmove(g_rnEdit, g_rnEdit + 1, 15);
                     g_rnEdit[15] = (unsigned char)ch;
                     g_rnEdit[16] = 0;
@@ -2185,7 +2185,7 @@ static void RnTick(void *menu, void *input) {
             }
         }
     } else {
-        /* In replay list (state +0x27f4 == 0): open editor on F2 */
+        
         if (f2Trigger && *(unsigned char*)((char*)menu + 0x27f4) == 0) {
             int curId = *(int*)((char*)menu + 0x27e4);
             RnOpen(menu, curId);
@@ -2261,33 +2261,33 @@ static void PatchReplayRenameInput(void) {
 typedef unsigned char (__attribute__((fastcall)) *PF_ReplaySavePromptUpdate)(void *obj);
 typedef void (__attribute__((thiscall)) *PF_ReplaySaveInputAction)(void *input);
 
-/*
- * Replay save prompt: "Save Replay? (No.%03d)" (object at 0x4e93d4, scene 5).
- *
- * Its update (0x41a120) only reads left/right (buttons 2/3, selection toggles +0x488 between
- * 0 = YES and 1 = NO) and confirm (button 4 or Enter), which runs 0x431900 (writes
- * replay\replay%03d.dat) for YES or 0x4318a0 (nothing) for NO before starting the fade-out
- * (+0x48c = 0x19, +0x494 = 1).  The cancel buttons are not handled at all, so a player who
- * does not want to save has to move the cursor to NO and confirm.
- *
- * Here a cancel press is turned into NO: the selection is set to NO and the game's own NO
- * branch (same sound, same fade-out, no 0x431900 call) is run, so no replay file is written.
- * +0x490 is the "input ready" flag (the prompt waits for the confirm button to be released
- * before accepting input) and +0x494 is the "decided" flag.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 static const int g_ReplaySaveCancel = 1;
 
-/* Physical key state as the game's input object keeps it (+0x08 + VK code, 0x80 = down).  In the
- * replay save scene the prompt object's button bitset (+0x04) is not refreshed (only the game scene
- * runs the input recorder), so the game's own edge/button queries (0x431540) cannot see the cancel
- * buttons here; the raw key states are always current. */
+
+
+
+
 static int ReplaySaveKeyDown(void *input, int vk) {
     return input && vk >= 0 && vk < 0x100 &&
            (((unsigned char*)input)[8 + vk] & 0x80) != 0;
 }
 
-/* 0x1b = ESC and 0x58 = X are the keys the game maps to its cancel buttons by default (0x431180:
- * action 7 = ESC / pad Button4, action 5 = X / pad Button2). */
+
+
 static int ReplaySaveCancelDown(void *input) {
     return ReplaySaveKeyDown(input, 0x1b) || ReplaySaveKeyDown(input, 0x58);
 }
@@ -2299,8 +2299,8 @@ static unsigned char __attribute__((fastcall)) ReplaySavePromptUpdateHook(void *
     unsigned char *o = (unsigned char*)obj;
     void *input = *(void**)(uintptr_t)0x46bbec;
 
-    /* The cancel keys must be released once after the prompt appears, so a button still held from
-     * the previous screen does not dismiss the prompt by itself. */
+    
+
     if (obj && o[4] && input && !IsBadReadPtr(input, 0x240)) {
         if (g_replaySaveArmedObj != obj || *(int*)(o + 0x490) == 0) {
             g_replaySaveArmedObj = obj;
@@ -2310,9 +2310,9 @@ static unsigned char __attribute__((fastcall)) ReplaySavePromptUpdateHook(void *
             if (!g_replaySaveArmed) {
                 if (!ReplaySaveCancelDown(input)) g_replaySaveArmed = 1;
             } else if (g_ReplaySaveCancel && ReplaySaveCancelDown(input)) {
-                *(int*)(o + 0x488) = 1;                 /* NO */
+                *(int*)(o + 0x488) = 1;                 
                 ((PF_ReplaySaveInputAction)(uintptr_t)0x431880)(input);
-                ((PF_ReplaySaveInputAction)(uintptr_t)0x4318a0)(input);   /* the game's NO action: no file write */
+                ((PF_ReplaySaveInputAction)(uintptr_t)0x4318a0)(input);   
                 ((PF_PlaySe)(uintptr_t)0x412210)((void*)(uintptr_t)0x4ea3a8, 0, 0xff);
                 *(int*)(o + 0x48c) = 0x19;
                 *(int*)(o + 0x494) = 1;
@@ -2379,7 +2379,7 @@ static unsigned char __attribute__((fastcall)) ReplayInputQueryHook(void *self, 
     (void)edx;
     FpuEnforce("input", -1);
     PauseReplayRestore();
-    /* Practice frame simulation must not consume live keyboard or controller input. */
+    
     if (g_exSimulatingStageFrame) return 0;
     result = g_replayInputQueryOrig(self, id, delay);
     if (playback && g_replayInputQueryLogRemaining) {
@@ -2445,15 +2445,15 @@ static int g_practiceBossTarget = 0;
 static int g_practiceScorePending = 0;
 static int g_practiceScoreActive = 0;
 static int g_practiceScoreStage = 0;
-static volatile int g_postJumpLog = 0;  /* frames remaining to trace after a practice jump */
+static volatile int g_postJumpLog = 0;  
 static int g_practiceBgmSeekPending = 0;
 static int g_practiceBgmSeekDeadline = 0;
-static int g_practiceBgmSeekStartFrame = 0;   /* the BGM is loaded by another thread: do not touch it right after the jump */
+static int g_practiceBgmSeekStartFrame = 0;   
 static int g_practiceBgmSeekSeconds = 0;
 static int g_practiceBgmFadeInFrames = 0;
 static int g_practiceBgmFadeInVolume = 0;
 static int g_practiceBgmStartedDuringSeek = 0;
-static int g_practiceBgmLoaded = 0;   /* a BGM id was actually passed to the real loader this run */
+static int g_practiceBgmLoaded = 0;   
 static int g_practiceBgmLastId = -1;
 static int g_practiceBgmSimLastId = -1;
 static int g_practiceBossSeekingSecondForm = 0;
@@ -2464,11 +2464,11 @@ static int g_practiceBossLiveDefeated = 0;
 static int g_practiceBossLiveMissing = 0;
 static unsigned *g_practiceBossLiveFirstObject = NULL;
 static int g_practiceStage3EventLog = 0;
-static int g_exBoss2Kill = 0;         /* Boss 2 practice: defeat Boss 1 at once (see ExBoss2Step) */
-static int g_exBoss2Transition = 0;   /* suppress dialogue until Boss 2's battle BGM starts */
+static int g_exBoss2Kill = 0;         
+static int g_exBoss2Transition = 0;   
 static int g_exBoss2KillFrames = 0;
 static int g_exBoss1Defeated = 0;
-static int g_exBoss2BgmSeen = 0;      /* Boss 2's battle BGM has started (VM bgm op seen outside the fast-forward) */
+static int g_exBoss2BgmSeen = 0;      
 static int g_exBoss2ObjectSeen = 0;
 static int g_exBoss2BgmFrame = 0;
 static int g_exBoss2TransitionFastForwarded = 0;
@@ -2476,9 +2476,9 @@ static int g_exBoss1BgmPending = 0;
 static int g_exBoss1DonePending = 0;
 static int g_exBoss2ScoreReset = 0;
 static int g_exBossReturnAtFrame = 0;
-static int g_exBossClearSim = 0;      /* the stage clear opcode was called while simulating */
+static int g_exBossClearSim = 0;      
 static int g_exBoss2Logged = 0;
-static unsigned *g_exBoss1Obj = NULL;   /* the Boss 1 object being defeated (so that Boss 2 is never touched) */
+static unsigned *g_exBoss1Obj = NULL;   
 static unsigned *g_exLastBoss = NULL;
 
 typedef void (__stdcall *PF_GameStart)(int stage);
@@ -2539,11 +2539,11 @@ static int g_exSkipWait = 0;
 static int g_exShorten = 0;
 
 static int g_exBossRunLogged = 0;
-static volatile int g_exMuteSe = 0;   /* 1 while a practice skip fast-forwards: sound effects are not played */
+static volatile int g_exMuteSe = 0;   
 static int g_exBgmMuted = 0;
 static int g_exBgmSavedVol = 0;
 
-/* The BGM stays muted through practice fast-forward and until a requested stream seek completes. */
+
 static void ExBgmMuteSync(void) {
     int shouldMute = g_exMuteSe || g_practiceBgmSeekPending || g_exBoss1BgmPending;
     if (shouldMute && !g_exBgmMuted) {
@@ -2650,7 +2650,7 @@ static void ExOnGameStart(int stage) {
     g_exBossReturnAtFrame = 0;
     g_exBossClearSim = 0;
     g_exStartReq = 0;
-    /* hook the VM before the practice fast-forward so the dialogue is not shown while it runs */
+    
     if (g_exBossRun >= 1) ExDlgInstall();
     if (g_exBossRun >= 1) ExClearHookInstall();
     if (stage == 4) {
@@ -2683,15 +2683,15 @@ static void ExOnRetry(int stage) {
     }
 }
 
-static int g_practiceReturn = 0;   /* the last game start was a practice run: the title opens the Practice menu */
-static int g_lastPracticeCursor = -2; /* Practice menu item of the last started run (-2 = none);
-   restored to the menu cursor on return so the selector lands where the player just played */
+static int g_practiceReturn = 0;   
+static int g_lastPracticeCursor = -2; 
+
 
 static void __stdcall GameStartHook(int stage) {
     int practiceStart = g_practiceScorePending && stage == g_practiceScoreStage;
     g_practiceReturn = (*(volatile unsigned char*)(uintptr_t)0x4dade0 != 0);
     {
-        /* the Practice menu passes [gamestate+0x10] = cursor+1 into the run (menu obj 0x420cc1) */
+        
         unsigned *gs = (unsigned*)(uintptr_t)0x4e93c8;
         unsigned cursorPlus1 = gs ? *gs ? *(unsigned*)(*gs + 0x10) : 0 : 0;
         if (cursorPlus1 >= 1 && cursorPlus1 <= 0x40)
@@ -2896,18 +2896,18 @@ static void PerfFlush(int frame) {
 }
 
 #ifdef SMD_DEBUG_BUILD
-/* The collision victim is the player body object *(0x4e9ac0) (created at 0x42a4e5).  Its update handler
-   0x42ade0 keeps +0x109 (hitbox) off while the invincibility counter +0x2a8 is above 0 and restores it to 1
-   every frame, so a one-shot poke at +0x109 never survives.  We hold +0x2a8 exactly at 0x78 every frame:
-   above 0 (hitbox off for the whole frame) but not above 0x78, because the not-yet-spawned-ship branch in
-   0x42ade0 (ship dead -> wait for the fire button) is skipped while +0x2a8 > 0x78 and the ship would never
-   reappear.  F9 toggles the feature on the fly. */
+
+
+
+
+
+
 static void DebugDisablePlayerHitbox(void) {
     static int on = 1, logged = 0, dumpN = 0, playbackWarned = 0;
     void *body = *(void **)(uintptr_t)0x4e9ac0;
-    /* Never touch game state while a replay/demo/ghost is playing back: forcing the
-       invincibility counter during playback mutates state the recording never had and
-       desynchronises the replay partway through the stage. */
+    
+
+
     {
         void *input = *(void **)(uintptr_t)0x46bbec;
         int playback = input && !IsBadReadPtr(input, 0x235) &&
@@ -3055,8 +3055,8 @@ static void PracticeRowsExpand(void *obj) {
     double *firstY = (double*)((char*)obj + 0x100 + 0x10);
     double *secondY = (double*)((char*)obj + 0x100 + 0xe8 + 0x10);
     if (*secondY - *firstY >= 0x30) return;
-    /* The menu has three stage rows followed by Extra and Exit. Move each later
-       row down to make a full line available for the Stage/Boss selector. */
+    
+
     for (i = 1; i < 5; i++) {
         double *y = (double*)((char*)obj + 0x100 + 0xe8 * i + 0x10);
         *y += (i < 4) ? i * 0x20 : 0x60;
@@ -3378,8 +3378,8 @@ static void ExLogQueue(void) {
                 i == 0 ? " (spawns not listed)" : "");
 }
 
-static int g_exBgmMoveDelta = 0;   /* frames between the moved BGM event's original time and the jump */
-static int g_exBgmMoveTime = 0;    /* original time of the moved BGM event */
+static int g_exBgmMoveDelta = 0;   
+static int g_exBgmMoveTime = 0;    
 
 static void ExSkipTo(int target, int area) {
     unsigned **headp = (unsigned**)(uintptr_t)0x4ea1d8;
@@ -3409,8 +3409,8 @@ static void ExSkipTo(int target, int area) {
     n = *headp;
 
     {
-        /* If no BGM event starts exactly at the target (the boss area), keep the BGM that would be
-           playing there: take the latest earlier BGM event and move it to the target frame. */
+        
+
         unsigned *q, *keepBgm = NULL;
         int bestT = -1, exact = 0;
         for (q = *headp; q; q = (unsigned*)q[0]) {
@@ -4156,11 +4156,11 @@ static int ExFastForwardBoss2Transition(int from) {
     return *(volatile int*)(uintptr_t)0x4dadf8;
 }
 
-/* Boss practice return: the boss practice boss was defeated (0x4dae04 -> NULL).  The defeat script
-   waits for the defeat dialogue confirmations, so waiting naturally stalls (Boss 2's BGM is never
-   reached).  Simulate the defeat transition the same way the Boss 2 practice transition fast-forward
-   does, until the stage clear opcode is called (ExStageClearOp sets g_exBossClearSim), then return to
-   the Practice menu from the event dispatch. */
+
+
+
+
+
 static int ExFastForwardBossReturn(int from) {
     int f;
     int limit = from + 12000;
@@ -4198,17 +4198,17 @@ static int ExFastForwardBossReturn(int from) {
     return endFrame;
 }
 
-/* Boss intro dialogue investigation: after a Boss practice jump, log the first few calls of every VM
-   opcode handler (thread ip / wait / args) for EX_TR_FRAMES frames, to find the dialogue opcodes. */
+
+
 #define EX_TR_N 40
 #define EX_TR_FRAMES 2400
-static const int g_ExDlgTrace = 0;      /* 1: log VM opcodes after a Boss practice jump */
-/* Skip all dialogue opcodes during EX boss practice so no message is shown and the VM can advance. */
+static const int g_ExDlgTrace = 0;      
+
 static const int g_ExBossDlgSkip = 1;
-static const int g_ExBossDlgDump = 0;   /* 1: dump the script bytes of the dialogue region to the log */
-/* Boss 1 main thread (from ExTrace): the first dialogue line is op21 at ip 649740; the script resumes
-   at the op0 at ip 650448 (right before the BGM op18). op21 is 20 bytes and the VM adds the size of the
-   current instruction after the handler returns, so ip is set to END - 20 and the handler is not run. */
+static const int g_ExBossDlgDump = 0;   
+
+
+
 #define EX_B1_DLG_FIRST 649740
 #define EX_B1_DLG_LO 649400
 #define EX_B1_DLG_END 650448
@@ -4222,7 +4222,7 @@ static unsigned g_trSeen[EX_TR_SEEN];
 static int g_trLines = 0;
 static volatile int g_trDlgArmed = 0;
 
-/* true the first time this (opcode, ip) pair is seen in the current trace */
+
 static int ExTrFirst(int op, int ip) {
     unsigned key = ((unsigned)op << 24) ^ (unsigned)ip ^ 0x80000000u;
     unsigned h = (key * 2654435761u) >> 19, n;
@@ -4234,7 +4234,7 @@ static int ExTrFirst(int op, int ip) {
 }
 
 static void ExDumpScript(void *args, int ip) {
-    /* args points 4 bytes (instruction header) past the instruction start, ip is the instruction offset */
+    
     const unsigned char *base = (const unsigned char*)args - 4 - ip;
     int from = 649600, to = 650800, a;
 
@@ -4270,8 +4270,8 @@ static unsigned char ExTrCommon(int i, void *thr, void *args) {
             *(volatile int*)(uintptr_t)0x4dadf8, action);
     }
     if (skipIntro) {
-        /* Skipping op21 leaves the dialogue wait flag at 0, so its confirmation loop exits while
-           the surrounding entrance and battle script continue normally. */
+        
+
         if (g_dlgSkipLog < 12) {
             g_dlgSkipLog++;
             Log("ExArea: Boss 1 intro dialogue skipped (ip=%d line=%d frame=%d sim=%d)", ip,
@@ -4344,7 +4344,7 @@ static void ExTraceStart(int target) {
         g_trInstalled = 1;
         Log("ExTrace: hooked %d opcode handler(s)", n);
     }
-    if (target < 0) return;   /* install only */
+    if (target < 0) return;   
     g_dlgSkipLog = 0;
     g_dlgShownLog = 0;
     memset(g_trCnt, 0, sizeof(g_trCnt));
@@ -4359,11 +4359,11 @@ static void ExDlgInstall(void) {
     ExTraceStart(-1);
 }
 
-/* Boss 1 practice: no "Stage Clear" when Boss 1 is defeated.
-   The stage clear screen is started only by the VM opcode whose handler is 0x42f200 (it sets the result UI
-   flag 0x4dae14 and calls 0x417c00).  In the Boss 1 practice that opcode is skipped until Boss 2's battle BGM
-   has started, so the script just goes on after Boss 1; the clear after Boss 2 is shown as usual.  The handler is
-   looked up by address in the opcode table, so the opcode number does not matter.  Every call is logged. */
+
+
+
+
+
 static PF_Op g_exClearOrig = NULL;
 static int g_exClearHooked = 0;
 static int g_exClearLog = 0;
@@ -4375,14 +4375,14 @@ static unsigned char __attribute__((fastcall)) ExReturnPracticeTitleUpdate(void 
     unsigned char result;
     result = ((PF_TitleUpdate)(uintptr_t)0x421040)(obj, edx);
     if (g_exReturnPracticeMenuPending && obj) {
-        /* Open the Practice menu the way the main menu does for its Practice item (cursor 2):
-           `lea ecx,[title+0x22e90]; call 0x420b40; mov [title+8],0xc` (state 0xc = Practice menu;
-           state 0xb would start a stage).  Cancel in the Practice menu goes back to the main menu. */
+        
+
+
         char *title = *(char**)(uintptr_t)0x4e93c8;
         if (title && !IsBadReadPtr(title, 0x23300)) {
             g_exReturnPracticeMenuPending = 0;
             if (*(volatile int*)(uintptr_t)0x46bc10 != 0) {
-                {   /* set the selection cursor before any menu update runs (menu+8) */
+                {   
                     char *menu = title + 0x22e90;
                     ((void (__attribute__((thiscall)) *)(void*))(uintptr_t)0x420b40)(menu);
                     if (g_lastPracticeCursor >= 0)
@@ -4420,24 +4420,24 @@ static void PatchExReturnPracticeTitleUpdate(void) {
     Log("ExArea: title update hook installed");
 }
 
-/* Any practice run (Stage 1-3, Extra area/boss) that ends in the title scene (stage end, game over, "title" in
-   the pause menu) opens the Practice menu: the title scene init (slot 0 of the title vtable, 0x453f38 ->
-   0x4227b0, thiscall) is hooked and, when the last game start was a practice run (BYTE 0x4dade0 != 0, noted
-   by GameStartHook) or ExReturnToPracticeMenu asked for it, opens the menu right after the original init
-   (the title update hook above only runs while Extra is unlocked, so it is just a fallback). */
+
+
+
+
+
 static const int g_ReturnToPractice = 1;
 typedef unsigned char (__attribute__((fastcall)) *PF_TitleInit)(void *title);
 static PF_TitleInit g_origTitleInit = NULL;
 
-static int g_practiceMenuOpenWait = 0;    /* frames until the Practice menu is opened in the new title scene */
+static int g_practiceMenuOpenWait = 0;    
 static int g_practiceMenuOpenTries = 0;
-static int g_practiceMenuWatch = 0;       /* frames since the Practice menu was opened (blank menu watchdog) */
+static int g_practiceMenuWatch = 0;       
 
 typedef unsigned char (__attribute__((fastcall)) *PF_TitleUpd)(void *title);
 static PF_TitleUpd g_origTitleUpd = NULL;
 
-/* Opens the Practice menu the way the main menu's Practice item does (init 0x420b40, cursor 2, state 0xc).
-   Returns 0 when the menu's textures could not be created, so the caller can try again. */
+
+
 static int PracticeMenuOpen(char *t, const char *why) {
     char *menu = t + 0x22e90;
     if (*(volatile int*)(uintptr_t)0x46bc10 == 0) {
@@ -4452,7 +4452,7 @@ static int PracticeMenuOpen(char *t, const char *why) {
     }
     *(int*)(t + 0x2324c) = 2;
     if (g_lastPracticeCursor >= 0) {
-        /* menu+8 is the selection cursor (0x420c80 clears, 0x420d55/0x420d88 maintain it) */
+        
         *(unsigned char*)(menu + 8) = (unsigned char)g_lastPracticeCursor;
         Log("ReturnToPractice: cursor restored to item %d", g_lastPracticeCursor);
     }
@@ -4463,8 +4463,8 @@ static int PracticeMenuOpen(char *t, const char *why) {
     return 1;
 }
 
-/* The title scene is created in the middle of the scene switch, so the menu is not opened inside its init:
-   it is opened from the title update a few frames later, when the scene runs like after a normal menu choice. */
+
+
 static unsigned char __attribute__((fastcall)) TitleInitHook(void *title) {
     unsigned char r = g_origTitleInit(title);
     g_practiceMenuWatch = 0;
@@ -4501,8 +4501,8 @@ static unsigned char __attribute__((fastcall)) TitleUpdateHook2(void *title) {
         if (*(int*)(t + 8) != 0xc) {
             g_practiceMenuWatch = 0;
         } else if (++g_practiceMenuWatch >= 90) {
-            /* The menu's fade counter rises by 4 per update up to 0x80: after 90 frames in the menu a low value
-               (or a missing texture) means it is not running, i.e. it would stay blank. */
+            
+
             int fade = *(int*)(t + 0x22e90 + 0xc);
             char *menu = t + 0x22e90;
             g_practiceMenuWatch = 0;
@@ -4586,8 +4586,8 @@ static unsigned char __cdecl ExStageClearOp(void *thr, void *args) {
     }
     if (transitionClear) return 1;
     if (g_exSimulatingStageFrame && g_exRun && g_exBossRun >= 1) {
-        /* inside the return fast-forward: stop the simulation; the actual return to the Practice
-           menu happens back in the event dispatch (a scene switch inside the sim would corrupt it) */
+        
+
         g_exBossClearSim = 1;
         return 1;
     }
@@ -4618,7 +4618,7 @@ static void ExClearHookInstall(void) {
 
     g_exClearLog = 0;
     if (g_exClearHooked || !tbl) return;
-    for (i = 0; i < 45; i++) {   /* the VM has opcodes 0..44 */
+    for (i = 0; i < 45; i++) {   
         if ((DWORD)(uintptr_t)tbl[i] != 0x42f200) continue;
         if (!VirtualProtect(&tbl[i], sizeof(void*), PAGE_READWRITE, &old)) continue;
         g_exClearOrig = (PF_Op)tbl[i];
@@ -4631,18 +4631,18 @@ static void ExClearHookInstall(void) {
     Log("ExArea: stage clear opcode handler 0x42f200 not found in the opcode table");
 }
 
-/* Boss 2 practice.  Boss 2 appears after Boss 1 is defeated, at a frame that depends on how fast the player
-   wins, so there is no fixed frame to jump to.  The practice jumps to the Boss 1 start like the Boss 1 practice
-   and then defeats Boss 1 at once (its hit points are set to 0 every frame) so that the script goes on to
-   Boss 2 by itself.  The Boss 2 BGM (g_exBossBgm[1], seen by ExVmBgmHook) ends the defeating.
-   Boss 1 is found as the only enemy object with a large hit point value (+0x2c, as for the player object);
-   candidates are logged so the rule can be adjusted. */
-/* The game keeps the current boss in DWORD 0x4dae04: the enemy spawn (0x42fa70) stores the new object there
-   when it is created with the boss flag, and the object removal (0x42ea40) clears it again.  The boss hit
-   points are the FLOAT at object+0x48 (1.0 = full; the HUD gauge 0x414710 draws it): the hit handler
-   (object+0x818 = 0x42a1a0, called as handler(self, shot)) subtracts the shot's +0x48 and, when the value is
-   <= 0, runs the defeat (score, hit box off, thread flag +0x0c = 1).  The old rule (int at +0x2c, 500..2000000)
-   never matched anything: +0x2c is a counter that starts at 0. */
+
+
+
+
+
+
+
+
+
+
+
+
 static unsigned *ExFindBossCandidate(int logIt) {
     unsigned *boss = *(unsigned**)(uintptr_t)0x4dae04;
 
@@ -4688,7 +4688,7 @@ static void ExBoss2Step(int frame) {
         g_exBoss1Obj = boss;
         Log("ExArea: Boss 2 practice: Boss 1 object %p found (hp=%.3f)", (void*)boss, *(float*)((char*)boss + 0x48));
     } else if (boss != g_exBoss1Obj) {
-        /* a different boss object: this is Boss 2, leave it alone */
+        
         g_exBoss2Kill = 0;
         g_exBoss2ObjectSeen = 1;
         Log("ExArea: Boss 2 appeared (object %p, hp=%.3f) %d frame(s) after the Boss 1 jump", (void*)boss,
@@ -4703,8 +4703,8 @@ static void ExBoss2Step(int frame) {
             Log("ExArea: Boss 2 practice: boss object %p hp %.3f -> 0 (frame %d)", (void*)boss, (double)hp, frame);
         }
     }
-    /* The defeat itself runs inside the hit handler; with hp <= 0 one call is enough (the shot only has to
-       look like a player shot: type 2 at +0x04, damage at +0x48).  Not repeated once the hit box is off. */
+    
+
     if (*((unsigned char*)boss + 0x109) != 0) {
         typedef void (__cdecl *PF_HitHandler)(void *self, void *other);
         PF_HitHandler hit = (PF_HitHandler)(uintptr_t)boss[0x818 / 4];
@@ -4823,7 +4823,7 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         Log("ExArea: marker frame=%d", frame);
     f9prev = f9;
 #ifdef SMD_DEBUG_BUILD
-    {   /* JoyDbg: dump the game's joystick buffer and parsed direction flags */
+    {   
         static int joyDbgN = 0;
         static int joyDbgFrame = -1;
         if ((frame % 60) == 0 && frame != joyDbgFrame && joyDbgN < 20) {
@@ -4912,8 +4912,8 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         return 1;
     }
     if (g_exBossRun >= 1 && !g_exBoss2Kill && !g_exSimulatingStageFrame && g_exBossRunLogged < 400) {
-        /* A missing boss after a live boss starts the one-second return delay. In Boss 2 practice,
-           ignore Boss 1's disappearance until Boss 2's battle BGM has started. */
+        
+
         unsigned *b = *(unsigned**)(uintptr_t)0x4dae04;
         if (b != g_exLastBoss) {
             g_exBossRunLogged++;
@@ -4925,9 +4925,9 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
                 Log("ExDlg: Boss practice: current boss object -> none (frame %d, was %p) [run=%d bgm2=%d seen=%d ret=%d]",
                     frame, (void*)g_exLastBoss, g_exBossRun, g_exBoss2BgmSeen, g_exBoss2ObjectSeen, g_exBossReturnAtFrame);
                 if ((g_exBossRun == 1 || g_exBoss2BgmSeen) && !g_exBossReturnAtFrame) {
-                    /* Fallback when the stage clear opcode never fires: return 3 seconds after the
-                       boss object disappears (both Boss 1 and Boss 2).  ExStageClearOp can override
-                       this with an earlier natural return. */
+                    
+
+
                     g_exBossReturnAtFrame = frame + 180;
                     Log("ExArea: Boss %d defeated; returning to Practice in 180 frames (at %d)",
                         g_exBossRun, g_exBossReturnAtFrame);
@@ -5017,9 +5017,9 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         if (g_exBossRun == 1) {
             target = g_exBossDefaultFrame[0];
         } else if (g_exBossRun == 2) {
-            /* The BGM at frame 24017 happens after the Boss 1 script has already been running
-               for several minutes. Simulating to that timestamp leaves its live boss and attacks
-               on screen. Enter at Boss 1's intro, then use the real defeat path to advance the script. */
+            
+
+
             target = g_exBossDefaultFrame[0];
         } else if (target <= 0 && isBoss) target = g_exBossDefaultFrame[bossIndex];
         if (target <= 0 && !isBoss && g_exArea >= 0 && g_exArea < EX_AREA_N && !g_exShorten)
@@ -5027,12 +5027,12 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
         if (target > 0) {
             int startFrame = frame;
             int sel = isBoss ? 3 : ((g_exArea >= 0 && g_exArea < EX_AREA_N) ? g_exAreaBgGroup[g_exArea] : 0);
-            /* EX area practice: use mode 1 (ExFastForward) so frames 1..target simulate naturally
-               and background transitions/scroll match normal gameplay exactly without over-settling. */
+            
+
             int areaBgMode = g_ExBgMode;
-            /* The fast-forward runs the real stage update with no input, so the player is hit over and
-               over while the frames are simulated. Keep the state the run started with (lives, game-over
-               countdown, game-over/continue flags) and put it back after the jump. */
+            
+
+
             ExPracticeSave sv;
             ExPracticeSaveState(&sv);
             g_exMuteSe = 1;
@@ -5054,11 +5054,11 @@ static unsigned char __cdecl EventDispatchImpl(int frame) {
                 else
                     ExFastForward(startFrame, target);
                 if (!isBoss && g_exRun && g_exArea == 1 && sel >= 0 && sel < g_exBgGroupN) {
-                    /* Area 2: The background transition event in Script4.dat was scheduled at frame 6462
-                       (only 150 frames before Area 2's start frame 6612). In normal play, Area 1's tiles
-                       are still scrolling off screen. For Area 2 practice, seed the background directly
-                       with Area 2's textures (0x48 base, 0x49 bottom) across all slots and queue so Area 2
-                       starts with its proper background instead of Area 1's background. */
+                    
+
+
+
+
                     g_exBgCur = sel;
                     ExBgSeed(&g_exBgGroups[sel]);
                 }
@@ -5302,9 +5302,9 @@ static void BgmNotify(int frame, int id, const char *path) {
             g_exSimulatingStageFrame ? 1 : 0);
 }
 
-/* Both the script VM opcode (op6 -> 0x433740) and the queued type-6 event dispatcher
-   (event at 0x430152 -> 0x433740) start the BGM.  They both need the same suppression and
-   accounting, so share it through one function. */
+
+
+
 static int BgmDispatch(int id, const char *path) {
     int frame = *(volatile int*)(uintptr_t)0x4dadf8;
     int result;
@@ -5360,14 +5360,14 @@ static int g_audioN = 0;
 static int g_audioInitialized = 0;
 static CRITICAL_SECTION g_audioCs;
 
-/* defined further down, used by the buffer creation hooks above them */
+
 static void AudioSuppressIfPaused(IDirectSoundBuffer *b);
 
-/* Play() on a stopped looping buffer restarts the voice at position 0 on the
-   emulated DirectSound (the cursor report stays stale until the next Play), so an
-   unpaused BGM resumes at the ring start, which holds already decoded audio ahead
-   of the paused position.  Reposition the buffer after Stop and verify the cursor
-   after the resume, resyncing if the position still snapped to 0. */
+
+
+
+
+
 typedef struct { IDirectSoundBuffer *buf; DWORD settled, size, bps, due; int tries; } AudioChk;
 static AudioChk g_chk[16];
 static int g_chkN = 0;
@@ -5492,14 +5492,14 @@ static HRESULT WINAPI DSCreateHook(LPCGUID guid, LPDIRECTSOUND *pp, LPUNKNOWN un
     return hr;
 }
 
-/* Logs the faulting instruction and registers of a crash, so a crash during the BGM seek can be located. */
+
 static LONG CALLBACK SeekCrashVeh(PEXCEPTION_POINTERS ep);
 
-/* Diagnostics for the unpause position jump: snapshot the music ring state (DSound play/write
-   cursors, game stream cursor fields, decoder position and a checksum of the ring bytes under the
-   play cursor) at pause, then diff it at resume.  A changed checksum means the streaming refill
-   thread kept decoding while the buffer was stopped and overwrote the audio at the paused
-   position, which would explain the BGM continuing from an advanced point after unpause. */
+
+
+
+
+
 typedef void *(__cdecl *PF_GetCurrentMusicSnap)(void);
 
 static int g_snapValid = 0;
@@ -5555,20 +5555,20 @@ static void AudioRingSnapshot(const char *when) {
     }
 }
 
-/* The game's streaming refill pump (0x4133f0, called from the music streaming loop at 0x413012)
-   keeps decoding while the pause menu is open: the stopped DSound buffer no longer constrains the
-   write cursor, so the pump races at several times realtime speed and, once the decode-ahead
-   window is full, wraps around and overwrites the audio at the paused play position.  The play
-   cursor is restored correctly on unpause, but the data under it is future audio, which makes the
-   BGM continue from an advanced point.  Freeze the pump while the pause menu is open so the ring
-   stays exactly as it was when the game paused. */
+
+
+
+
+
+
+
 typedef unsigned char (__attribute__((thiscall)) *PF_MusicPump)(void *);
 static PF_MusicPump g_origMusicPump = NULL;
 
-/* 1 while the pause menu is open and the audio should be silent.  Buffers that the game
-   creates or restarts during the pause (a new BGM for a menu, a re-Play of the streaming
-   buffer) would otherwise keep playing, which is heard as "the BGM advances during the
-   pause".  The flag lets the creation hooks and the watchdog stop those as well. */
+
+
+
+
 static volatile int g_audioPaused = 0;
 
 static void AudioPause(void);
@@ -5581,8 +5581,8 @@ static unsigned char __attribute__((thiscall)) MusicPumpHook(void *music) {
     return g_origMusicPump ? g_origMusicPump(music) : 1;
 }
 
-/* Stops a single buffer and remembers where it was, so that a buffer started while the
-   pause menu is open becomes silent too.  Returns 1 when the buffer was playing. */
+
+
 static int AudioSuppressBuffer(IDirectSoundBuffer *b, const char *why) {
     DWORD st = 0;
     int i;
@@ -5600,13 +5600,13 @@ static int AudioSuppressBuffer(IDirectSoundBuffer *b, const char *why) {
             g_audio[i].looping ? "looping" : "one-shot", (unsigned long)g_audio[i].pos);
         return 1;
     }
-    /* unknown buffer (created while paused and not in the table): just stop it */
+    
     IDirectSoundBuffer_Stop(b);
     Log("PauseAudio: %s unknown buffer %p stopped", why, (void*)b);
     return 1;
 }
 
-/* Called for every buffer the game creates or duplicates while the menu is open. */
+
 static void AudioSuppressIfPaused(IDirectSoundBuffer *b) {
     if (!g_audioPaused || !b) return;
     EnterCriticalSection(&g_audioCs);
@@ -5614,7 +5614,7 @@ static void AudioSuppressIfPaused(IDirectSoundBuffer *b) {
     LeaveCriticalSection(&g_audioCs);
 }
 
-/* Watchdog: the game can restart the streaming buffer behind our back; keep the pause silent. */
+
 static void AudioEnforceSilence(void) {
     int i;
     EnterCriticalSection(&g_audioCs);
@@ -5877,7 +5877,7 @@ static int PracticeSeekBgmInner(int seconds) {
     return 1;
 }
 
-/* Logs the faulting instruction and registers of a crash, so a crash during the BGM seek can be located. */
+
 static LONG CALLBACK SeekCrashVeh(PEXCEPTION_POINTERS ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION ||
@@ -5898,8 +5898,8 @@ static LONG CALLBACK SeekCrashVeh(PEXCEPTION_POINTERS ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-/* The streaming thread decodes and refills the music from the same source object, so the whole seek
-   (format query, source seek, ring refill) runs under the music lock (0x40efe0 / 0x40eff0, music+0x1c). */
+
+
 static int PracticeSeekBgm(int seconds) {
     typedef void *(__cdecl *PF_GetCurrentMusic)(void);
     typedef void (__attribute__((thiscall)) *PF_MusicLock)(void *);
@@ -5932,7 +5932,7 @@ static void AudioChkTick(void) {
                 if (g_audio[k].buf == b) { alive = 1; break; }
             if (!alive) { g_chk[i] = g_chk[g_chkN - 1]; g_chkN--; continue; }
             if (SUCCEEDED(IDirectSoundBuffer_GetCurrentPosition(b, &pos, NULL))) {
-                /* elapsed time since the resume (due = resumeTick + 150) */
+                
                 elapsed = (now - c->due) + 150;
                 exp = c->settled + elapsed * c->bps / 1000;
                 exp %= c->size;
@@ -5990,8 +5990,8 @@ static DWORD WINAPI PauseAudioThread(LPVOID unused) {
             }
             AudioResume(doPlay);
         } else if (cur) {
-            /* Keep the pause silent: the game may restart the streaming buffer or create a
-               new one for the menu, which would otherwise keep the BGM playing. */
+            
+
             DWORD now = GetTickCount();
             static DWORD lastEnforce;
             if (now - lastEnforce >= 100) {
@@ -6088,7 +6088,7 @@ static void __attribute__((thiscall)) SePlayHook(void *se, int pan, int vol) {
     DWORD status = 0;
     HRESULT hr;
 
-    if (g_exMuteSe || g_exSimulatingStageFrame) return;   /* silent during the practice fast-forward */
+    if (g_exMuteSe || g_exSimulatingStageFrame) return;   
     if (!bufs || count <= 0) return;
     if (idx < 0 || idx >= count) idx = 0;
 
@@ -6219,8 +6219,8 @@ static void BatchApplyTexture(void) {
     }
 }
 
-/* Draws the queued quads.  The count is cleared first so that a state change made while the draw is
-   being issued (D7_BatchFlush -> here) cannot draw them twice. */
+
+
 void SmdBatchFlushQuads(void) {
     int q = g_bquads;
     if (q > 0) {
@@ -6350,16 +6350,16 @@ static const int g_FrameWaitSleep = 1;
 static const double g_FrameWaitMarginMs = 2.0;
 static const double g_FrameWaitMarginHiResMs = 0.7;
 
-/* In-game FPS counter (bottom-right HUD, 0x414A80 draws 0x416010 at 0x414ABF) shows integer fps.
-   Show 1 decimal place using the game's digit glyphs + a dot glyph from the same atlas. */
+
+
 typedef void (__cdecl *PF_DrawNumber)(int value, int font, int x, int y, int unk1, int a, int g, int b, int color);
 static LARGE_INTEGER g_fpsSampleTime;
 static unsigned int g_fpsSampleFrames;
-static double g_fpsTenths; /* fixed at 1 decimal, e.g. 598 = 59.8 */
+static double g_fpsTenths; 
 static int g_fpsDotLogged;
 
-/* 0x4089A0 glyph blit: __thiscall(ecx=tex, 10 stack args), ret 0x28. Mirrors 416145:
-   (dstX,dstY,srcH,srcW,srcX,srcY,srcH,srcW,0,color). */
+
+
 static void __attribute__((noinline)) GameBlitGlyph(void *tex, int dstX, int dstY, int srcH, int srcW, int srcX, int srcY, int color) {
     struct { uintptr_t fn; void *tex; int a[10]; } s;
     s.fn = 0x4089a0; s.tex = tex;
@@ -6372,7 +6372,7 @@ static void __attribute__((noinline)) GameBlitGlyph(void *tex, int dstX, int dst
         : : [s]"r"(&s) : "eax","ecx","edx","memory");
 }
 
-/* Same blit with a separate destination size: (dstX,dstY,dstW,dstH,srcX,srcY,srcW,srcH,0,alpha). */
+
 static void __attribute__((noinline)) GameBlitGlyphScaled(void *tex, int dstX, int dstY, int dstW, int dstH,
                                                           int srcX, int srcY, int srcW, int srcH, int alpha) {
     struct { uintptr_t fn; void *tex; int a[10]; } s;
@@ -6386,15 +6386,15 @@ static void __attribute__((noinline)) GameBlitGlyphScaled(void *tex, int dstX, i
         : : [s]"r"(&s) : "eax","ecx","edx","memory");
 }
 
-/* 0x416010 args: (value, digit count, x, y, font index, texSel, alpha, zero-pad flag, color).  x is the
-   right-most digit's left edge; digit i (from the right) is at x + cw[font]*i; the 0x4089A0 last arg is alpha.
-   The parameter names below keep the old order: `font` = digit count, `unk1` = font index. */
+
+
+
 static void __cdecl FpsDisplayHook(int value, int font, int x, int y, int unk1, int a, int g, int b, int color) {
     LARGE_INTEGER now;
     int *gw = (int*)0x4db0c4, *gh = (int*)0x4db0e0, *sy = (int*)0x4db0fc, *cw = (int*)0x4db0a8, *sx = (int*)0x4db118;
-    void *tex = a ? *(void**)0x4db13c : *(void**)0x4db144; /* same selection as 416010 */
+    void *tex = a ? *(void**)0x4db13c : *(void**)0x4db144; 
     PF_DrawNumber draw = (PF_DrawNumber)(uintptr_t)0x416010;
-    int fi = unk1; /* real font index */
+    int fi = unk1; 
     int count = font;
 
     int v, ip, tenths, digitW, cellW, cellH, baseSY, baseSX;
@@ -6423,31 +6423,31 @@ static void __cdecl FpsDisplayHook(int value, int font, int x, int y, int unk1, 
     ip = v / 10;
     tenths = v % 10;
 
-    /* Keep right edge near original: shift left by (dot slot + tenths digit). */
+    
     digitW = cw[font] ? cw[font] : 8;
     cellW = gw[font] ? gw[font] : digitW;
     cellH = gh[font] ? gh[font] : digitW;
     baseSY = sy[font];
     baseSX = sx[font];
 
-    /* Decimal point generated from the in-game digit atlas (pbgtk/PBG5 -> Grp.ac5 Text2/shield.tga;
-       font3: sy=104, gh=16, digits at sx+(gh+4)*n, no '.' glyph exists). Sample a solid block from
-       the '1' glyph stroke so color/alpha/texture match the digits, placed on the digit baseline. */
-    /* Text.tga (tex 0x4db144) has a real '.' glyph: font 4's row (sy=132) reads "0123456789." with the dot in
-       the 11th cell, i.e. srcX = (gh+4)*10 + sx.  Blit that whole cell, centred in the dot slot. */
+    
+
+
+    
+
     dotGW = gw[4] ? gw[4] : cellW;
     dotGH = gh[4] ? gh[4] : cellH;
     inkX = (dotGH + 4) * 10 + sx[4];
     inkY = sy[4];
     dotSize = dotGW;
     oneSX = 0;
-    slot = digitW * 2 / 3 > 4 ? digitW * 2 / 3 : 4;  /* width reserved for the dot, between int part and tenths */
-    /* x is the LEFT edge of the whole number (digit i of count at x + cw*i, least significant digit last).
-       Keep the right edge: int part is shifted left by slot + cw, then dot slot, then the tenths digit in
-       the original last-digit cell. */
+    slot = digitW * 2 / 3 > 4 ? digitW * 2 / 3 : 4;  
+    
+
+
     tenthX = x + digitW * (count - 1);
-    /* enlarge the dot 1.5x, keep its bottom on the digit row, nudge it right */
-    /* the game passes (gh, gw) as the (w, h) pair for both dst and src (see 416145), keep that order */
+    
+    
     dotDW = dotGH * 3 / 2;
     dotDH = dotGW * 3 / 2;
     dotX = tenthX - slot + (slot - dotDW) / 2 + 3;
@@ -6473,9 +6473,9 @@ static void PatchFpsDisplay(void) {
     Log("FpsDisplay: %s (1 decimal)", n ? "patched" : "skipped");
 }
 
-/* A high-resolution waitable timer (Windows 10 1803+) wakes up within ~0.5 ms, so the frame wait can sleep
-   almost the whole remaining time instead of leaving 2 ms for busy-waiting.  Without it the 1 ms system
-   timer resolution is requested and the old margin is kept. */
+
+
+
 static HANDLE g_fwTimer = NULL;
 static int g_fwTimerInit = 0;
 static int g_fwHiRes = 0;
@@ -6493,7 +6493,7 @@ static void FrameWaitInit(void) {
         if (tbp) tbp(1);
     }
     if (cw) {
-        g_fwTimer = cw(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+        g_fwTimer = cw(NULL, NULL, 0x00000002 , TIMER_ALL_ACCESS);
         if (g_fwTimer) g_fwHiRes = 1;
     }
     Log("FrameWait: %s", g_fwHiRes ? "high-resolution waitable timer" : "MsgWait with 1 ms timer resolution");
@@ -6502,14 +6502,14 @@ static void FrameWaitInit(void) {
 typedef unsigned (__attribute__((fastcall)) *PF_FrameTimer)(int *ctx);
 int SmdD3D9GetVsync(void);
 
-/* ---- main-thread heartbeat + freeze watchdog (debug builds) ---------------- */
+
 #ifdef SMD_DEBUG_BUILD
-static volatile LONG g_frameSeq = 0;        /* bumped once per frame by FrameTimerHook */
-static volatile DWORD g_frameSeqTick = 0;   /* last heartbeat update time */
+static volatile LONG g_frameSeq = 0;        
+static volatile DWORD g_frameSeqTick = 0;   
 static volatile DWORD g_mainThreadId = 0;
 
-/* Logs a report when the main thread stops producing frames while the process
-   is still alive (hooked call stuck, deadloop, deadlock, ...). */
+
+
 static DWORD WINAPI FreezeWatchThread(LPVOID arg) {
     LONG lastSeq = 0;
     DWORD lastSeqTick = 0, lastReport = 0;
@@ -6526,7 +6526,7 @@ static DWORD WINAPI FreezeWatchThread(LPVOID arg) {
             lastSeqTick = tick;
             continue;
         }
-        if (!seq) continue;    /* game loop not started yet */
+        if (!seq) continue;    
         if (now - (lastSeqTick ? lastSeqTick : now) > 5000 &&
             now - lastReport > 5000) {
             lastReport = now;
@@ -6560,16 +6560,16 @@ static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
 #endif
 
     if (vsync) {
-        /* When VSync is ON, D3D9 present blocks on vblank (16.67ms);
-           run original frame timer without additional delay */
+        
+
         TitleCancelFrameTick();
         SmdControllerPoll();
         BatchTryInstall();
         return ((PF_FrameTimer)(uintptr_t)0x424f20)(ctx);
     }
 
-    /* VSync is OFF: Pace the frame loop to a rock-solid 60.0000 FPS using QPC
-       to eliminate stutter, frame drops, and 100% CPU busy-spinning. */
+    
+
     if (!g_ftInit) {
         g_ftInit = 1;
         QueryPerformanceFrequency(&g_ftFreq);
@@ -6584,8 +6584,8 @@ static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
 
     QueryPerformanceCounter(&now);
 
-    /* If clock desynced or stalled by more than 2 frames (e.g. stage load / pause),
-       resynchronize immediately to current time */
+    
+
     if (now.QuadPart > g_ftNextTick.QuadPart + targetCounts * 2 ||
         now.QuadPart < g_ftNextTick.QuadPart - targetCounts * 2) {
         g_ftNextTick = now;
@@ -6614,7 +6614,7 @@ static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
             g_fwSpins++;
         }
 
-        /* Fine-grained QPC spin-wait for the sub-millisecond remainder */
+        
         for (;;) {
             QueryPerformanceCounter(&now);
             if (now.QuadPart >= g_ftNextTick.QuadPart) break;
@@ -6625,21 +6625,21 @@ static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
         }
     }
 
-    /* Advance next target tick by exactly 1 frame interval (preserves 60.0 Hz phase) */
+    
     g_ftNextTick.QuadPart += targetCounts;
 
-    /* Poll input directly at the frame boundary right before logic update for minimum latency */
+    
     TitleCancelFrameTick();
     SmdControllerPoll();
     BatchTryInstall();
 
-    /* Populate the game timer context (ctx = 0x4e92a8) */
+    
     {
-        int idx = ctx[65]; /* [ctx + 0x104] frame index 0..59 */
-        ctx[3] = 0; /* logic accumulator */
-        ctx[4] = 0; /* render accumulator */
-        ((unsigned char*)ctx)[0x108] = 1; /* logic ready flag */
-        ((unsigned char*)ctx)[0x109] = 1; /* render ready flag */
+        int idx = ctx[65]; 
+        ctx[3] = 0; 
+        ctx[4] = 0; 
+        ((unsigned char*)ctx)[0x108] = 1; 
+        ((unsigned char*)ctx)[0x109] = 1; 
 
         if (idx >= 0 && idx < 60) {
             ctx[5 + idx] = (int)((double)now.QuadPart * 1800000.0 / (double)g_ftFreq.QuadPart);
@@ -6698,15 +6698,15 @@ static void PatchKeepRunningInactive(void) {
     Log("KeepActive: game active-state flag is held while the window is unfocused");
 }
 
-/*
- * Extra practice: no replay save prompt.
- *
- * When a stage ends, the scene update (0x413ab0) goes to the title for a practice run (BYTE 0x4dade0 != 0)
- * and to scene 5 (replay save prompt) otherwise: `push 0; push 5; call 0x4254d0` at 0x413bdb.  The Extra
- * practice is started like a normal Extra run (0x4dade0 = 0), so it ended in the replay save prompt.
- * Every `push 0; push 5; call 0x4254d0` (cdecl, 0x4254d0(scene, force)) in the code is redirected to a hook
- * that asks for the title (scene 1) instead while an Extra practice run (g_exRun) is active.
- */
+
+
+
+
+
+
+
+
+
 typedef void (__cdecl *PF_SceneSwitch)(int scene, int force);
 
 static void __cdecl StageEndSceneHook(int scene, int force) {
@@ -6741,8 +6741,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
         LogOpen();
-        /* No loader error dialogs ("entry point not found in the dynamic link library" etc.) for any DLL the game or
-           this proxy loads; a failed load is reported through the return value / the log instead. */
+        
+
         SetErrorMode(SetErrorMode(0) | SEM_FAILCRITICALERRORS);
         QueryPerformanceFrequency(&g_qpcFreq);
         Log("process attach (pid=%lu)", GetCurrentProcessId());

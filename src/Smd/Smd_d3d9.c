@@ -19,10 +19,10 @@
 #endif
 #include "Smd_internal.h"
 
-/* D3D9/DDraw emulation restored from Raindrop 0.1.9 (tag 0.1.9, commit 8eb18cc). */
+
 static int g_fullscreenRequested = 0;
 static int g_displayModeFailures = 0;
-static int g_d7Vsync = 1;   /* device presents with D3DPRESENT_INTERVAL_ONE (see D7E_ConfigVsync) */
+static int g_d7Vsync = 1;   
 static int D7E_ConfigVsync(UINT refresh);
 static const char *D7E_VsyncSource(void);
 static void ExeDirFile(const char *name, char *out) {
@@ -32,8 +32,8 @@ static void ExeDirFile(const char *name, char *out) {
     strcat(out, name);
 }
 
-/* Debug call tracer: logs the first D7_TRACE_LIMIT  DirectDraw7/Direct3D7 API calls
-   so a startup hang can be located by looking at the last logged call. */
+
+
 #ifdef SMD_DEBUG_BUILD
 static unsigned g_d7TraceTotal;
 #define D7_TRACE_LIMIT 600
@@ -54,8 +54,8 @@ static void TraceHitN(const char *name, unsigned long a, unsigned long b) {
 #define SMD_D3D7_EMU 1
 #endif
 static const int g_D7Emu = SMD_D3D7_EMU;
-/* Create the Direct3D9 device as a pure device (no runtime state tracking/validation, no Get* calls): the
-   layer filters redundant state itself.  Falls back to a normal hardware device if it cannot be created. */
+
+
 static const int g_D7PureDevice = 1;
 
 static const GUID k_D7_IID_Unknown = { 0x00000000, 0x0000, 0x0000, { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
@@ -70,7 +70,7 @@ static const GUID k_D7_IID_Surf7 = { 0x06675A80, 0x3B9B, 0x11D2, { 0xB9, 0x2F, 0
 
 static int D7_Iid(const GUID *a, const GUID *b) { return memcmp(a, b, sizeof(GUID)) == 0; }
 
-typedef struct { DWORD m[4]; int sh[4], nb[4]; } D7Fmt;   /* R, G, B, A */
+typedef struct { DWORD m[4]; int sh[4], nb[4]; } D7Fmt;   
 
 typedef struct D7Surf {
     void **vt;
@@ -86,7 +86,7 @@ typedef struct D7Surf {
     int hasKey;
     DWORD keyLo;
     int dirty;
-    int dpart;          /* dirty region is only drc (otherwise the whole surface) */
+    int dpart;          
     RECT drc;
     int lockRO, lockFull;
     RECT lockRc;
@@ -125,14 +125,14 @@ static struct {
     unsigned warned;
     unsigned surfLogged;
     int inScene;
-    int fs;            /* borderless fullscreen (game asked for DDSCL_FULLSCREEN, i.e. WndMode=off) */
-    int fsCw, fsCh;    /* client size the borders were last painted for */
-    IDirect3DStateBlock9 *sb;   /* unused (kept for the device reset path) */
-    DWORD fvf;                  /* FVF currently set on the device (0 = unknown) */
-    void *devTex[8];            /* texture currently set on the device per stage */
+    int fs;            
+    int fsCw, fsCh;    
+    IDirect3DStateBlock9 *sb;   
+    DWORD fvf;                  
+    void *devTex[8];            
 } g_d7 = { 0, NULL, 640, 480 };
 
-/* Device state shadows: skip SetFVF / SetTexture calls that would not change anything. */
+
 static void D7_SetFVF(DWORD fvf) {
     if (!g_d7.dev || g_d7.fvf == fvf) return;
     g_d7.fvf = fvf;
@@ -149,7 +149,7 @@ static void D7_SetTex(DWORD stage, IDirect3DTexture9 *t) {
 int SmdD3D9EmuActive(void) { return g_d7.active; }
 static int D7_EmuActive(void) { return g_d7.active; }
 
-/* Draw batching (see D7_BatchFlush): consecutive sprite quads are collected here. */
+
 #define D7_BATCH_FVF 0x1c4
 #define D7_BATCH_MAX 1024
 static DWORD g_d7bv[D7_BATCH_MAX * 6 * 8];
@@ -161,7 +161,7 @@ static void D7_BatchFlush(void) {
     IDirect3DTexture9 *tex = NULL;
     unsigned quads = g_d7bq;
     TraceHitN("Dev.BatchFlush", quads, 0);
-    SmdBatchFlushQuads();   /* called before every real state change: the queued sprites use the old state */
+    SmdBatchFlushQuads();   
     if (!quads) return;
     g_d7bq = 0;
     if (quads > D7_BATCH_MAX) quads = D7_BATCH_MAX;
@@ -187,8 +187,8 @@ static int D7_Warn(unsigned bit) {
     return 1;
 }
 
-/* ---- pixel format helpers ------------------------------------------- */
-static unsigned char g_d7Exp[9][256];   /* n-bit channel value -> 8-bit */
+
+static unsigned char g_d7Exp[9][256];   
 static int g_d7ExpInit = 0;
 
 static void D7_FmtInit(D7Fmt *f, const DDPIXELFORMAT *pf) {
@@ -277,7 +277,7 @@ static const struct { DWORD flags, bpp, r, g, b, a; } k_d7Fmts[] = {
     { DDPF_RGB,                    16, 0x00007C00, 0x000003E0, 0x0000001F, 0 }
 };
 
-/* ---- surfaces ------------------------------------------------------- */
+
 static D7Surf *D7_SurfNew(int w, int h, const DDPIXELFORMAT *pf, DWORD caps) {
     D7Surf *s = (D7Surf*)calloc(1, sizeof(*s));
     if (!s) return NULL;
@@ -340,7 +340,7 @@ static ULONG STDMETHODCALLTYPE ES_Release(void *self) {
     return 0;
 }
 
-/* Marks (part of) a surface as changed so that its texture is refreshed; partial marks are merged. */
+
 static void D7_MarkDirty(D7Surf *s, const RECT *r) {
     RECT c;
     if (!r) {
@@ -366,7 +366,7 @@ static void D7_MarkDirty(D7Surf *s, const RECT *r) {
     }
 }
 
-/* 16-bit raw value -> A8R8G8B8 lookup table per pixel format (built on first use). */
+
 static const DWORD *D7_Lut16(const D7Fmt *f) {
     static struct { DWORD m[4]; DWORD *t; } cache[4];
     static int ncache = 0;
@@ -387,7 +387,7 @@ static const DWORD *D7_Lut16(const D7Fmt *f) {
     return t;
 }
 
-/* Direct3D9 texture for a surface (A8R8G8B8, colour key -> alpha 0). */
+
 static IDirect3DTexture9 *D7_GetTex(D7Surf *s) {
     D3DLOCKED_RECT lr;
     int x, y, bytes, n, partial;
@@ -424,7 +424,7 @@ static IDirect3DTexture9 *D7_GetTex(D7Surf *s) {
                         memcpy(dp, sp, (size_t)n * sizeof(DWORD));
                         continue;
                     }
-                    /* fast path: A8R8G8B8 / X8R8G8B8 */
+                    
                     DWORD m3 = s->fmt.m[3], addA = m3 ? 0u : 0xFF000000u, keyv = s->keyLo & ~m3;
                     const DWORD *sd = (const DWORD*)sp;
                     for (x = 0; x < n; x++) {
@@ -505,7 +505,7 @@ static void D7_Fill(D7Surf *d, const RECT *rIn, DWORD raw) {
     D7_MarkDirty(d, &r);
 }
 
-/* ---- Direct3D9 device ------------------------------------------------ */
+
 typedef IDirect3D9 *(WINAPI *PF_D7Create9)(UINT);
 
 static void D7_ApplyRS(DWORD st, DWORD v) {
@@ -544,7 +544,7 @@ static void D7_Reapply(void) {
     }
 }
 
-/* Turn the game window into a borderless window covering its monitor. */
+
 static void D7_SetupBorderless(HWND hwnd) {
     MONITORINFO mi;
     HMONITOR mon;
@@ -571,9 +571,9 @@ static void D7_SetupBorderless(HWND hwnd) {
         (long)mi.rcMonitor.left, (long)mi.rcMonitor.top);
 }
 
-/* Bring the game window to the foreground (Windows refuses a plain SetForegroundWindow
-   from a process that is not in the foreground, so attach to the foreground thread's
-   input queue first and fall back to an Alt key tap). */
+
+
+
 static void D7_BringToFront(HWND hwnd) {
     HWND fg;
     DWORD fgThread = 0, myThread;
@@ -602,8 +602,8 @@ static void D7_BringToFront(HWND hwnd) {
     SmdLog("Foreground: window %p %s", (void*)hwnd, GetForegroundWindow() == hwnd ? "is now in the foreground" : "could not be brought to the foreground");
 }
 
-/* Switch the game window between borderless fullscreen and a normal window whose
-   client area is the virtual display size. */
+
+
 static void D7_SetWindowed(int windowed) {
     HWND hwnd = g_d7.hwnd;
     MONITORINFO mi;
@@ -640,7 +640,7 @@ static void D7_SetWindowed(int windowed) {
     InvalidateRect(hwnd, NULL, TRUE);
 }
 
-/* Puts the device and the state shadows into the same, known state (all states the layer touches). */
+
 static void D7_SeedState(void) {
     IDirect3DDevice9 *dev = g_d7.dev;
     static const DWORD rsSeed[][2] = {
@@ -750,8 +750,8 @@ static int D7_InitD3D9(void) {
     return 1;
 }
 
-/* Present; in borderless fullscreen the back buffer is stretched to the client area
-   keeping its aspect ratio (black bars). */
+
+
 static HRESULT D7_PresentFS(void) {
     RECT cr, dr;
     int cw, ch, w, h;
@@ -785,12 +785,12 @@ static HRESULT D7_PresentFS(void) {
     return IDirect3DDevice9_Present(g_d7.dev, NULL, &dr, NULL, NULL);
 }
 
-/* Present pacing: align early frame arrivals to 16.667 ms boundaries so D3D9 holds a stable 60.0 fps.
-   Only used when the device presents without vblank sync (INTERVAL_IMMEDIATE): there Present returns as
-   soon as the frame is handed to the driver/compositor, so the game loop needs its own 60 Hz pacing.
-   With INTERVAL_ONE the vblank already paces the loop, and waiting here only moves the present towards
-   the vblank boundary where it can miss it and slip a whole frame (+16.7 ms of input latency), so the
-   wait is skipped entirely in that mode.  Disengages when present itself is the bottleneck. */
+
+
+
+
+
+
 static LARGE_INTEGER g_paceFreq;
 static LARGE_INTEGER g_lastPresent;
 static double g_costEwmaMs;
@@ -802,9 +802,9 @@ static const double D7_PACE_INTERVAL_MS = 16.666667;
 static double D7PaceWait(void);
 static int SmdIsWine(void);
 
-/* Under Wine the game's own frame timer already holds 60 fps, so the wait is skipped; this guard
-   re-enables it if a system ever presents faster than the game's fixed 60 Hz step. */
-static int g_paceNeeded = -1;   /* -1 unknown, 0 no pacing needed, 1 pacing required */
+
+
+static int g_paceNeeded = -1;   
 static LARGE_INTEGER g_rateStart;
 static unsigned g_rateFrames;
 
@@ -824,13 +824,13 @@ static int D7PaceEnabled(void) {
 }
 
 static double D7PaceWait(void) {
-    /* Pacing is handled with sub-microsecond QPC precision at frame start in FrameTimerHook.
-       Skipping wait here eliminates latency between render and presentation. */
+    
+
     return 0.0;
 }
 
-/* Count presents and re-enable the pacing wait when the loop runs faster than the game's 60 Hz
-   step (only relevant while the wait is skipped: no vblank sync, and not yet re-enabled). */
+
+
 static void D7RateGuard(void) {
     LARGE_INTEGER now;
     if (!SmdIsWine() || g_d7Vsync || g_paceNeeded == 1 || !g_paceFreq.QuadPart) return;
@@ -869,11 +869,11 @@ static void D7_Present(void) {
     cost = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)g_paceFreq.QuadPart;
     D7PaceUpdate(t1, cost);
     D7RateGuard();
-    SmdKeyLatNote(t1.QuadPart);   /* press->present latency measurement feeds each D3D9 present */
+    SmdKeyLatNote(t1.QuadPart);   
     {
         static unsigned presentSeq;
-        /* Per-frame present logging makes the debug build's own I/O a measurable part of the frame;
-           sample every 10th present so latency measurements stay representative. */
+        
+
         if ((++presentSeq % 10) == 0 || cost > 8.0)
             SmdLog("D7Present: hr=%08X elapsed=%.2f ms pace=%.2f ms", (unsigned)hr, cost, paceMs);
     }
@@ -892,12 +892,12 @@ static void D7_Present(void) {
     }
 }
 
-/* ---- software surface -> Direct3D9 back buffer ------------------------
-   Used for Blt/BltFast into the 3D back buffer and for Blt(primary <- 2D
-   surface).  The source surface becomes a texture (colour key -> alpha 0,
-   see D7_GetTex) and is drawn as a pre-transformed quad.  The complete
-   device state is captured in a state block first and restored afterwards,
-   so the game's own render/texture-stage state is not disturbed. */
+
+
+
+
+
+
 typedef struct { float x, y, z, rhw; DWORD color; float u, v; } D7Quad;
 #define D7_QUAD_FVF (D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1)
 
@@ -937,7 +937,7 @@ static int D7_BltToDev(const RECT *drIn, D7Surf *s, const RECT *srIn, int useKey
     t = D7_GetTex(s);
     if (!t) return 0;
 
-    /* -0.5: align texel centres with pixel centres for pre-transformed vertices */
+    
     x0 = (float)dr.left - 0.5f;   y0 = (float)dr.top - 0.5f;
     x1 = (float)dr.right - 0.5f;  y1 = (float)dr.bottom - 0.5f;
     u0 = (float)sr.left / (float)s->w;   v0 = (float)sr.top / (float)s->h;
@@ -948,9 +948,9 @@ static int D7_BltToDev(const RECT *drIn, D7Surf *s, const RECT *srIn, int useKey
     q[2].x = x0; q[2].y = y1; q[2].u = u0; q[2].v = v1;
     q[3].x = x1; q[3].y = y1; q[3].u = u1; q[3].v = v1;
 
-    /* The game's own render/texture-stage state is saved from the state shadows (all the states touched
-       here are seeded by D7_SeedState) and restored afterwards; states that already have the wanted value
-       cost nothing, so no device state block is needed. */
+    
+
+
     D7_BatchFlush();
     rsVal[0] = FALSE; rsVal[1] = FALSE; rsVal[2] = FALSE; rsVal[3] = D3DCULL_NONE; rsVal[4] = FALSE;
     rsVal[5] = FALSE; rsVal[6] = FALSE; rsVal[7] = FALSE; rsVal[8] = FALSE;
@@ -984,11 +984,11 @@ static int D7_BltToDev(const RECT *drIn, D7Surf *s, const RECT *srIn, int useKey
     return 1;
 }
 
-/* ---- stub generators ------------------------------------------------- */
+
 #define D7FN(name, ret, ...) \
     static HRESULT STDMETHODCALLTYPE name(void *self, ##__VA_ARGS__) { (void)self; return (ret); }
 
-/* ---- IDirectDrawSurface7 --------------------------------------------- */
+
 static HRESULT STDMETHODCALLTYPE ES_QueryInterface(void *self, const GUID *riid, void **out) {
     if (!out) return E_POINTER;
     *out = NULL;
@@ -1017,7 +1017,7 @@ static HRESULT STDMETHODCALLTYPE ES_Blt(void *self, RECT *dr, void *srcp, RECT *
         if (s && (s == g_d7.back3d || (s->caps & DDSCAPS_3DDEVICE) || s == d->back)) {
             D7_Present();
         } else if (s && g_d7.dev) {
-            /* 2D surface -> primary: draw it onto the Direct3D9 back buffer, then present */
+            
             if (!D7_BltToDev(dr, s, sr, (flags & DDBLT_KEYSRC) ? 1 : 0) && D7_Warn(D7W_PRIMBLT))
                 SmdLog("D3D7 emu: Blt to the primary surface failed (invalid rectangle or texture)");
             D7_Present();
@@ -1204,7 +1204,7 @@ static HRESULT STDMETHODCALLTYPE ES_Lock(void *self, RECT *r, DDSURFACEDESC2 *d,
 
 static HRESULT STDMETHODCALLTYPE ES_Unlock(void *self, RECT *r) {
     D7Surf *s = (D7Surf*)self;
-    /* a read-only lock cannot have changed the pixels; otherwise only the locked rectangle is refreshed */
+    
     if (!s->lockRO) D7_MarkDirty(s, s->lockFull ? NULL : &s->lockRc);
     s->lockRO = 0;
     s->lockFull = 1;
@@ -1296,7 +1296,7 @@ static void *g_d7SurfVt[49] = {
     (void*)ES_SetLOD, (void*)ES_GetLOD
 };
 
-/* ---- IDirect3DDevice7 ------------------------------------------------ */
+
 static HRESULT STDMETHODCALLTYPE EV_QueryInterface(void *self, const GUID *riid, void **out) {
     if (!out) return E_POINTER;
     *out = NULL;
@@ -1438,8 +1438,8 @@ static UINT D7_FvfStride(DWORD fvf) {
     return st;
 }
 
-/* DDCKEY_SRCBLT emulation: texels equal to the key have alpha 0 (see D7_GetTex);
-   while COLORKEYENABLE is on, reject them with an alpha test on the texture alpha. */
+
+
 static void D7_CkBegin(void) {
     D7_ApplyRS(D3DRS_ALPHATESTENABLE, TRUE);
     D7_ApplyRS(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
@@ -1551,7 +1551,7 @@ static void *g_d7DevVt[49] = {
     (void*)EV_GetLightEnable, (void*)EV_SetClipPlane, (void*)EV_GetClipPlane, (void*)EV_GetInfo
 };
 
-/* ---- IDirect3D7 ------------------------------------------------------ */
+
 static HRESULT STDMETHODCALLTYPE E3_QueryInterface(void *self, const GUID *riid, void **out) {
     if (!out) return E_POINTER;
     *out = NULL;
@@ -1591,7 +1591,7 @@ static void *g_d7D3DVt[8] = {
     (void*)E3_EvictManagedTextures
 };
 
-/* ---- IDirectDraw7 ---------------------------------------------------- */
+
 static HRESULT STDMETHODCALLTYPE ED_QueryInterface(void *self, const GUID *riid, void **out) {
     if (!out) return E_POINTER;
     *out = NULL;
@@ -1673,12 +1673,12 @@ static HRESULT STDMETHODCALLTYPE ED_GetDisplayMode(void *self, DDSURFACEDESC2 *d
     return DD_OK;
 }
 
-/* ==========================================================================
-   Alt+Enter: toggle WndMode in config.txt and, with the Direct3D9 layer, switch
-   between borderless fullscreen and a normal window on the fly.  While Alt+Enter
-   is held (until Enter is released) the Enter key is hidden from the game: the
-   key-state APIs the game imports from user32 are hooked through its IAT.
-   ========================================================================== */
+
+
+
+
+
+
 static volatile LONG g_enterMask = 0;
 typedef SHORT (WINAPI *PF_KeyStateFn)(int);
 typedef BOOL (WINAPI *PF_KbStateFn)(PBYTE);
@@ -1704,7 +1704,7 @@ static char *WndModeReadFile(const char *path, size_t *outN) {
     return buf;
 }
 
-/* Find the value of the "WndMode=" line (a line that starts with it; comment lines never do). */
+
 static int WndModeFind(const char *buf, size_t n, size_t *vs, size_t *ve) {
     size_t i = 0;
     while (i < n) {
@@ -1724,7 +1724,7 @@ static int WndModeFind(const char *buf, size_t n, size_t *vs, size_t *ve) {
     return 0;
 }
 
-/* 1 = WndMode=on (window), 0 = off (fullscreen), -1 = not found */
+
 static int ReadWndModeConfig(void) {
     char path[MAX_PATH];
     size_t n = 0, vs = 0, ve = 0;
@@ -1818,7 +1818,7 @@ static BOOL WINAPI Hook_GetKeyboardState(PBYTE keys) {
     return r;
 }
 
-/* Replace the import thunk of `func` (any DLL) in the main executable. */
+
 static int HookIat(const char *func, void *hook, void **orig) {
     BYTE *base = (BYTE*)GetModuleHandleA(NULL);
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER*)base;
@@ -1864,7 +1864,7 @@ static HWND g_hotkeyHwnd = NULL;
 
 static LRESULT CALLBACK SmdWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_SYSKEYDOWN && w == VK_RETURN) {
-        if (!(l & 0x40000000)) {   /* ignore auto-repeat */
+        if (!(l & 0x40000000)) {   
             g_enterMask = 1;
             ToggleWndMode();
         }
@@ -1875,7 +1875,7 @@ static LRESULT CALLBACK SmdWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return CallWindowProcA(g_origWndProc, h, m, w, l);
 }
 
-/* Subclass the game window to catch Alt+Enter (also stops the system beep). */
+
 static void HotkeyAttach(HWND hwnd) {
     LONG_PTR prev;
     if (!hwnd || hwnd == g_hotkeyHwnd || !IsWindow(hwnd)) return;
@@ -1941,7 +1941,7 @@ D7FN(ED_CreatePalette, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c, DWORD d)
 D7FN(ED_DuplicateSurface, DDERR_UNSUPPORTED, DWORD a, DWORD b)
 typedef HRESULT (WINAPI *PF_D7EnumModes)(DDSURFACEDESC2*, void*);
 
-/* Report a fixed set of 16/32 bpp modes (the desktop mode is never changed, see ED_SetDisplayMode). */
+
 static HRESULT STDMETHODCALLTYPE ED_EnumDisplayModes(void *self, DWORD flags, DDSURFACEDESC2 *filter, void *ctx, PF_D7EnumModes cb) {
     static const struct { int w, h, bpp; } modes[] = {
         { 640, 480, 32 }, { 640, 480, 16 }, { 800, 600, 32 }, { 800, 600, 16 },
@@ -2046,11 +2046,11 @@ static int SmdIsWine(void) {
     return v;
 }
 
-/* [Graphics] VSync=auto|on|off in raindrop.ini, SMD_VSYNC=0/1 in the environment.
-   auto: vblank sync on a 59-61 Hz display, except under Wine/Proton where the X11/Wayland
-   compositor already presents the window on its own vblank; waiting for the vblank inside
-   Present as well costs one extra frame of input latency there, so Wine defaults to the
-   async present paced to 60 Hz instead. */
+
+
+
+
+
 static const char *g_d7VsyncSrc = "display refresh";
 
 static const char *D7E_VsyncSource(void) { return g_d7VsyncSrc; }
@@ -2114,11 +2114,11 @@ static int D7E_ConfigD3D9(void) {
                 SmdLog("Created raindrop.ini with default Graphics API");
             }
         }
-        /* The sentinel default tells us whether the user explicitly configured the API or
-           the ini only contains the default.  An explicit D3D9 request is honoured even
-           under Wine/Proton (DXVK provides d3d9 there); the fallback must not silently
-           override the user's config, otherwise Proton runs end up on the Wine builtin
-           DirectDraw, where the game cannot init and exits immediately. */
+        
+
+
+
+
         GetPrivateProfileStringA("Graphics", "API", "\x1notconfigured", value, sizeof(value), path);
         useD3D9 = (_stricmp(value, "D3D9") == 0 || _stricmp(value, "Direct3D9") == 0);
         if (_stricmp(value, "\x1notconfigured") == 0) {
@@ -2142,11 +2142,11 @@ static int D7E_ConfigD3D9(void) {
 
 static void D7E_BindPrivateExports(HMODULE real);
 
-/* Private ddraw.dll exports that the system d3d9.dll / d3d8.dll import.  The proxy is loaded under the name
-   ddraw.dll, so such an import binds to it; when it was missing the loader reported "entry point
-   AcquireDDThreadLock not found" and failed to load d3d9.dll.  Each export is a jump through a pointer that is
-   bound to the real system ddraw.dll (D7E_BindPrivateExports), so any argument list passes through unchanged;
-   until it is bound (or when the real DLL lacks it) the pointer is a plain `ret`. */
+
+
+
+
+
 static void SmdFwdDefault(void) {}
 #define SMD_FWD_STUB(name) \
     __attribute__((used)) static void *SmdFwdPtr_##name = (void*)SmdFwdDefault; \
@@ -2167,8 +2167,8 @@ static void D7E_BindPrivateExports(HMODULE real) {
 }
 
 static void D7E_SaveFallbackAPI(void) {
-    /* Every fallback to the Direct3D9 emulation is written to raindrop.ini, not only when the file was just
-       created, so the next start goes straight to D3D9 instead of failing on DirectDraw again. */
+    
+
     D7E_WriteConfigAPI("D3D9");
     g_D7E_ConfigCreated = 0;
     SmdLog("Saved D3D9 fallback to raindrop.ini");
@@ -2179,7 +2179,7 @@ static HRESULT D7E_CreateDD7(void **out) {
     g_d7.active = 1;
     g_d7DD.ref++;
     *out = &g_d7DD;
-    SmdKeyLatInit();   /* run the key-latency observer thread when SMD_KEYLAT is set */
+    SmdKeyLatInit();   
     SmdLog("D3D7 emu: using the built-in DirectDraw7/Direct3D7 -> Direct3D9 layer");
     return DD_OK;
 }
@@ -2200,7 +2200,7 @@ static FARPROC p_DllUnregisterServer;
 static void LoadReal(void) {
     if (g_real) return;
     
-    /* g_qpcFreq handled in Smd.c */
+    
     char sys[MAX_PATH];
     GetSystemDirectoryA(sys, MAX_PATH);
     strcat(sys, "\\ddraw.dll");
@@ -2291,7 +2291,7 @@ static HRESULT STDMETHODCALLTYPE WDD7_QueryInterface(IDirectDraw7 *self, REFIID 
                 (unsigned)riid->Data4[4], (unsigned)riid->Data4[5],
                 (unsigned)riid->Data4[6], (unsigned)riid->Data4[7], hr);
         else if (0 && IsEqualCLSID(riid, &k_IID_IDirect3D7))
-            // CensusHookD3D7(*out);
+            
         return hr;
     }
     IDirectDraw7_AddRef(w->orig);
@@ -2685,13 +2685,13 @@ __declspec(dllexport) HRESULT WINAPI DllUnregisterServer(void) {
     return ((PF_FPOCH)p_DllUnregisterServer)();
 }
 
-/*
- * Extra practice: no replay save prompt.
- *
- * When a stage ends, the scene update (0x413ab0) goes to the title for a practice run (BYTE 0x4dade0 != 0)
- * and to scene 5 (replay save prompt) otherwise: `push 0; push 5; call 0x4254d0` at 0x413bdb.  The Extra
- * practice is started like a normal Extra run (0x4dade0 = 0), so it ended in the replay save prompt.
- * Every `push 0; push 5; call 0x4254d0` (cdecl, 0x4254d0(scene, force)) in the code is redirected to a hook
- * that asks for the title (scene 1) instead while an Extra practice run (g_exRun) is active.
- */
+
+
+
+
+
+
+
+
+
 typedef void (__cdecl *PF_SceneSwitch)(int scene, int force);

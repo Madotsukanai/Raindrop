@@ -1,20 +1,20 @@
-#define VERSION "0.3.1"
+#define VERSION "0.3.2"
 #include <windows.h>
 #include <d3d9.h>
 #include <mmsystem.h>
 #include <stdio.h>
 #include "d3dx9_font_compat.h"
 
-/* ---------------------------------------------------------------------------
- * Game version / address table.
- * The mod supports the disc build and the Steam build of RefRain 1.03.7.
- * Every address below is stored as the preferred (0x400000-based) VA for that
- * build; at load time DetectVersion() picks the table, then rebases every
- * entry by the actual image base delta (both exes are DYNAMIC_BASE, so the
- * image is not guaranteed to load at 0x400000).
- * ------------------------------------------------------------------------- */
+
+
+
+
+
+
+
+
 typedef struct {
-    /* game variables */
+    
     DWORD Scene, SceneNext, ScenePend, Script;
     DWORD GameMode, ReplaySlot, GameModeNext, Var4d2370;
     DWORD FrameCnt;
@@ -25,28 +25,28 @@ typedef struct {
     DWORD Tasks, GpuQueue;
     DWORD Frame1, Frame2, ViewIdx;
     DWORD pdRange[6][2];
-    /* functions */
+    
     DWORD fnSE, fnTick, fnLoadGlobal, fnSaveGlobal, fnSaveGlobalRet;
     DWORD fnGetGameInfoInt, fnGetGameInfoIntRet;
     DWORD fnSetGameInfoInt, fnSetGameInfoIntRet;
     DWORD fnIsKeyPressed, fnIsKeyTriggered;
-    /* vtables / IAT */
+    
     DWORD vtInput, vtJoyA, vtJoyB, vtTask;
     DWORD iatGetKeyboardState, iatXInputGetCaps, iatXInputGetState;
-    /* hook sites and continuation addresses */
+    
     DWORD TransSite;
     DWORD LoadStartSite, LoadStartRet, LoadStartSkip;
     DWORD SceneCheckSite, SceneCheckRet;
     DWORD EndSceneSite, EndSceneRet;
     DWORD PreTickSite, PreTickRet;
     DWORD SetMefaSite, SetCrSite, SetLivesSite, SetDiffSite;
-    DWORD DispatchEpilogue;      /* steam: shared case epilogue; disc: 0 (inline epilogue) */
+    DWORD DispatchEpilogue;      
     DWORD RefRainCfgSite, RefRainCfgRet;
     DWORD GameInfoRefRainSite;
     DWORD SaveReplayHdrSite, SaveReplayHdrRet;
     DWORD FreadWrapSite, FwriteWrapSite;
     DWORD Getter19Fn, Getter19Entry;
-    DWORD ViewIdxWriteSite;    /* mov [viewIdx], eax in the scene/view setter */
+    DWORD ViewIdxWriteSite;    
 } GameAddrs;
 
 typedef struct {
@@ -63,38 +63,38 @@ typedef struct {
 } VersionSigs;
 
 static const GameAddrs ADDRS_DISC = {
-    /* Scene, SceneNext, ScenePend, Script */
+    
     0x005c073c, 0x005c0740, 0x005c0744, 0x005c0760,
-    /* GameMode, ReplaySlot, GameModeNext, Var4d2370 */
+    
     0x004d2378, 0x004d237c, 0x004d2380, 0x004d2370,
-    /* FrameCnt */
+    
     0x005abb78,
-    /* Unlock, LoadFlag, IsRefRain, Config, InputMgr */
+    
     0x005ac4d4, 0x005ac4dc, 0x005ac674, 0x005ac9b0, 0x005ac9b4,
-    /* Lives, St10, St14, St18, St1c, St20, St24, Diff */
+    
     0x005b8e08, 0x005b8e10, 0x005b8e14, 0x005b8e18, 0x005b8e1c, 0x005b8e20, 0x005b8e24, 0x005b8e28,
-    /* In1, In2, In3, Obj */
+    
     0x005b8e54, 0x005b8e58, 0x005b8e5c, 0x005b8e68,
-    /* Var5b975d, Cr, Mefa, Char, Player */
+    
     0x005b975d, 0x005b976c, 0x005b9770, 0x005b9774, 0x5b9778,
-    /* Tasks, GpuQueue */
+    
     0x005ba0a8, 0x004df338,
-    /* Frame1, Frame2, ViewIdx */
+    
     0x005abb70, 0x005abb74, 0x005abb80,
-    /* pdRange (PauseDiag snapshot ranges) */
+    
     { { 0x005abb60, 0x005abbc0 }, { 0x005b8e00, 0x005b8e70 }, { 0x005ac4c0, 0x005ac4f0 },
       { 0x005ac670, 0x005ac680 }, { 0x004d2370, 0x004d2380 }, { 0x005c0730, 0x005c0760 } },
-    /* fnSE, fnTick, fnLoadGlobal, fnSaveGlobal, fnSaveGlobalRet */
+    
     0x0043bf40, 0x0042a7c0, 0x0042a8e0, 0x0042c330, 0x0042c335,
-    /* fnGetGameInfoInt, ret, fnSetGameInfoInt, ret */
+    
     0x0044fb80, 0x0044fb85, 0x0044fca0, 0x0044fca5,
-    /* fnIsKeyPressed, fnIsKeyTriggered */
+    
     0x00431760, 0x004317a0,
-    /* vtInput, vtJoyA, vtJoyB, vtTask */
+    
     0x004b80c4, 0x004b83f8, 0x004b807c, 0x004b9a20,
-    /* iatGetKeyboardState, iatXInputGetCaps, iatXInputGetState */
+    
     0x0048c248, 0x0048c294, 0x0048c298,
-    /* hook sites */
+    
     0x00440deb,
     0x00441097, 0x004410a3, 0x004410ba,
     0x00440ff8, 0x00440ffe,
@@ -143,16 +143,16 @@ static const GameAddrs ADDRS_STEAM = {
 };
 
 static const VersionSigs SIGS_DISC = {
-    { 0xA1, 0x3C, 0x07, 0x5C, 0x00 },                                   /* Trans: mov eax,[scene] */
-    { 0x32, 0xC9, 0xC7, 0x05, 0xDC, 0xC4, 0x5A },                       /* LoadStart */
-    { 0x8B, 0x15, 0x40, 0x07, 0x5C, 0x00 },                             /* SceneCheck */
-    { 0xFF, 0x90, 0xA8, 0x00, 0x00, 0x00 },                             /* EndScene: call [eax+0xa8] */
-    { 0xF3, 0x0F, 0x10, 0x45, 0x08, 0xF3, 0x0F, 0x11, 0x05, 0x70, 0x97, 0x5B, 0x00 },  /* SetMefa */
-    { 0xF3, 0x0F, 0x10, 0x45, 0x08, 0xF3, 0x0F, 0x11, 0x05, 0x6C, 0x97, 0x5B, 0x00 },  /* SetCR */
-    { 0x8B, 0x45, 0x08, 0xA3, 0x08, 0x8E, 0x5B, 0x00 },                 /* SetLives */
-    { 0x8B, 0x45, 0x08, 0xA3, 0x28, 0x8E, 0x5B, 0x00 },                 /* SetDifficulty */
-    { 0x8B, 0x00, 0xC7, 0x45, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF },           /* GetRefRainConfig */
-    { 0x56, 0x6A, 0x01, 0x6A, 0x0C }                                    /* SaveReplayHeader */
+    { 0xA1, 0x3C, 0x07, 0x5C, 0x00 },                                   
+    { 0x32, 0xC9, 0xC7, 0x05, 0xDC, 0xC4, 0x5A },                       
+    { 0x8B, 0x15, 0x40, 0x07, 0x5C, 0x00 },                             
+    { 0xFF, 0x90, 0xA8, 0x00, 0x00, 0x00 },                             
+    { 0xF3, 0x0F, 0x10, 0x45, 0x08, 0xF3, 0x0F, 0x11, 0x05, 0x70, 0x97, 0x5B, 0x00 },  
+    { 0xF3, 0x0F, 0x10, 0x45, 0x08, 0xF3, 0x0F, 0x11, 0x05, 0x6C, 0x97, 0x5B, 0x00 },  
+    { 0x8B, 0x45, 0x08, 0xA3, 0x08, 0x8E, 0x5B, 0x00 },                 
+    { 0x8B, 0x45, 0x08, 0xA3, 0x28, 0x8E, 0x5B, 0x00 },                 
+    { 0x8B, 0x00, 0xC7, 0x45, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF },           
+    { 0x56, 0x6A, 0x01, 0x6A, 0x0C }                                    
 };
 
 static const VersionSigs SIGS_STEAM = {
@@ -168,19 +168,19 @@ static const VersionSigs SIGS_STEAM = {
     { 0x56, 0x6A, 0x01, 0x6A, 0x0C }
 };
 
-static DWORD  g_BaseDelta = 0;      /* actual image base - 0x400000 */
+static DWORD  g_BaseDelta = 0;      
 static volatile int g_IsSteam = 0;
-static GameAddrs g_Addrs;           /* runtime copy, rebased */
+static GameAddrs g_Addrs;           
 static const GameAddrs *g_A = &ADDRS_DISC;
 static VersionSigs g_Sigs;
 
-/* Accessors for game variables (g_A entries already carry the image delta). */
+
 #define VA(x)  (g_A->x)
 #define VD(x)  (*(volatile DWORD*)(g_A->x))
 #define VB(x)  (*(volatile BYTE*)(g_A->x))
 
-/* Addresses consumed by naked-hook inline asm (symbol-referenced, so the
- * register setup happens inside the asm block, after pushal-style saves). */
+
+
 static volatile DWORD g_A_SceneNext;
 static volatile DWORD g_A_LoadFlag;
 static volatile DWORD g_A_Mefa, g_A_Cr, g_A_Lives, g_A_Diff, g_A_ViewIdx;
@@ -202,9 +202,9 @@ static volatile int g_PracticeStage = 0;
 static volatile int g_AutoAdvanceToDifficulty = 0;
 static volatile int g_AutoNavPhase = 0;
 static volatile int g_AutoNavTimer = 0;
-/* Where the simulated title navigation should stop:
-   0 = reopen the Practice (stage select) menu - used when the menu is cancelled,
-   1 = leave the player on the character's desktop - used by the pause-menu Q hotkey. */
+
+
+
 static volatile int g_AutoNavTarget = 0;
 #define SIMKEY_NONE   0
 #define SIMKEY_DECIDE 1
@@ -261,9 +261,9 @@ static ID3DXFont *g_pTitleFont = NULL;
 static ID3DXFont *g_pFooterFont = NULL;
 static DWORD g_CurrentFontWidth = 0;
 
-/* Logging (raindrop.log and OutputDebugString) is only compiled into the debug build
-   (make refrain-debug, which defines REFRAIN_DEBUG_BUILD).  The release build keeps the call sites but
-   LogMessage does nothing there (the arguments are still evaluated). */
+
+
+
 #ifdef REFRAIN_DEBUG_BUILD
 static void LogMessage(const char *format, ...) {
     char buf[512];
@@ -309,13 +309,13 @@ static void DrawSolidRect(IDirect3DDevice9 *pDevice, float x, float y, float w, 
     pDevice->lpVtbl->DrawPrimitiveUP(pDevice, D3DPT_TRIANGLESTRIP, 2, verts, sizeof(struct Vertex2D));
 }
 
-/* Frame of `t` pixels drawn OUTSIDE the box (x, y, w, h).  Four thin rectangles instead of a filled one, so a
-   translucent panel drawn inside shows the game screen and not the border color. */
+
+
 static void DrawFrame(IDirect3DDevice9 *pDevice, float x, float y, float w, float h, float t, DWORD color) {
-    DrawSolidRect(pDevice, x - t, y - t, w + 2.0f * t, t, color);          /* top */
-    DrawSolidRect(pDevice, x - t, y + h, w + 2.0f * t, t, color);          /* bottom */
-    DrawSolidRect(pDevice, x - t, y,     t,            h, color);          /* left */
-    DrawSolidRect(pDevice, x + w, y,     t,            h, color);          /* right */
+    DrawSolidRect(pDevice, x - t, y - t, w + 2.0f * t, t, color);          
+    DrawSolidRect(pDevice, x - t, y + h, w + 2.0f * t, t, color);          
+    DrawSolidRect(pDevice, x - t, y,     t,            h, color);          
+    DrawSolidRect(pDevice, x + w, y,     t,            h, color);          
 }
 
 static void EnsureFont(IDirect3DDevice9 *pDevice, DWORD screenW) {
@@ -370,21 +370,21 @@ typedef struct {
     DWORD footerBorder, foot1, foot2;
 } PracticeMenuTheme;
 
-/* background panel opacity shared by every Practice menu theme (0x00 = invisible .. 0xFF = opaque) */
+
 #define MENU_PANEL_ALPHA 0xC4
 #define PANEL_COLOR(rgb) ((((DWORD)MENU_PANEL_ALPHA) << 24) | (DWORD)(rgb))
 
 static const PracticeMenuTheme *GetPracticeMenuTheme(DWORD ch) {
     static const PracticeMenuTheme themes[3] = {
-    	/* Miria */
+    	
         { PANEL_COLOR(0x0D111A), 0xFF00BFFF, 0xFF335577, 0x88004488, 0x55112233, 0xFFFFCC00, 0xFF88AABB,
           0x660077CC, 0x44005588, 0xFFFFFF00, 0xFF00FFCC, 0xFFAAAAAA, 0xFF666666, 0xFF555555, 0xFF333333,
           0xFF335577, 0xFF88DDFF, 0xFF6699BB },
-        /* Tee */
+        
         { PANEL_COLOR(0x2A1022), 0xFFFF88CC, 0xFFC0609C, 0x88C83C90, 0x55702C58, 0xFFFFE08A, 0xFFFFCCE4,
           0x66E048A8, 0x44B83C88, 0xFFFFFF88, 0xFFFFAADE, 0xFFFFD6EA, 0xFFD296B4, 0xFFA87890, 0xFF8C6078,
           0xFFC0609C, 0xFFFFC4E2, 0xFFE0A0C0 },
-        /* Mews */
+        
         { PANEL_COLOR(0x0D1A14), 0xFF28B898, 0xFF33574D, 0x880C5848, 0x55143328, 0xFFFFCC66, 0xFF99CCBB,
           0x66208870, 0x44185850, 0xFFFFFF66, 0xFF66FFD8, 0xFFB0DDCC, 0xFF668877, 0xFF446655, 0xFF335544,
           0xFF33574D, 0xFF88DDCC, 0xFF669988 }
@@ -416,25 +416,25 @@ typedef struct {
 
 #define MENU_ITEM_COUNT 5
 
-/* visitCentral[%d] (1-based, %d = stage 1..5) lives in the global data struct. Its per-build
-   base VAs (index 1) are 0x5ac4e0 (disc) / 0x5b05b0 (steam); rebased by g_BaseDelta at runtime.
-   A non-zero value means the player has reached that Central in normal play. */
+
+
+
 static inline int IsStageReached(int stage) {
     if (stage <= 1) return 1;
     if (stage > MENU_ITEM_COUNT) return 0;
-    static const DWORD visitBase[2] = { 0x005ac4e0, 0x005b05b0 };  /* [0]=disc, [1]=steam */
+    static const DWORD visitBase[2] = { 0x005ac4e0, 0x005b05b0 };  
     DWORD *p = (DWORD*)((uintptr_t)(visitBase[g_IsSteam ? 1 : 0] + g_BaseDelta) + (DWORD)(stage - 1) * 4);
     if (IsBadReadPtr(p, 4)) return 0;
     return *p != 0;
 }
 
-/* Number of practice-menu stages selectable now: limited by difficulty (Easy = 1..4) and by
-   normal-play progress (a stage is hidden until reached, so stage N is selectable only when
-   visitCentral[N] is set). */
+
+
+
 static inline int GetSelectableStageCount(void) {
     DWORD diff = VD(Diff);
     int cap = (diff == 1) ? 4 : MENU_ITEM_COUNT;
-    int n = 1;  /* Central 01 is always available */
+    int n = 1;  
     while (n < cap && IsStageReached(n + 1)) n++;
     return n;
 }
@@ -593,9 +593,9 @@ typedef unsigned char (__attribute__((thiscall)) *PFN_IsKey)(void *this, int key
 static PFN_IsKey orig_IsKeyPressed = NULL;
 static PFN_IsKey orig_IsKeyTriggered = NULL;
 static volatile int g_PauseMenuOpen = 0;
-/* Tick of the last game-native "pause opened" signal (ESC trigger seen by IsKeyTriggered, or an
-   ESC edge). Q/R act while the flag is open or within this grace window, so a heuristic glitch
-   can never silence the hotkeys right after the menu opens. */
+
+
+
 static volatile DWORD g_LastPauseOpenTick = 0;
 static void PauseDiagKey(int key);
 
@@ -873,10 +873,10 @@ static volatile DWORD g_LatFrameCount = 0;
 typedef BOOL (WINAPI *PFN_GetKeyboardState_t)(PBYTE);
 static PFN_GetKeyboardState_t orig_GetKeyboardState = NULL;
 
-/* "Is the game actually paused?" The frame counter does NOT freeze while the pause menu is up
-   (both builds keep advancing FrameCnt/Frame2 during pause - verified by PauseDiag freeze/resume
-   diffs and the hotkey logs), so this verdict is almost always 0. It stays as a harmless backup
-   signal; the reliable pause detection is the game's own ESC trigger, see Hook_IsKeyTriggered. */
+
+
+
+
 static int GameLooksPaused(void) {
     static DWORD lastFrame = 0;
     static DWORD lastScene = 0xFFFFFFFF;
@@ -889,8 +889,8 @@ static int GameLooksPaused(void) {
     DWORD sc = VD(Scene);
     DWORD now = GetTickCount();
     if (!primed || sc != lastScene) {
-        /* New scene: the counter is meaningless until the game has actually ticked once
-           (it is 0 during the stage intro and after a practice retry). */
+        
+
         primed = 1;
         lastScene = sc;
         lastFrame = fr;
@@ -902,16 +902,16 @@ static int GameLooksPaused(void) {
     if (fr != lastFrame) {
         lastFrame = fr;
         lastChange = now;
-        /* An opening/closing animation ticks the frame counter for a moment even though the
-           throttle keeps running; hold the old verdict briefly instead of flip-flopping. */
+        
+
         if (!framePaused) return 0;
         if (now - lastChange < 300) return framePaused;
         framePaused = 0;
         return 0;
     }
     if (th != lastThrottle) {
-        /* The throttle only advances while the game runs, never while a pause is open
-           (PauseDiag freeze/resume diffs show it parked during pause). */
+        
+
         lastThrottle = th;
         lastChange = now;
         framePaused = 0;
@@ -938,15 +938,15 @@ static BOOL WINAPI Mine_GetKeyboardState(PBYTE p) {
 
         int paused = GameLooksPaused();
         DWORD now = GetTickCount();
-        /* Q/R act while the pause flag is set or within the grace window after the last
-           game-native "pause opened" signal. */
+        
+
         int hotkeyArmed = g_PauseMenuOpen ||
                           (g_LastPauseOpenTick != 0 && now - g_LastPauseOpenTick < 10000);
         if (inStage) {
             if (escDown && !escWasDown) {
-                /* The game does not close the pause menu on ESC (the stage script polls ESC via
-                   IsKeyTriggered only while unpaused - pressing ESC with the menu open is a
-                   no-op for the game), so an ESC edge always means "the menu just opened". */
+                
+
+
                 g_PauseMenuOpen = 1;
                 g_LastPauseOpenTick = now;
                 LogMessage("Pause menu state: open (ESC edge, scene %lu)", scene);
@@ -1407,11 +1407,11 @@ unsigned char __attribute__((thiscall)) Hook_IsKeyTriggered(void *this, int key)
 
     unsigned char res = orig_IsKeyTriggered(this, key);
     if (res) PauseDiagKey(key);
-    /* The stage script polls ESC (0x1B) via IsKeyTriggered every frame it runs and opens the
-       pause menu on the trigger; the menu itself then consumes all further ESC presses (no more
-       0x1B triggers until the menu is gone), and the menu polls Z/X/up/down through this same
-       hook. So a 0x1B trigger in a stage scene is the game's own "pause menu opened" event -
-       log evidence: exactly one key=0x1B per session, coinciding with the menu opening. */
+    
+
+
+
+
     if (res && key == 0x1B &&
         ((currentScene >= 2 && currentScene <= 7) || currentScene == 10)) {
         if (!g_PauseMenuOpen)
@@ -2832,7 +2832,7 @@ DWORD __cdecl HandleTrans(void) {
         return prevScene;
     }
 
-    /* A stray DECIDE during the pause-Q navigation must never start a DIVE. */
+    
     if (g_AutoAdvanceToDifficulty && g_AutoNavTarget == 1 && nextScene >= 3 && nextScene <= 8) {
         LogMessage("Trans: blocking stage load while auto-navigating to the desktop (prev=%lu next=%lu)",
                    prevScene, nextScene);
@@ -3208,15 +3208,15 @@ static DWORD WINAPI HotkeyThread(LPVOID param) {
 }
 
 #ifdef REFRAIN_DEBUG_BUILD
-/* ---- Practice-start diagnostics (debug build only) --------------------------
- * The stage-init code uses the "view index" global (disc 0x5abb80 / steam
- * 0x5afc50) to index an 8-byte-per-entry table.  It is written by exactly one
- * game instruction (mov [viewIdx], eax) inside the view setter, from
- *   (Char - 1) + 3 * ((Diff - 1) + 4 * <Re:MODE config value>)
- * where the config value is the eax our Hook_GetRefRainConfig leaves behind.
- * The hook below logs those three inputs every time the game writes the index,
- * which pinpoints which input went out of range.
- */
+
+
+
+
+
+
+
+
+
 static volatile DWORD g_WvIdx, g_WvEbx, g_WvEsi, g_WvRet;
 static volatile DWORD g_ViewIdxWriteRet = 0;
 static volatile DWORD g_LastLoggedIdx = 0xFFFFFFFF;
@@ -3634,7 +3634,7 @@ static void DetectVersion(void) {
     memcpy(&g_Addrs, tmpl, sizeof(g_Addrs));
     memcpy(&g_Sigs, g_IsSteam ? &SIGS_STEAM : &SIGS_DISC, sizeof(g_Sigs));
 
-    /* rebase every DWORD address field (0 means "not used by this version") */
+    
     DWORD *p = (DWORD*)&g_Addrs;
     for (size_t i = 0; i < sizeof(g_Addrs) / sizeof(DWORD); i++) {
         if (p[i] != 0) p[i] += g_BaseDelta;
@@ -3642,8 +3642,8 @@ static void DetectVersion(void) {
 
     g_A = &g_Addrs;
 
-    /* addresses used by naked-hook inline asm (referenced by symbol, so the
-       register setup runs inside the asm block, after pushal-style saves) */
+    
+
     g_A_SceneNext = g_A->SceneNext;
     g_A_LoadFlag = g_A->LoadFlag;
     g_A_Mefa = g_A->Mefa;
@@ -3659,7 +3659,7 @@ static void DetectVersion(void) {
     g_GetGameInfoIntFn = g_A->fnGetGameInfoInt;
     g_RefRainCfgRetAddr = g_A->RefRainCfgRet;
 
-    /* hook continuation addresses */
+    
     g_ReturnAddr = g_A->SceneCheckRet;
     g_EndSceneRetAddr = g_A->EndSceneRet;
     g_LoadStartRetAddr = g_A->LoadStartRet;
@@ -3668,7 +3668,7 @@ static void DetectVersion(void) {
     g_PreTickTarget = g_A->fnTick;
     g_SaveReplayHdrRetAddr = g_A->SaveReplayHdrRet;
 
-    /* original functions */
+    
     orig_IsKeyPressed = (PFN_IsKey)g_A->fnIsKeyPressed;
     orig_IsKeyTriggered = (PFN_IsKey)g_A->fnIsKeyTriggered;
 

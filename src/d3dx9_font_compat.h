@@ -7,10 +7,10 @@ typedef struct ID3DXFont ID3DXFont;
 typedef ID3DXFont *LPD3DXFONT;
 typedef struct ID3DXSprite ID3DXSprite;
 
-/* Layout of ID3DXFont in d3dx9core.h.  The slot order must match exactly:
-   the slots that are never called are only placeholders to keep DrawTextA at
-   index 14.  Missing or reordered slots make DrawTextA call a different method
-   with the wrong argument count and corrupt the stack. */
+
+
+
+
 typedef struct ID3DXFontVtbl {
     HRESULT (STDMETHODCALLTYPE *QueryInterface)(ID3DXFont *, REFIID, void **);   /*  0 */
     ULONG (STDMETHODCALLTYPE *AddRef)(ID3DXFont *);                              /*  1 */
@@ -37,7 +37,7 @@ struct ID3DXFont {
     const ID3DXFontVtbl *lpVtbl;
 };
 
-/* Compile-time guard: breaks the build if DrawTextA is not at slot 14. */
+
 typedef char d3dx9_font_vtbl_layout_check[
     (offsetof(ID3DXFontVtbl, DrawTextA) == 14 * sizeof(void *)) ? 1 : -1];
 

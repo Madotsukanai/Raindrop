@@ -1,5 +1,5 @@
-/* Shared GitHub Releases self-updater for Raindrop (header-only).
-   Requires windows.h and a Log(fmt, ...) macro plus a VERSION macro from the includer. */
+
+
 #ifndef RAIN_UPDATE_H
 #define RAIN_UPDATE_H
 
@@ -40,7 +40,7 @@ static int RuHasSection(const char *buf, const char *name) {
     return 0;
 }
 
-/* Ensures raindrop.ini exists and contains the auto-update settings only. */
+
 static void RainUpdateEnsureIni(void) {
     static const char block[] = "[General]\r\nUpdateCheck=1\r\nUpdateSkip=\r\n\r\n";
     char path[MAX_PATH];
@@ -117,7 +117,7 @@ static void RainUpdateInit(HMODULE module) {
     }
 }
 
-/* ---- GitHub Releases self-updater ----------------------------------------- */
+
 typedef struct {
     char *data;
     size_t size;
@@ -236,7 +236,7 @@ static int UpdateParseString(const char *from, const char *end, char *out, size_
     const char *p = from;
     size_t n = 0;
     if (!p || !end) return 0;
-    /* from points at the opening quote of the JSON key; skip the key itself */
+    
     if (*p == '"') {
         p++;
         while (p < end && *p != '"') p++;
@@ -308,7 +308,7 @@ static int UpdateHexByte(char c) {
     return -1;
 }
 
-/* GitHub publishes asset digests as "sha256:<64 hex characters>". */
+
 static int UpdateDigestBytes(const char *digest, unsigned char out[32]) {
     int hi, lo, i;
     if (_strnicmp(digest, "sha256:", 7) != 0) return 0;
@@ -322,7 +322,7 @@ static int UpdateDigestBytes(const char *digest, unsigned char out[32]) {
     return 1;
 }
 
-/* Compact SHA-256 (FIPS 180-4), used to verify downloaded release assets. */
+
 typedef struct {
     uint32_t h[8];
     unsigned char buf[64];
@@ -497,8 +497,8 @@ static int UpdateMessageBox(const char *title, const char *text, DWORD type) {
     return MessageBoxW(NULL, textW, titleW, type);
 }
 
-/* A detached cmd.exe waits for this process to exit, then relaunches the game so the
-   freshly installed DLL is loaded.  Cannot be done from the loader lock in DllMain. */
+
+
 static void UpdateScheduleRestart(const char *dllPath) {
     char batPath[MAX_PATH], exePath[MAX_PATH], cmd[MAX_PATH * 2];
     FILE *f;
