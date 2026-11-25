@@ -114,5 +114,8 @@ $(BUILD)/debug:
 
 clean:
 	rm -rf $(BUILD)
+	cargo clean --manifest-path rust/raindrop-gpu/Cargo.toml
+	cargo clean --manifest-path rust/raindrop-d3d9/Cargo.toml
+	cargo clean --manifest-path rust/raindrop-ddraw/Cargo.toml
 
-.PHONY: all debug refrain refrain-debug smd smd-debug rust-d3d9 clean
+.PHONY: all debug refrain refrain-debug smd smd-debug rust-d3d9 rust-clean clean
