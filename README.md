@@ -10,7 +10,7 @@
 
 [公式サイト](https://www.rebrank.org/download.htm)からアップデートパッチをダウンロードしてゲームに適用し、[Releases](https://github.com/Madotsukanai/Raindrop/releases/latest)から`ddraw.dll`をダウンロードしてから`Rain.exe` (SHA-256: `ae35b0ad17094bd21f86bc464504ceeafc50941e5207d75a3065e44049138211`)と同じディレクトリにコピーしてゲームを起動してください。
 
-グラフィックスAPIは、`Rain.exe`と同じディレクトリに置く`raindrop.ini`で選択できます。
+グラフィックスバックエンドは、`Rain.exe`と同じディレクトリに置く`raindrop.ini`で選択できます。
 
 ```ini
 [General]
@@ -18,7 +18,7 @@ PrEx=1
 UpdateCheck=1
 UpdateSkip=
 [Graphics]
-API=DirectDraw
+Backend=wgpu
 VSync=auto
 ```
 
@@ -27,21 +27,21 @@ VSync=auto
 | `PrEx` | `1` | プラクティス拡張（ボスシーク、プラクティスメニュー、EXプラクティス）の有効/無効。 |
 | `UpdateCheck` | `1` | 起動時にGitHub Releasesを確認し、最新版があれば更新するか尋ねる。 |
 | `UpdateSkip` | （空） | 更新を断ったバージョンタグが自動記録され、そのバージョンでは再び尋ねない。手動設定不要。 |
-| `API` | `DirectDraw` | グラフィックスAPIの選択（下記参照）。 |
-| `VSync` | `auto` | 内蔵D3D9実装の表示同期（下記参照）。 |
+| `Backend` | `wgpu` | グラフィックスバックエンドの選択（下記参照）。 |
+| `VSync` | `auto` | 内蔵グラフィックス実装の表示同期（下記参照）。 |
 
 真偽値は`PrEx` / `UpdateCheck` / `VSync` / 環境変数`SMD_VSYNC`のいずれも`1` / `on` / `true` / `yes`（真）と`0` / `off` / `false` / `no`（偽）を同じ書式で使用できます（大文字小文字を区別しません）。`VSync`はさらに`auto`を指定できます。
 
 存在しない項目は起動時に自動で追加されます。
 
-`API=DirectDraw`はシステムのDirectDrawを使用します。利用できない場合はD3D9へフォールバックします。`API=D3D9`にすると、起動時から内蔵D3D9実装を使用します。ファイルまたは設定がない場合は`DirectDraw`を使用します。<br>
-Wine/Protonではデフォルトの`DirectDraw`のままにすることを推奨します。
+`Backend=wgpu`（既定）はwgpu上に実装した内蔵DirectDraw7/Direct3D7エミュレーション（DirectDraw/Direct3D7をwgpuで置き換えるRust実装）を使用します。wgpuを初期化できない場合のみ、実行時に内蔵D3D9実装へフォールバックします（`raindrop.ini`は書き換えません）。`Backend=system`にすると、システムのd3d9.dll上で動く内蔵D3D9実装を起動時から使用します。ファイルまたは設定がない場合は`wgpu`を使用します。<br>
+Wine/Protonではデフォルトの`wgpu`のままにすることを推奨します（システムのDirectDraw/D3D7はWineでは利用できないため）。
 
-内蔵D3D9実装（`API=D3D9`）の表示同期は`VSync`で選択できます。
+内蔵グラフィックス実装の表示同期は`VSync`で選択できます。
 
 ```ini
 [Graphics]
-API=D3D9
+Backend=wgpu
 VSync=auto
 ```
 
@@ -76,11 +76,11 @@ nmake /f NMakefile                :: refrain + smd
 
 ### Linux
 
-MinGW-w64（32bit）でクロスコンパイルします。`i686-w64-mingw32-gcc` をインストールしてから、リポジトリのルートで `make` を実行してください。
+MinGW-w64（32bit）とRust（cargo）でクロスコンパイルします。`i686-w64-mingw32-gcc`と`cargo`をインストールしてから、リポジトリのルートで`make`を実行してください。`ddraw.dll`にはRustクレート（wgpu）が静的にリンクされ、`rust/`配下は自動でビルドされます。`make clean`は`build/`とRustクレートのビルド成果物を両方削除します。
 
 ```sh
 # Arch / CachyOS
-sudo pacman -S mingw-w64-gcc
+sudo pacman -S mingw-w64-gcc rust
 
 # Debian / Ubuntu
 sudo apt install mingw-w64

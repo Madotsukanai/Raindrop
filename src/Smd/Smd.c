@@ -147,7 +147,7 @@ static void IniAddGeneralSection(const char *path) {
 }
 
 static void IniAddGraphicsSection(const char *path) {
-    static const char block[] = "\r\n[Graphics]\r\nAPI=D3D9\r\nVSync=auto\r\n";
+    static const char block[] = "\r\n[Graphics]\r\nBackend=wgpu\r\nVSync=auto\r\n";
     FILE *f = fopen(path, "rb");
     long fsize;
     char *buf;
@@ -166,7 +166,7 @@ static void IniAddGraphicsSection(const char *path) {
         if (f) {
             fwrite(block + skip, 1, sizeof(block) - 1 - skip, f);
             fclose(f);
-            Log("Graphics: added the missing [Graphics] section (API=D3D9, VSync=auto)");
+            Log("Graphics: added the missing [Graphics] section (Backend=wgpu, VSync=auto)");
         }
     }
     free(buf);
@@ -180,7 +180,7 @@ static void LoadGeneralConfig(void) {
         HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
                                   FILE_ATTRIBUTE_NORMAL, NULL);
         if (file != INVALID_HANDLE_VALUE) {
-            static const char defaults[] = "[General]\r\nPrEx=1\r\nUpdateCheck=1\r\nUpdateSkip=\r\n\r\n[Graphics]\r\nAPI=D3D9\r\nVSync=auto\r\n";
+            static const char defaults[] = "[General]\r\nPrEx=1\r\nUpdateCheck=1\r\nUpdateSkip=\r\n\r\n[Graphics]\r\nBackend=wgpu\r\nVSync=auto\r\n";
             DWORD written;
             WriteFile(file, defaults, (DWORD)(sizeof(defaults) - 1), &written, NULL);
             CloseHandle(file);

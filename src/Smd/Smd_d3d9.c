@@ -2008,12 +2008,6 @@ static int D7E_Forced(void) {
 
 static int g_D7E_ConfigCreated = 0;
 
-static void D7E_WriteConfigAPI(const char *api) {
-    char path[MAX_PATH];
-    ExeDirFile("raindrop.ini", path);
-    WritePrivateProfileStringA("Graphics", "API", api, path);
-}
-
 static int SmdIsWine(void) {
     static int v = -1;
     if (v < 0) {
@@ -2067,6 +2061,9 @@ int SmdD3D9GetVsync(void) {
     return g_d7Vsync;
 }
 
+/* Backend=wgpu (default, auto-appended) -> the DirectDraw emulation layer
+   (raindrop-ddraw on wgpu). Backend=system -> the Direct3D9-based emulation
+   (C D7 emu over the system d3d9.dll). */
 static int D7E_ConfigD3D9(void) {
     static int initialized = 0;
     static int useD3D9 = 0;
@@ -2078,25 +2075,25 @@ static int D7E_ConfigD3D9(void) {
             HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
                                       FILE_ATTRIBUTE_NORMAL, NULL);
             if (file != INVALID_HANDLE_VALUE) {
-                static const char defaults[] = "[Graphics]\r\nAPI=D3D9\r\nVSync=auto\r\n";
+                static const char defaults[] = "[Graphics]\r\nBackend=wgpu\r\nVSync=auto\r\n";
                 DWORD written;
                 WriteFile(file, defaults, (DWORD)(sizeof(defaults) - 1), &written, NULL);
                 CloseHandle(file);
                 g_D7E_ConfigCreated = 1;
-                SmdLog("Created raindrop.ini with default Graphics API");
+                SmdLog("Created raindrop.ini with default Graphics Backend");
             }
         }
-        GetPrivateProfileStringA("Graphics", "API", "\x1notconfigured", value, sizeof(value), path);
-        useD3D9 = (_stricmp(value, "D3D9") == 0 || _stricmp(value, "Direct3D9") == 0);
-        if (_stricmp(value, "\x1notconfigured") == 0) {
-            GetPrivateProfileStringA("Graphics", "API", "D3D9", value, sizeof(value), path);
-            SmdLog("Graphics API: %s (default)", useD3D9 ? "D3D9 (Rust wgpu)" : "DirectDraw");
-        } else {
-            if (useD3D9 && SmdIsWine())
-                SmdLog("Graphics API: D3D9 explicitly configured in raindrop.ini, Wine/Proton detected -> using it anyway");
-            else
-                SmdLog("Graphics API: %s (raindrop.ini)", useD3D9 ? "D3D9" : "DirectDraw");
+        GetPrivateProfileStringA("Graphics", "Backend", "\x1notfound", value, sizeof(value), path);
+        if (strcmp(value, "\x1notfound") == 0) {
+            WritePrivateProfileStringA("Graphics", "Backend", "wgpu", path);
+            strcpy(value, "wgpu");
+            SmdLog("Graphics: added the missing Backend entry (Backend=wgpu)");
         }
+        useD3D9 = (_stricmp(value, "system") == 0 || _stricmp(value, "d3d9") == 0);
+        if (useD3D9)
+            SmdLog("Graphics Backend: system (the Direct3D9 emulation, raindrop.ini)");
+        else if (_stricmp(value, "wgpu") != 0 && _stricmp(value, "ddraw") != 0)
+            SmdLog("Graphics: unknown Backend '%s', using wgpu", value);
         initialized = 1;
     }
     return useD3D9;
@@ -2121,12 +2118,6 @@ static void D7E_BindPrivateExports(HMODULE real) {
     SMD_FWD_LIST(SMD_FWD_BIND)
 #undef SMD_FWD_BIND
     SmdLog("Real ddraw: %d private export(s) bound", n);
-}
-
-static void D7E_SaveFallbackAPI(void) {
-    D7E_WriteConfigAPI("D3D9");
-    g_D7E_ConfigCreated = 0;
-    SmdLog("Saved D3D9 fallback to raindrop.ini");
 }
 
 static HRESULT D7E_CreateDD7(void **out) {
@@ -2157,8 +2148,7 @@ static void WINAPI D7E_RustFlushHook(void) {
     SmdBatchFlushQuads();
 }
 
-/* API=DirectDraw -> the DirectDraw emulation layer (raindrop-ddraw).
-   There is no backend setting: wgpu is the only backend. */
+/* Backend=wgpu -> the DirectDraw emulation layer (raindrop-ddraw). */
 static int D7E_DirectDrawEmu(void) {
     static int v = -1;
     if (v >= 0) return v;
@@ -2539,31 +2529,29 @@ static HRESULT WINAPI Hook_DirectDrawCreateEx(GUID *guid, LPVOID *out, REFIID ri
         SmdLog("DirectDrawCreateEx (other) -> hr=%08X", hr);
         return hr;
     }
-    /* Forced (SMD_FORCE_D3D7_EMU=1): Rust ddraw first, C emu as backup. */
+    /* Forced (SMD_FORCE_D3D7_EMU=1): the Rust wgpu layer first, C emu as backup. */
     if (g_D7Emu && D7E_Forced()) {
         if (D7E_CreateRust(out) >= 0 && *out)
             return DD_OK;
-        SmdLog("GraphicsAPI: forced, selecting built-in Direct3D9 emulation (C)");
+        SmdLog("Graphics Backend: forced, selecting the Direct3D9 emulation (C)");
         return D7E_CreateDD7(out);
     }
-    /* API=D3D9 -> the Direct3D9-based emulation (C D7 emu; wgpu d3d9.dll when
-       deployed in the game dir, else the system d3d9). */
+    /* Backend=system -> the Direct3D9-based emulation (C D7 emu over the
+       system d3d9.dll). */
     if (g_D7Emu && D7E_ConfigD3D9()) {
-        SmdLog("GraphicsAPI: using the Direct3D9 emulation (API=D3D9)");
+        SmdLog("Graphics Backend: using the Direct3D9 emulation (Backend=system)");
         return D7E_CreateDD7(out);
     }
-    /* API=DirectDraw -> the DirectDraw emulation: raindrop-ddraw (rust),
-       the C D7 emu (c), or the real ddraw (system, passthrough). */
+    /* Backend=wgpu -> the DirectDraw emulation layer (raindrop-ddraw on wgpu). */
     if (g_D7Emu && D7E_DirectDrawEmu()) {
         if (D7E_CreateRust(out) >= 0 && *out)
             return DD_OK;
-        SmdLog("GraphicsAPI: selecting built-in Direct3D9 emulation (C)");
+        SmdLog("Graphics Backend: the wgpu layer is unavailable, selecting the Direct3D9 emulation (C)");
         return D7E_CreateDD7(out);
     }
     if (!p_DirectDrawCreateEx) {
         if (g_D7Emu) {
-            SmdLog("System DirectDrawCreateEx is unavailable; switching to Direct3D9 emulation");
-            D7E_SaveFallbackAPI();
+            SmdLog("System DirectDrawCreateEx is unavailable; switching to the Direct3D9 emulation (runtime fallback, ini unchanged)");
             return D7E_CreateDD7(out);
         }
         return DDERR_GENERIC;
@@ -2574,8 +2562,7 @@ static HRESULT WINAPI Hook_DirectDrawCreateEx(GUID *guid, LPVOID *out, REFIID ri
     SmdLog("DirectDrawCreateEx(IID_IDirectDraw7) -> hr=%08X orig=%p", hr, (void*)orig);
     if (hr < 0 || !orig) {
         if (g_D7Emu) {
-            SmdLog("DirectDraw7 creation failed (hr=%08X); switching to Direct3D9 emulation", (unsigned)hr);
-            D7E_SaveFallbackAPI();
+            SmdLog("DirectDraw7 creation failed (hr=%08X); switching to the Direct3D9 emulation (runtime fallback, ini unchanged)", (unsigned)hr);
             return D7E_CreateDD7(out);
         }
         return hr;
@@ -2617,9 +2604,8 @@ static HRESULT WINAPI Hook_DirectDrawCreateEx(GUID *guid, LPVOID *out, REFIID ri
             }
             if (orig) goto ddraw_ready;
             if (g_D7Emu) {
-                SmdLog("No usable system Direct3D7 interface (hr=%08X); switching to Direct3D9 emulation",
+                SmdLog("No usable system Direct3D7 interface (hr=%08X); switching to the Direct3D9 emulation (runtime fallback, ini unchanged)",
                     (unsigned)d3dHr);
-                D7E_SaveFallbackAPI();
                 return D7E_CreateDD7(out);
             }
             return d3dHr;
