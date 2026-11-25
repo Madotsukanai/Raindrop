@@ -8,6 +8,9 @@ use core::ffi::c_void;
 
 pub struct D3D9State {
     pub ctx: Option<std::sync::Arc<raindrop_gpu::gpu::RgContext>>,
+    /// presentation surface created together with the ctx (adapter-matched);
+    /// handed to the first device's Renderer
+    pub surface: Option<wgpu::Surface<'static>>,
     /// mode table per adapter (only adapter 0 exists)
     pub modes: [(u32, u32, u32); 4], // w, h, refresh
 }
@@ -16,6 +19,7 @@ impl D3D9State {
     fn new() -> Self {
         D3D9State {
             ctx: None,
+            surface: None,
             modes: [(640, 480, 60), (800, 600, 60), (1024, 768, 60), (1280, 1024, 60)],
         }
     }

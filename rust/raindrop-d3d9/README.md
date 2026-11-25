@@ -1,17 +1,13 @@
-# raindrop-d3d9 (Rust d3d9.dll for RefRain)
+# raindrop-d3d9 (Rust d3d9 エミュレーション)
 
-RefRain用 `d3d9.dll` のRust実装。`raindrop-gpu` クレート(wgpu + fearless_simd
-カーネル)を利用する。
+`IDirect3DDevice9` 固定関数パスのwgpu実装。`raindrop-gpu` クレート
+(wgpu + fearless_simd カーネル)を利用する。
 
-## 動作モード
-
-`raindrop.ini`(`RefRain.exe` と同じディレクトリ)の `[Graphics]` セクション:
-
-```ini
-[Graphics]
-Backend=system   ; 既定: システム d3d9.dll へのプロキシ(現行Cシムと同じ挙動)
-Backend=wgpu     ; 本クレートの IDirect3DDevice9 エミュレーション
-```
+- RefRain 本体の `d3d9.dll` は C のみのプロキシ shim に戻したため、
+  本クレートは RefRain にはリンクされない。
+- 現在の利用者: `raindrop-ddraw7`(五月雨 DirectDraw エミュレーション、
+  静的リンク)。
+- バックエンド設定は廃止済み。wgpu が唯一のバックエンド。
 
 ## wgpu エミュレーションの現状
 
@@ -64,4 +60,4 @@ i686-pc-windows-msvc --release --features wgpu-backend` で実施。
 C版 `d3d9.dll` はゲームバイナリのパッチ(プラクティスメニュー等)を含む。
 本クレートにはそのロジックが**無い**。フル置き換えには `src/RefRain.c` の
 アドレスパッチ部分のRust移植が残課題。それまで Rust 版はテスト/実験用で、
-配布は C 版(または C 版がロードされた環境での Backend=wgpu 実験)を推奨。
+配布は C 版を推奨。

@@ -61,26 +61,68 @@ impl RgTexture {
     }
 }
 
+/// Result of `init`: the GPU context plus an optional presentation surface
+/// (owned here so the adapter can be selected with `compatible_surface`).
+pub struct GpuInit {
+    pub ctx: RgContext,
+    pub surface: Option<wgpu::Surface<'static>>,
+}
+
+/// Raw Win32 surface for an HWND (None when hwnd == 0 or creation fails).
+unsafe extern "system" {
+    fn GetModuleHandleW(name: *const u16) -> isize;
+}
+
+fn raw_surface(instance: &Instance, hwnd: isize) -> Option<wgpu::Surface<'static>> {
+    if hwnd == 0 {
+        return None;
+    }
+    use core::num::NonZeroIsize;
+    use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WindowsDisplayHandle, Win32WindowHandle};
+    use wgpu::SurfaceTargetUnsafe;
+    let mut wh = Win32WindowHandle::new(NonZeroIsize::new(hwnd)?);
+    // wgpu's Vulkan backend needs the Win32 hinstance on the raw handle
+    let hinstance = unsafe { GetModuleHandleW(core::ptr::null()) } as isize;
+    wh.hinstance = NonZeroIsize::new(hinstance);
+    let rdh = RawDisplayHandle::Windows(WindowsDisplayHandle::new());
+    let rwh = RawWindowHandle::Win32(wh);
+    let target = SurfaceTargetUnsafe::RawHandle { raw_display_handle: rdh, raw_window_handle: rwh };
+    match unsafe { instance.create_surface_unsafe(target) } {
+        Ok(s) => Some(s),
+        Err(_) => None,
+    }
+}
+
 /// Create a wgpu context. Returns null if no adapter/device is available
 /// (the C side should then fall back to the legacy D3D9 path).
-pub fn init() -> Option<RgContext> {
+///
+/// `hwnd != 0` selects an adapter compatible with that window's surface so the
+/// surface/adapter backend pair always matches (Vulkan vs GL on Win32).
+pub fn init(hwnd: isize) -> Option<GpuInit> {
     let instance = Instance::new(&InstanceDescriptor {
         backends: Backends::VULKAN | Backends::GL,
         flags: InstanceFlags::empty(),
         ..Default::default()
     });
+    let surface = raw_surface(&instance, hwnd);
+    // request_adapter with compatible_surface filters adapters that actually support
+    // this surface's backend (Vulkan/GL may disagree under Wine). If the winner lacks
+    // COPY_DST on the swapchain, the renderer falls back to a blit render pass.
     let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
         power_preference: PowerPreference::LowPower,
         force_fallback_adapter: false,
-        compatible_surface: None,
+        compatible_surface: surface.as_ref(),
     }))
     .ok()?;
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).ok()?;
-    Some(RgContext {
-        instance,
-        adapter,
-        device,
-        queue,
+    Some(GpuInit {
+        ctx: RgContext {
+            instance,
+            adapter,
+            device,
+            queue,
+        },
+        surface,
     })
 }
 
@@ -97,6 +139,25 @@ pub fn create_texture(ctx: &RgContext, w: u32, h: u32) -> Option<RgTexture> {
         // A8R8G8B8 byte order == BGRA in memory == wgpu Bgra8Unorm
         format: TextureFormat::Bgra8Unorm,
         usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&TextureViewDescriptor::default());
+    Some(RgTexture { texture, view, width: w, height: h })
+}
+
+/// Create a render-target-capable texture (offscreen scene / D3D9 backbuffer).
+pub fn create_render_target(ctx: &RgContext, w: u32, h: u32) -> Option<RgTexture> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let texture = ctx.device.create_texture(&TextureDescriptor {
+        label: Some("raindrop render target"),
+        size: Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Bgra8Unorm,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::COPY_SRC | TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     let view = texture.create_view(&TextureViewDescriptor::default());
@@ -149,8 +210,9 @@ pub fn poll(ctx: &RgContext) {
 /// `ctx` must be a pointer returned by `raindrop_gpu_init`, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn raindrop_gpu_init() -> *mut RgContext {
-    match init() {
-        Some(ctx) => Box::into_raw(Box::new(ctx)),
+    // no HWND here (used by the C ddraw shim); surface-free adapter selection
+    match init(0) {
+        Some(g) => Box::into_raw(Box::new(g.ctx)),
         None => std::ptr::null_mut(),
     }
 }

@@ -1,0 +1,23 @@
+[package]
+name = "raindrop-ddraw7"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Rust DirectDraw7/Direct3D7 COM emulation on top of the raindrop-d3d9 wgpu device"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+raindrop-d3d9 = { path = "../raindrop-d3d9" }
+raindrop-gpu = { path = "../raindrop-gpu" }
+
+[features]
+default = []
+wgpu-backend = ["raindrop-d3d9/wgpu-backend"]
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+strip = "debuginfo"
+

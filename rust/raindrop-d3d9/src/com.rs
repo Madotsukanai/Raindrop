@@ -25,6 +25,7 @@ pub enum Tag {
     Surface,
     VertexBuffer,
     IndexBuffer,
+    VertexDeclaration,
     Texture,
 }
 

@@ -11,6 +11,7 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 [dependencies]
 fearless_simd = "1.3.0"
 pollster = "1.0.3"
+raw-window-handle = "0.6"
 wgpu = { version = "26", optional = true, default-features = false, features = ["vulkan", "gles", "wgsl"] }
 
 [features]

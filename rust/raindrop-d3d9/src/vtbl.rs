@@ -51,6 +51,10 @@ pub struct Texture {
     pub pool: u32,
     pub levels_sys: Vec<SysLevel>,
     pub gpu: Option<wgpu::Texture>,
+    /// cached default view of `gpu` (created lazily); bind groups reference it
+    pub view: Option<wgpu::TextureView>,
+    /// cached bind groups: [nearest, linear]; resolved once per (texture, filter)
+    pub bg: [Option<wgpu::BindGroup>; 2],
 }
 
 impl Texture {
@@ -73,6 +77,7 @@ pub unsafe extern "system" fn qi(selfp: *mut ComObj, riid: *const u32, out: *mut
         Tag::Surface => SURFACE9_IID,
         Tag::VertexBuffer => VERTEXBUFFER9_IID,
         Tag::IndexBuffer => INDEXBUFFER9_IID,
+        Tag::VertexDeclaration => VERTEXDECLARATION9_IID,
         Tag::Texture => TEXTURE9_IID,
     };
     let iunknown: (u32, u16, u16, [u8; 8]) = (0, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
@@ -104,6 +109,7 @@ pub unsafe extern "system" fn release(selfp: *mut ComObj) -> u32 {
                 Tag::Surface => drop(Box::from_raw(o.data.cast::<Surface>())),
                 Tag::VertexBuffer | Tag::IndexBuffer => drop(Box::from_raw(o.data.cast::<Buffer>())),
                 Tag::Texture => drop(Box::from_raw(o.data.cast::<Texture>())),
+                Tag::VertexDeclaration => drop(Box::from_raw(o.data.cast::<Vec<u8>>())),
             }
         }
         drop(Box::from_raw(selfp));
@@ -144,7 +150,26 @@ pub struct Vtables(
     pub Box<[Slot]>,
     pub Box<[Slot]>,
     pub Box<[Slot]>,
+    pub Box<[Slot]>,
 );
+
+// IDirect3DVertexDeclaration9: QI, AddRef, Release, GetDevice, GetDeclaration
+pub const VERTEXDECLARATION9_IID: (u32, u16, u16, [u8; 8]) = (0xdd13c59c, 0x36fa, 0x4098, [0xa8, 0xfb, 0xc7, 0xed, 0x39, 0xdc, 0x85, 0x46]);
+
+pub unsafe extern "system" fn vdecl_get_device(_selfp: *mut ComObj, _out: *mut *mut c_void) -> Hr {
+    D3DERR_INVALIDCALL
+}
+
+/// GetDeclaration(D3DVERTEXELEMENT9 decl[MAX_FVF_DECL_SIZE], UINT* pNumElements)
+pub unsafe extern "system" fn vdecl_get_declaration(selfp: *mut ComObj, out: *mut u8, count: *mut u32) -> Hr {
+    let data = &*((*selfp).data as *const Vec<u8>);
+    if !out.is_null() && !count.is_null() {
+        let n = data.len() / 8;
+        core::ptr::copy_nonoverlapping(data.as_ptr(), out, data.len());
+        *count = n as u32;
+    }
+    S_OK
+}
 // the slot tables are plain function pointers, only ever read; Send+Sync is sound here
 unsafe impl Send for Vtables {}
 unsafe impl Sync for Vtables {}
@@ -194,16 +219,16 @@ fn build_all() -> Vtables {
             DEVICE9_SETGAMMARAMP => d::ok1,
             DEVICE9_GETGAMMARAMP => d::get_gamma_ramp,
             DEVICE9_CREATETEXTURE => d::create_texture,
-            DEVICE9_CREATEVOLUMETEXTURE => d::notavail,
-            DEVICE9_CREATECUBETEXTURE => d::notavail,
+            DEVICE9_CREATEVOLUMETEXTURE => d::na_vol_tex,
+            DEVICE9_CREATECUBETEXTURE => d::na_cube_tex,
             DEVICE9_CREATEVERTEXBUFFER => d::create_vertex_buffer,
             DEVICE9_CREATEINDEXBUFFER => d::create_index_buffer,
             DEVICE9_CREATERENDERTARGET => d::create_render_target,
             DEVICE9_CREATEDEPTHSTENCILSURFACE => d::create_depth_stencil,
             DEVICE9_UPDATESURFACE => d::update_surface,
             DEVICE9_UPDATETEXTURE => d::update_texture,
-            DEVICE9_GETRENDERTARGETDATA => d::notavail,
-            DEVICE9_GETFRONTBUFFERDATA => d::notavail,
+            DEVICE9_GETRENDERTARGETDATA => d::get_render_target_data,
+            DEVICE9_GETFRONTBUFFERDATA => d::na_front_buf,
             DEVICE9_STRETCHRECT => d::stretch_rect,
             DEVICE9_COLORFILL => d::color_fill,
             DEVICE9_CREATEOFFSCREENPLAINSURFACE => d::create_offscreen_surface,
@@ -226,7 +251,7 @@ fn build_all() -> Vtables {
             DEVICE9_SETRENDERSTATE => d::set_render_state,
             DEVICE9_GETRENDERSTATE => d::get_render_state,
             DEVICE9_SETCLIPSTATUS => d::ok1,
-            DEVICE9_GETCLIPSTATUS => d::notavail,
+            DEVICE9_GETCLIPSTATUS => d::na_clip,
             DEVICE9_GETTEXTURE => d::get_texture,
             DEVICE9_SETTEXTURE => d::set_texture,
             DEVICE9_GETTEXTURESTAGESTATE => d::get_texture_stage_state,
@@ -244,17 +269,19 @@ fn build_all() -> Vtables {
             DEVICE9_DRAWINDEXEDPRIMITIVE => d::draw_indexed_primitive,
             DEVICE9_DRAWPRIMITIVEUP => d::draw_primitive_up,
             DEVICE9_DRAWINDEXEDPRIMITIVEUP => d::draw_indexed_primitive_up,
-            DEVICE9_CREATEVERTEXDECLARATION => d::notavail,
+            DEVICE9_CREATEVERTEXDECLARATION => d::create_vertex_declaration,
+            DEVICE9_SETVERTEXDECLARATION => d::set_vertex_declaration,
+            DEVICE9_GETVERTEXDECLARATION => d::get_vertex_declaration,
             DEVICE9_SETFVF => d::set_fvf,
             DEVICE9_GETFVF => d::get_fvf,
-            DEVICE9_CREATEVERTEXSHADER => d::notavail,
+            DEVICE9_CREATEVERTEXSHADER => d::create_vertex_shader_stub,
             DEVICE9_SETVERTEXSHADER => d::set_vertex_shader,
             DEVICE9_SETVERTEXSHADERCONSTANTF => d::set_vsc_f,
             DEVICE9_SETPIXELSHADER => d::set_pixel_shader,
             DEVICE9_SETPIXELSHADERCONSTANTF => d::set_psc_f,
             DEVICE9_SETSTREAMSOURCE => d::set_stream_source,
             DEVICE9_SETINDICES => d::set_indices,
-            DEVICE9_CREATEQUERY => d::notavail,
+            DEVICE9_CREATEQUERY => d::na_query,
         ]),
         slots!(SWAPCHAIN9_SLOTS; [
             UNKNOWN_QUERYINTERFACE => qi, UNKNOWN_ADDREF => addref, UNKNOWN_RELEASE => release,
@@ -297,6 +324,11 @@ fn build_all() -> Vtables {
             TEXTURE9_LOCKRECT => d::tex_lock_rect,
             TEXTURE9_UNLOCKRECT => d::tex_unlock_rect,
             TEXTURE9_ADDDIRTYRECT => d::tex_add_dirty_rect,
+        ]),
+        slots!(7; [
+            UNKNOWN_QUERYINTERFACE => qi, UNKNOWN_ADDREF => addref, UNKNOWN_RELEASE => release,
+            3 => vdecl_get_device,
+            4 => vdecl_get_declaration,
         ]),
     )
 }

@@ -1,13 +1,5 @@
-// raindrop-d3d9: Rust d3d9.dll for RefRain.
-//
-// Two modes (raindrop.ini [Graphics] Backend=):
-//   system (default) - proxy: Direct3DCreate9 forwards to the real system d3d9.dll,
-//                      exactly like the C shim. Zero behavior change.
-//   wgpu             - the emulated fixed-function device in this crate.
-//
-// NOTE: the C d3d9.dll also patches the game binary; this crate does NOT contain
-// that logic yet. Until it is ported, deploy the Rust DLL only together with a
-// patched setup or for testing.
+// raindrop-d3d9: Rust IDirect3DDevice9 emulation on wgpu (fixed-function DX9
+// subset). wgpu is the only backend; there is no Backend= setting.
 
 // COM/Win32 FFI surface: field naming follows the D3D9 headers, fn-item->usize casts
 // are the deliberate vtable construction technique.
@@ -31,9 +23,10 @@ pub mod vtbl_gen;
 // COM/Win32 FFI surface: field naming follows the D3D9 headers, fn-item->usize casts
 use com::*;
 
-// Note: this crate no longer exports Direct3DCreate9 itself. The C shim
-// (src/RefRain.c) owns the export surface and decides system-proxy vs wgpu
-// backend via raindrop.ini, calling raindrop_d3d9_create9 (statically linked).
+// Note: this crate does not export Direct3DCreate9 itself. Consumers own the
+// export surface: raindrop-ddraw7 (五月雨 DirectDraw emulation) links it
+// statically, and the standalone raindrop_d3d9.dll below exposes
+// raindrop_d3d9_create9 for a thin C shim if needed.
 
 /// ABI probe.
 #[no_mangle]

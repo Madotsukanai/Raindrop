@@ -34,6 +34,7 @@ pub struct Device {
     pub textures_bound: [Option<*mut ComObj>; 8],
     pub stream0: Option<(*mut ComObj, u32, u32)>, // (buffer, offset, stride)
     pub indices: Option<*mut ComObj>,
+    pub decl: *mut ComObj,
     pub vp: D3DVIEWPORT9,
     pub transforms: [[f32; 16]; 4],
     pub in_scene: bool,
@@ -65,11 +66,12 @@ impl Device {
             (pp.BackBufferWidth, pp.BackBufferHeight)
         };
         if state.ctx.is_none() {
-            let c = raindrop_gpu::gpu::init().ok_or(D3DERR_NOTAVAILABLE)?;
-            state.ctx = Some(std::sync::Arc::new(c));
+            let c = raindrop_gpu::gpu::init(hwnd).ok_or(D3DERR_NOTAVAILABLE)?;
+            state.surface = c.surface;
+            state.ctx = Some(std::sync::Arc::new(c.ctx));
         }
         let ctx = state.ctx.clone().unwrap();
-        let renderer = Renderer::new(ctx, hwnd, w, h)?;
+        let renderer = Renderer::new(ctx, state.surface.take(), w, h, pp.PresentationInterval)?;
         Ok(Device {
             d3d9: core::ptr::null_mut(),
             behavior,
@@ -89,6 +91,7 @@ impl Device {
             textures_bound: [None; 8],
             stream0: None,
             indices: None,
+            decl: core::ptr::null_mut(),
             vp: D3DVIEWPORT9 { X: 0, Y: 0, Width: w, Height: h, MinZ: 0.0, MaxZ: 1.0 },
             transforms: [identity(); 4],
             in_scene: false,
@@ -152,6 +155,12 @@ pub unsafe extern "system" fn unimpl2(_s: *mut ComObj, _a: *mut c_void, _b: *mut
 pub unsafe extern "system" fn notavail(_s: *mut ComObj) -> Hr {
     D3DERR_NOTAVAILABLE
 }
+pub unsafe extern "system" fn na_vol_tex(_s: *mut ComObj) -> Hr { D3DERR_NOTAVAILABLE }
+pub unsafe extern "system" fn na_cube_tex(_s: *mut ComObj) -> Hr { D3DERR_NOTAVAILABLE }
+pub unsafe extern "system" fn na_front_buf(_s: *mut ComObj, _a: *mut c_void, _b: *mut c_void) -> Hr { D3DERR_NOTAVAILABLE }
+pub unsafe extern "system" fn na_clip(_s: *mut ComObj, _a: *mut c_void) -> Hr { D3DERR_NOTAVAILABLE }
+pub unsafe extern "system" fn create_vertex_shader_stub(_s: *mut ComObj, _a: *const c_void, _b: *mut c_void) -> Hr { D3DERR_NOTAVAILABLE }
+pub unsafe extern "system" fn na_query(_s: *mut ComObj, _a: u32, _b: *mut c_void) -> Hr { D3DERR_NOTAVAILABLE }
 
 unsafe fn dev<'a>(selfp: *mut ComObj) -> &'a mut Device {
     &mut *((*selfp).data as *mut Device)
@@ -389,6 +398,8 @@ pub unsafe extern "system" fn create_texture(
         pool,
         levels_sys: sys,
         gpu: gpu.map(|g| g.texture().clone()),
+        view: None,
+        bg: [None, None],
     };
     let data = Box::into_raw(Box::new(tex)) as *mut c_void;
     let obj = make_obj(Tag::Texture, vts.6.as_ptr(), data);
@@ -519,8 +530,7 @@ pub unsafe extern "system" fn create_offscreen_surface(
     out: *mut *mut c_void,
     _shared: *mut c_void,
 ) -> Hr {
-    let d = dev(selfp);
-    if bytes_per_pixel(fmt) == 0 {
+    let d = dev(selfp);    if bytes_per_pixel(fmt) == 0 {
         return D3DERR_NOTAVAILABLE;
     }
     let obj = make_surface_obj(selfp, w, h, fmt, 0, pool, true, false);
@@ -806,6 +816,106 @@ pub unsafe extern "system" fn set_fvf(selfp: *mut ComObj, fvf: u32) -> Hr {
     d.fvf = fvf;
     S_OK
 }
+/// D3DVERTEXELEMENT9 is 8 bytes: WORD Stream, WORD Offset, BYTE Type, BYTE Method, BYTE Usage, BYTE UsageIndex
+const DECL_END: u8 = 0xFF;
+
+/// Convert a vertex declaration to the equivalent FVF (best effort for our FVF-based renderer).
+fn decl_to_fvf(decl: &[u8]) -> u32 {
+    let n = decl.len() / 8;
+    let mut fvf = 0u32;
+    let mut rhw = false;
+    let mut xyz = false;
+    let mut color = false;
+    let mut tex = false;
+    let mut texn = 0u32;
+    for i in 0..n {
+        let e = &decl[i * 8..];
+        let usage = e[5];
+        let typ = e[4];
+        if e[2] == DECL_END {
+            break;
+        }
+        match usage {
+            0 => {
+                if typ == 3 { rhw = true; } // D3DDECLTYPE_FLOAT4
+                else if typ == 2 { xyz = true; }
+            }
+            9 => rhw = true, // D3DDECLUSAGE_POSITIONT
+            10 => color = true, // D3DDECLUSAGE_COLOR
+            5 => {
+                if e[6] == 0 { tex = true; texn += 1; } // first texcoord stage
+            }
+            _ => {}
+        }
+    }
+    if rhw {
+        fvf |= 4; // D3DFVF_XYZRHW
+    } else if xyz {
+        fvf |= 2; // D3DFVF_XYZ
+    } else {
+        fvf |= 4;
+    }
+    if color {
+        fvf |= 0x40; // D3DFVF_DIFFUSE
+    }
+    if tex {
+        fvf |= 0x100 | ((texn - 1) << 8).min(0x000); // D3DFVF_TEX1
+    }
+    fvf
+}
+
+pub unsafe extern "system" fn create_vertex_declaration(
+    selfp: *mut ComObj,
+    elements: *const u8,
+    out: *mut *mut c_void,
+) -> Hr {
+    if elements.is_null() || out.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
+    // count until D3DDECL_END
+    let mut n = 0usize;
+    while n < 32 {
+        let e = core::slice::from_raw_parts(elements.add(n * 8), 8);
+        if e[2] == DECL_END {
+            n += 1;
+            break;
+        }
+        n += 1;
+    }
+    if n == 0 {
+        return D3DERR_INVALIDCALL;
+    }
+    let bytes = core::slice::from_raw_parts(elements, n * 8).to_vec();
+    let data = Box::into_raw(Box::new(bytes)) as *mut c_void;
+    let vts = vtables();
+    let obj = make_obj(Tag::VertexDeclaration, vts.7.as_ptr(), data);
+    *out = obj as *mut c_void;
+    S_OK
+}
+
+pub unsafe extern "system" fn set_vertex_declaration(selfp: *mut ComObj, decl: *mut ComObj) -> Hr {
+    let d = dev(selfp);
+    d.decl = decl;
+    if !decl.is_null() {
+        let bytes = &*((*decl).data as *const Vec<u8>);
+        let fvf = decl_to_fvf(bytes);
+        if fvf != 0 && d.fvf == 0 {
+            d.fvf = fvf;
+        }
+    }
+    S_OK
+}
+
+pub unsafe extern "system" fn get_vertex_declaration(selfp: *mut ComObj, out: *mut *mut c_void) -> Hr {
+    let d = dev(selfp);
+    let p = d.decl;
+    if !p.is_null() {
+        addref(p);
+    }
+    *out = p as *mut c_void;
+    S_OK
+}
+
 pub unsafe extern "system" fn get_fvf(selfp: *mut ComObj, out: *mut u32) -> Hr {
     let d = dev(selfp);
     *out = d.fvf;
@@ -971,6 +1081,7 @@ pub unsafe extern "system" fn draw_primitive_up(
     }
     let nverts = prim_vertex_count(prim, count) as usize;
     let verts = unsafe { core::slice::from_raw_parts(data as *const u8, nverts * stride as usize) };
+    d.renderer.flush_textures(&d.textures_bound);
     d.renderer.draw(
         prim,
         d.fvf,
@@ -1061,19 +1172,18 @@ pub unsafe extern "system" fn surf_get_type(_self: *mut ComObj) -> u32 {
     }
 }
 
+/// IDirect3DSurface9::LockRect(self, lr, rect, flags) - stdcall, 4 args.
+/// (IDirect3DTexture9::LockRect has the extra `level`; the surface one does not.)
 pub unsafe extern "system" fn surf_lock_rect(
     selfp: *mut ComObj,
-    _level: u32,
     lr: *mut D3DLOCKED_RECT,
     _rect: *const RECT,
     flags: u32,
 ) -> Hr {
-    let s = &mut *((*selfp).data as *mut Surface);
-    if lr.is_null() {
+    let s = &mut *((*selfp).data as *mut Surface);    if lr.is_null() {
         return D3DERR_INVALIDCALL;
     }
-    let Some(sys) = &mut s.sys else {
-        return D3DERR_INVALIDCALL;
+    let Some(sys) = &mut s.sys else {        return D3DERR_INVALIDCALL;
     };
     sys.dirty = flags & 0 == 0; // writes through the pointer must mark dirty
     (*lr).Pitch = sys.pitch as i32;
@@ -1081,7 +1191,9 @@ pub unsafe extern "system" fn surf_lock_rect(
     S_OK
 }
 
-pub unsafe extern "system" fn surf_unlock_rect(_self: *mut ComObj, _level: u32) -> Hr {
+/// IDirect3DSurface9::UnlockRect(self) - stdcall, 1 arg (no rect on Surface;
+/// only IDirect3DTexture9::UnlockRect takes a level).
+pub unsafe extern "system" fn surf_unlock_rect(_self: *mut ComObj) -> Hr {
     S_OK
 }
 
@@ -1193,12 +1305,10 @@ pub unsafe extern "system" fn tex_unlock_rect(selfp: *mut ComObj, level: u32) ->
     if level >= t.levels {
         return D3DERR_INVALIDCALL;
     }
+    // D3D9 semantics: unlocking only marks the level dirty; the upload happens
+    // once per frame at flush_textures (EndScene / before draws). Uploading on
+    // every unlock would issue one full-texture write per locked row.
     t.levels_sys[level as usize].dirty = true;
-    let ctx = {
-        let d = &*((*t.device).data as *mut Device);
-        d.renderer.ctx()
-    };
-    crate::render::upload_texture(ctx, selfp, t);
     S_OK
 }
 
@@ -1212,3 +1322,24 @@ pub unsafe extern "system" fn tex_add_dirty_rect(_self: *mut ComObj, _rect: *con
 
 // extra fmt constant used above
 pub const D3DFMT_VERTEXDATA: u32 = 163;
+
+/// IDirect3DDevice9::GetRenderTargetData: copy the scene (backbuffer) into a
+/// system-memory surface. Used by the C shim's GetDC readback path.
+pub unsafe extern "system" fn get_render_target_data(
+    selfp: *mut ComObj,
+    _src: *mut ComObj,
+    dst: *mut ComObj,
+) -> Hr {
+    let d = dev(selfp);
+    if dst.is_null() {
+        return D3DERR_INVALIDCALL;
+    }
+    let ds = &mut *((*dst).data as *mut Surface);
+    if (*dst).tag != Tag::Surface {
+            return D3DERR_INVALIDCALL;
+    }
+    let Some(sys) = ds.sys.as_mut() else {
+        return D3DERR_INVALIDCALL;
+    };
+    d.renderer.readback_scene(sys)
+}

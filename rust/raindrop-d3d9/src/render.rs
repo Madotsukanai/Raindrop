@@ -1,8 +1,11 @@
 // wgpu renderer behind the emulated IDirect3DDevice9.
 //
-// Frame model: draws go into an offscreen "scene" texture (the D3D9 backbuffer);
-// Present() copies it to the swapchain frame and presents. Clear() issues an
-// immediate clear pass. Pipelines are cached per (blend, alpha-test) key.
+// Frame model: draws are *recorded* into a FrameBatch (vertices expanded into a
+// reusable Vec, one 32B uniform slot per draw). Present() replays the whole
+// batch in a single render pass into the scene texture, then blits/copies it to
+// the swapchain — one submit, one present per frame. Bind groups, views and
+// pipelines are cached and resolved at record time, so no GPU object is
+// created on the hot path.
 
 use crate::com::*;
 use crate::d3d9::*;
@@ -28,8 +31,8 @@ struct VsOut {
 fn vs(@location(0) xywrhw: vec4<f32>, @location(1) col: vec4<f32>, @location(2) uv: vec2<f32>) -> VsOut {
     let rhw = max(xywrhw.w, 1e-9);
     let px = 0.5; // D3D9 pixel-center offset
-    let x = ((xywrhw.x + px) - vp.x) / (vp.w * 0.5) - 1.0;
-    let y = 1.0 - ((xywrhw.y + px) - vp.y) / (vp.h * 0.5);
+    let x = ((xywrhw.x + px) - vp.x) / (max(vp.w, 1.0) * 0.5) - 1.0;
+    let y = 1.0 - ((xywrhw.y + px) - vp.y) / (max(vp.h, 1.0) * 0.5);
     var out: VsOut;
     out.pos = vec4<f32>(x, y, xywrhw.z, 1.0 / rhw);
     out.color = col;
@@ -66,6 +69,29 @@ struct PipeKey {
     alphatest: u64,
 }
 
+/// Uniform slots are allocated at 256-byte stride: the dynamic-offset alignment
+/// for uniform buffers lets every draw share one bind group.
+const UNI_STRIDE: usize = 256;
+
+/// One recorded draw: fully resolved GPU objects, replayed verbatim at Present.
+struct DrawCmd {
+    pipe: PipeKey,
+    bg: wgpu::BindGroup,
+    base_v: u32,
+    n_v: u32,
+    uni_off: u32,
+}
+
+/// Draws accumulated since the last Present, replayed in one render pass.
+#[derive(Default)]
+struct FrameBatch {
+    /// GPU-format vertices (40B each), expanded at record time
+    verts: Vec<u8>,
+    /// uniform data, UNI_STRIDE-aligned slots
+    uni: Vec<u8>,
+    cmds: Vec<DrawCmd>,
+}
+
 pub struct Renderer {
     pub ctx: Arc<RgContext>,
     surface: Option<wgpu::Surface<'static>>,
@@ -74,16 +100,34 @@ pub struct Renderer {
     scene: Option<RgTexture>,
     scene_w: u32,
     scene_h: u32,
-    pipelines: HashMap<PipeKey, wgpu::RenderPipeline>,
+    /// true when the swapchain lacks COPY_DST (e.g. GL surfaces): Present blits
+    /// the scene with a render pass instead of copy_texture_to_texture
+    blit: bool,
+    pipelines: HashMap<(PipeKey, wgpu::TextureFormat), wgpu::RenderPipeline>,
+    bgl: Option<wgpu::BindGroupLayout>,
+    samp_near: Option<wgpu::Sampler>,
+    samp_lin: Option<wgpu::Sampler>,
+    /// persistent vertex/uniform staging buffers: creating device memory per draw
+    /// is the dominant per-call cost on real Vulkan drivers
+    vbuf: Option<wgpu::Buffer>,
+    ubuf: Option<wgpu::Buffer>,
     dummy: Option<RgTexture>,
     vp: D3DVIEWPORT9,
     clear_color: Option<(u32, u32)>, // (flags, color)
+    frame: FrameBatch,
+    /// cached default view of the scene texture (recreated with the scene)
+    scene_view: Option<wgpu::TextureView>,
+    /// cached view/bind groups of the 1x1 dummy texture
+    dummy_view: Option<wgpu::TextureView>,
+    dummy_bg: [Option<wgpu::BindGroup>; 2],
+    /// static fullscreen-quad resources for the blit-Present path
+    blit_vbuf: Option<wgpu::Buffer>,
+    blit_ubuf: Option<wgpu::Buffer>,
+    blit_bg: Option<wgpu::BindGroup>,
 }
 
 impl Renderer {
-    pub fn new(ctx: Arc<RgContext>, hwnd: isize, w: u32, h: u32) -> Result<Renderer, Hr> {
-        let surface = unsafe { create_surface(&ctx, hwnd) };
-        let interval = D3DPRESENT_INTERVAL_ONE;
+    pub fn new(ctx: Arc<RgContext>, surface: Option<wgpu::Surface<'static>>, w: u32, h: u32, interval: u32) -> Result<Renderer, Hr> {
         let config = surface_config(&ctx, &surface, w, h, interval);
         if let Some(s) = &surface {
             s.configure(ctx.device(), &config);
@@ -96,13 +140,49 @@ impl Renderer {
             scene: None,
             scene_w: 0,
             scene_h: 0,
+            blit: false,
             pipelines: HashMap::new(),
+            bgl: None,
+            samp_near: None,
+            samp_lin: None,
+            vbuf: None,
+            ubuf: None,
             dummy: None,
             vp: D3DVIEWPORT9 { X: 0, Y: 0, Width: w, Height: h, MinZ: 0.0, MaxZ: 1.0 },
             clear_color: None,
+            frame: FrameBatch::default(),
+            scene_view: None,
+            dummy_view: None,
+            dummy_bg: [None, None],
+            blit_vbuf: None,
+            blit_ubuf: None,
+            blit_bg: None,
         };
-        r.ensure_scene(w, h);
+        // static resources: bind group layout + the two samplers are used by every
+        // draw; creating them per call is a measurable cost on software backends
+        r.bgl = Some(create_bind_group_layout(&r.ctx));
+        r.samp_near = Some(create_sampler(&r.ctx, false));
+        r.samp_lin = Some(create_sampler(&r.ctx, true));
+        // vertex buffer grows on demand; uniforms sit at 256B slots with dynamic
+        // offsets so one bind group serves every draw
+        r.vbuf = Some(r.ctx.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("raindrop d9 vbuf pool"),
+            size: 1 << 20,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        r.ubuf = Some(r.ctx.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("raindrop d9 ubuf pool"),
+            size: 1024 * UNI_STRIDE as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
         r.make_dummy();
+        r.ensure_scene(w, h);
+        if let Some(s) = &r.surface {
+            // drop-in: only enable blit when the copy path is unsupported
+            r.blit = !s.get_capabilities(&r.ctx.adapter()).usages.contains(wgpu::TextureUsages::COPY_DST);
+        }
         Ok(r)
     }
 
@@ -114,19 +194,91 @@ impl Renderer {
         if self.scene_w == w && self.scene_h == h && self.scene.is_some() {
             return;
         }
-        let gpu = raindrop_gpu::gpu::create_texture(&self.ctx, w, h)
+        let gpu = raindrop_gpu::gpu::create_render_target(&self.ctx, w, h)
             .expect("scene texture creation failed");
-        // add RENDER_ATTACHMENT for clear passes
         self.scene = Some(gpu);
         self.scene_w = w;
         self.scene_h = h;
+        self.scene_view = Some(
+            self.scene
+                .as_ref()
+                .unwrap()
+                .texture()
+                .create_view(&wgpu::TextureViewDescriptor::default()),
+        );
+        self.setup_blit();
+    }
+
+    /// Static fullscreen-quad resources for the blit-Present path. Written once
+    /// per scene size; previously rebuilt (two buffers + writes + a bind group)
+    /// on every Present.
+    fn setup_blit(&mut self) {
+        let (w, h) = (self.scene_w, self.scene_h);
+        let v: [f32; 60] = [
+            0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0,
+            w as f32, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0,
+            0.0, h as f32, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0,
+            0.0, h as f32, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0,
+            w as f32, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0,
+            w as f32, h as f32, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        ];
+        let vbytes: &[u8] = unsafe { core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), v.len() * 4) };
+        let vbuf = self.ctx.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("raindrop d9 blit verts"),
+            size: 60 * 4,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.ctx.queue().write_buffer(&vbuf, 0, vbytes);
+        let ubuf = self.ctx.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("raindrop d9 blit uni"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uni = build_uniform(
+            &D3DVIEWPORT9 { X: 0, Y: 0, Width: w, Height: h, MinZ: 0.0, MaxZ: 1.0 },
+            false, 0, 0,
+        );
+        self.ctx.queue().write_buffer(&ubuf, 0, &uni);
+        let scene_view = self.scene_view.clone().unwrap();
+        let bg = self.ctx.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raindrop d9 blit bind"),
+            layout: &self.bind_layout(),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &ubuf,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(32),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&scene_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.samp_near.clone().unwrap()),
+                },
+            ],
+        });
+        self.blit_vbuf = Some(vbuf);
+        self.blit_ubuf = Some(ubuf);
+        self.blit_bg = Some(bg);
     }
 
     pub fn reconfigure(&mut self, w: u32, h: u32, interval: u32) {
         self.interval = interval;
         self.config.width = w;
         self.config.height = h;
-        self.config.present_mode = present_mode(interval);
+        self.config.present_mode = if let Some(s) = &self.surface {
+            let caps = s.get_capabilities(&self.ctx.adapter());
+            present_mode(interval, Some(&caps))
+        } else {
+            present_mode(interval, None)
+        };
         if let Some(s) = &self.surface {
             s.configure(self.ctx.device(), &self.config);
         }
@@ -153,39 +305,33 @@ impl Renderer {
         }
     }
 
-    fn pipeline(
-        &mut self,
-        rs: &[u32; 256],
-        format: wgpu::TextureFormat,
-    ) -> wgpu::RenderPipeline {
-        let blend_enabled = rs[D3DRS_ALPHABLENDENABLE as usize] != 0;
-        let src = rs[D3DRS_SRCBLEND as usize];
-        let dst = rs[D3DRS_DESTBLEND as usize];
-        let op = rs[D3DRS_BLENDOP as usize];
-        let at = rs[D3DRS_ALPHATESTENABLE as usize] != 0;
-        let afunc = rs[D3DRS_ALPHAFUNC as usize];
-        let aref = rs[D3DRS_ALPHAREF as usize];
-        let key = PipeKey {
-            blend: (blend_enabled as u64) | ((src as u64) << 8) | ((dst as u64) << 16) | ((op as u64) << 24),
-            alphatest: (at as u64) | ((afunc as u64) << 8) | ((aref as u64) << 16),
-        };
+    fn pipeline_for(&mut self, key: PipeKey, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+        // early-out before shader/module/layout work; pipelines are the expensive
+        // resource on software backends (llvmpipe compiles on every creation)
+        if let Some(p) = self.pipelines.get(&(key, format)) {
+            return p.clone();
+        }
         let module = self.ctx.device().create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("raindrop d9"),
             source: wgpu::ShaderSource::Wgsl(WGSL.into()),
         });
-        let bpl = wgpu::BlendComponent {
+        let enabled = (key.blend & 0xFF) != 0;
+        let src = ((key.blend >> 8) & 0xFF) as u32;
+        let dst = ((key.blend >> 16) & 0xFF) as u32;
+        let op = ((key.blend >> 24) & 0xFF) as u32;
+        let comp = || wgpu::BlendComponent {
             src_factor: blend_factor(src, true),
             dst_factor: blend_factor(dst, false),
             operation: blend_op(op),
         };
-        let alpha_component = wgpu::BlendComponent {
-            src_factor: blend_factor(src, true),
-            dst_factor: blend_factor(dst, false),
-            operation: blend_op(op),
+        let blend = if enabled {
+            Some(wgpu::BlendState { color: comp(), alpha: comp() })
+        } else {
+            None // opaque replace
         };
         let targets = [Some(wgpu::ColorTargetState {
             format,
-            blend: Some(wgpu::BlendState { color: bpl, alpha: alpha_component }),
+            blend,
             write_mask: wgpu::ColorWrites::ALL,
         })];
         let layout = self.ctx.device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -221,42 +367,26 @@ impl Renderer {
                 multiview: None,
                 cache: None,
             });
-        self.pipelines.insert(key, pipeline.clone());
+        self.pipelines.insert((key, format), pipeline.clone());
         pipeline
     }
 
+    fn pipe_key(rs: &[u32; 256]) -> PipeKey {
+        let blend_enabled = rs[D3DRS_ALPHABLENDENABLE as usize] != 0;
+        let src = rs[D3DRS_SRCBLEND as usize];
+        let dst = rs[D3DRS_DESTBLEND as usize];
+        let op = rs[D3DRS_BLENDOP as usize];
+        let at = rs[D3DRS_ALPHATESTENABLE as usize] != 0;
+        let afunc = rs[D3DRS_ALPHAFUNC as usize];
+        let aref = rs[D3DRS_ALPHAREF as usize];
+        PipeKey {
+            blend: (blend_enabled as u64) | ((src as u64) << 8) | ((dst as u64) << 16) | ((op as u64) << 24),
+            alphatest: (at as u64) | ((afunc as u64) << 8) | ((aref as u64) << 16),
+        }
+    }
+
     fn bind_layout(&self) -> wgpu::BindGroupLayout {
-        self.ctx.device().create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("raindrop d9 bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: Some(wgpu::BufferSize::new(8 * 4).unwrap()),
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        })
+        self.bgl.clone().unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -283,21 +413,26 @@ impl Renderer {
             );
             return D3DERR_INVALIDCALL;
         }
-        let Some(scene) = &self.scene else {
+        if self.scene.is_none() {
             return D3DERR_INVALIDCALL;
-        };
-        let colorop = tss[0][D3DTSS_COLOROP as usize];
-        let alphaop = tss[0][D3DTSS_ALPHAOP as usize];
-        let _ = (colorop, alphaop);
+        }
+        let nverts = nverts.max(1);
+        let stride = stride as usize;
+        if verts.len() < nverts * stride {
+            return D3DERR_INVALIDCALL;
+        }
+        let _ = (prim, &tss);
 
-        // build GPU vertices
-        let mut gpu = Vec::with_capacity(nverts * 10 * 4);
         let has_diffuse = fvf & D3DFVF_DIFFUSE != 0;
         let has_tex = fvf & D3DFVF_TEX1 != 0;
         let cd = has_diffuse as usize * 4;
         let cs = has_diffuse as usize * 4 + (fvf & D3DFVF_SPECULAR != 0) as usize * 4;
         let ct = cs;
-        let stride = stride as usize;
+
+        // expand into the frame's persistent vertex Vec: no allocation, no queue
+        // work — GPU upload happens once, at Present
+        let base_v = self.frame.verts.len() as u32;
+        self.frame.verts.reserve(nverts * 40);
         for v in 0..nverts {
             let b = &verts[v * stride..];
             let x = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
@@ -316,7 +451,7 @@ impl Renderer {
                 (1.0, 1.0, 1.0, 1.0)
             };
             let (u, vv) = if has_tex {
-                let off = ct;
+                let off = 16 + (has_diffuse as usize) * 4 + (fvf & D3DFVF_SPECULAR != 0) as usize * 4;
                 (
                     f32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]),
                     f32::from_le_bytes([b[off + 4], b[off + 5], b[off + 6], b[off + 7]]),
@@ -324,111 +459,149 @@ impl Renderer {
             } else {
                 (0.0, 0.0)
             };
-            gpu.extend_from_slice(&x.to_le_bytes());
-            gpu.extend_from_slice(&y.to_le_bytes());
-            gpu.extend_from_slice(&z.to_le_bytes());
-            gpu.extend_from_slice(&rhw.to_le_bytes());
-            gpu.extend_from_slice(&r.to_le_bytes());
-            gpu.extend_from_slice(&g.to_le_bytes());
-            gpu.extend_from_slice(&bl.to_le_bytes());
-            gpu.extend_from_slice(&a.to_le_bytes());
-            gpu.extend_from_slice(&u.to_le_bytes());
-            gpu.extend_from_slice(&vv.to_le_bytes());
+            self.frame.verts.extend_from_slice(&x.to_le_bytes());
+            self.frame.verts.extend_from_slice(&y.to_le_bytes());
+            self.frame.verts.extend_from_slice(&z.to_le_bytes());
+            self.frame.verts.extend_from_slice(&rhw.to_le_bytes());
+            self.frame.verts.extend_from_slice(&r.to_le_bytes());
+            self.frame.verts.extend_from_slice(&g.to_le_bytes());
+            self.frame.verts.extend_from_slice(&bl.to_le_bytes());
+            self.frame.verts.extend_from_slice(&a.to_le_bytes());
+            self.frame.verts.extend_from_slice(&u.to_le_bytes());
+            self.frame.verts.extend_from_slice(&vv.to_le_bytes());
         }
-        let vbuf = self.ctx.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("raindrop d9 verts"),
-            size: gpu.len() as u64,
+        self.record(textures[0], rs, smp, vp, base_v, nverts as u32);
+        S_OK
+    }
+
+    /// Append the per-draw state (uniform slot, bind group, pipeline key) to the
+    /// frame batch. Everything expensive is resolved once and cached.
+    fn record(
+        &mut self,
+        tex: Option<*mut crate::com::ComObj>,
+        rs: &[u32; 256],
+        smp: &[[u32; 16]; 8],
+        vp: &D3DVIEWPORT9,
+        base_v: u32,
+        n_v: u32,
+    ) {
+        let at = rs[D3DRS_ALPHATESTENABLE as usize] != 0;
+        let uni = build_uniform(vp, at, rs[D3DRS_ALPHAFUNC as usize], rs[D3DRS_ALPHAREF as usize]);
+        let uni_off = self.alloc_uniform(&uni);
+        let filtering = smp[0][D3DSAMP_MAGFILTER as usize] == 2 || smp[0][D3DSAMP_MINFILTER as usize] == 2;
+        let bg = self.bind_group_for(tex, filtering);
+        let pipe = Self::pipe_key(rs);
+        self.frame.cmds.push(DrawCmd { pipe, bg, base_v, n_v, uni_off });
+    }
+
+    /// Reserve one UNI_STRIDE-aligned uniform slot in the frame batch.
+    fn alloc_uniform(&mut self, uni: &[u8; 32]) -> u32 {
+        let off = self.frame.uni.len() as u32;
+        self.frame.uni.extend_from_slice(uni);
+        self.frame
+            .uni
+            .resize(((self.frame.uni.len() + UNI_STRIDE - 1) / UNI_STRIDE) * UNI_STRIDE, 0);
+        off
+    }
+
+    /// Vertex/uniform buffers grow to fit the frame; recreation is rare and the
+    /// old buffer is simply replaced.
+    fn ensure_vbuf(&mut self, need: u64) -> wgpu::Buffer {
+        if let Some(b) = &self.vbuf {
+            if b.size() >= need {
+                return b.clone();
+            }
+        }
+        let size = need.max(1 << 20).next_power_of_two();
+        let b = self.ctx.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("raindrop d9 vbuf pool"),
+            size,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.ctx.queue().write_buffer(&vbuf, 0, &gpu);
+        self.vbuf = Some(b.clone());
+        b
+    }
 
-        // viewport uniforms
-        let at = rs[D3DRS_ALPHATESTENABLE as usize] != 0;
-        let uni = build_uniform(vp, at, rs[D3DRS_ALPHAFUNC as usize], rs[D3DRS_ALPHAREF as usize]);
-        let ubuf = self.ctx.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("raindrop d9 uni"),
-            size: 32,
+    fn ensure_ubuf(&mut self, need: u64) -> wgpu::Buffer {
+        if let Some(b) = &self.ubuf {
+            if b.size() >= need {
+                return b.clone();
+            }
+        }
+        let size = need.max(1024 * UNI_STRIDE as u64).next_power_of_two();
+        let b = self.ctx.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("raindrop d9 ubuf pool"),
+            size,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.ctx.queue().write_buffer(&ubuf, 0, &uni);
+        self.ubuf = Some(b.clone());
+        b
+    }
 
-        // bind texture (stage 0) or dummy
-        let texobj = textures[0].map(|t| unsafe { &*((**(&t)).data as *mut Texture) });
-        let bg;
-        let filtering = smp[0][D3DSAMP_MAGFILTER as usize] == 2 || smp[0][D3DSAMP_MINFILTER as usize] == 2;
-        match texobj {
-            Some(t) if t.gpu.is_some() => {
-                let v = t.gpu.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor::default());
-                bg = self.ctx.device().create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("raindrop d9 bind"),
-                    layout: &self.bind_layout(),
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&v) },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler(filtering)),
-                        },
-                    ],
-                });
-            }
-            _ => {
-                let dummy = self.dummy_texture();
-                let v = dummy.texture().create_view(&wgpu::TextureViewDescriptor::default());
-                bg = self.ctx.device().create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("raindrop d9 bind dummy"),
-                    layout: &self.bind_layout(),
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&v) },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler(filtering)),
-                        },
-                    ],
-                });
+    /// Build the uniform+texture+sampler bind group.
+    fn make_bg(&self, view: &wgpu::TextureView, filtering: bool, ubuf: &wgpu::Buffer) -> wgpu::BindGroup {
+        self.ctx.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raindrop d9 bind"),
+            layout: &self.bind_layout(),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: ubuf,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(32),
+                    }),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view) },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler(filtering)),
+                },
+            ],
+        })
+    }
+
+    /// Resolve the bind group for stage-0 texture: cached per (texture, filter)
+    /// inside the Texture object, so a released texture drops its cache with it.
+    fn bind_group_for(&mut self, tex: Option<*mut crate::com::ComObj>, filtering: bool) -> wgpu::BindGroup {
+        let ubuf = self.ubuf.clone().unwrap();
+        if let Some(p) = tex {
+            let t = unsafe { &mut *((*p).data as *mut Texture) };
+            if t.gpu.is_some() {
+                let slot = filtering as usize;
+                if let Some(bg) = &t.bg[slot] {
+                    return bg.clone();
+                }
+                if t.view.is_none() {
+                    t.view = Some(
+                        t.gpu
+                            .as_ref()
+                            .unwrap()
+                            .create_view(&wgpu::TextureViewDescriptor::default()),
+                    );
+                }
+                let bg = self.make_bg(t.view.as_ref().unwrap(), filtering, &ubuf);
+                t.bg[slot] = Some(bg.clone());
+                return bg;
             }
         }
-
-        // encode the draw
-        let clear = self.clear_color.take();
-        let scene_view = scene.texture().create_view(&wgpu::TextureViewDescriptor::default());
-        let mut enc = self.ctx.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("raindrop d9 enc"),
-        });
-        {
-            let load = match clear {
-                Some((_, color)) => wgpu::LoadOp::Clear(wgpu::Color {
-                    r: ((color >> 16) & 0xFF) as f64 / 255.0,
-                    g: ((color >> 8) & 0xFF) as f64 / 255.0,
-                    b: (color & 0xFF) as f64 / 255.0,
-                    a: ((color >> 24) & 0xFF) as f64 / 255.0,
-                }),
-                None => wgpu::LoadOp::Load,
-            };
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("raindrop d9 pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &scene_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            let format = scene.texture().format();
-            let pipe = self.pipeline(rs, format);
-            pass.set_pipeline(&pipe);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.set_vertex_buffer(0, vbuf.slice(..));
-            pass.draw(0..nverts as u32, 0..1);
+        // dummy (no texture bound or not yet uploaded)
+        let slot = filtering as usize;
+        if let Some(bg) = &self.dummy_bg[slot] {
+            return bg.clone();
         }
-        self.ctx.queue().submit(Some(enc.finish()));
-        S_OK
+        if self.dummy_view.is_none() {
+            self.dummy_view = Some(
+                self.dummy_texture()
+                    .texture()
+                    .create_view(&wgpu::TextureViewDescriptor::default()),
+            );
+        }
+        let bg = self.make_bg(self.dummy_view.as_ref().unwrap(), filtering, &ubuf);
+        self.dummy_bg[slot] = Some(bg.clone());
+        bg
     }
 
     pub fn draw_indexed(
@@ -444,19 +617,37 @@ impl Renderer {
         smp: &[[u32; 16]; 8],
         vp: &D3DVIEWPORT9,
     ) -> Hr {
-        // de-indexed expand: reuse the indexed path by expanding in place
+        if fvf & D3DFVF_POSITION_MASK != D3DFVF_XYZRHW {
+            warn_once(
+                crate::com::Tag::Device,
+                "only XYZRHW fixed-function drawing is emulated",
+                D3DERR_INVALIDCALL,
+            );
+            return D3DERR_INVALIDCALL;
+        }
+        if self.scene.is_none() {
+            return D3DERR_INVALIDCALL;
+        }
         let stride = stride as usize;
-        let mut expanded = Vec::with_capacity(indices.len() * stride);
+        if indices.is_empty() {
+            return S_OK;
+        }
         for &i in indices {
             let s = i as usize * stride;
-            if s + stride <= verts.len() {
-                expanded.extend_from_slice(&verts[s..s + stride]);
+            if s + stride > verts.len() {
+                return D3DERR_INVALIDCALL;
             }
         }
-        self.draw(
-            prim, fvf, &expanded, stride as u32, indices.len(), core::ptr::null(), 0, textures, rs, tss,
-            smp, vp,
-        )
+        // de-index straight into the frame batch: no intermediate allocation
+        let base_v = self.frame.verts.len() as u32;
+        self.frame.verts.reserve(indices.len() * stride);
+        for &i in indices {
+            let s = i as usize * stride;
+            self.frame.verts.extend_from_slice(&verts[s..s + stride]);
+        }
+        self.record(textures[0], rs, smp, vp, base_v, indices.len() as u32);
+        let _ = prim;
+        S_OK
     }
 
     fn sampler(&self, filtering: bool) -> wgpu::Sampler {
@@ -487,35 +678,138 @@ impl Renderer {
         let Some(surface) = &self.surface else {
             return D3DERR_DEVICELOST;
         };
-        let Some(scene) = &self.scene else {
+        if self.scene.is_none() {
             return D3DERR_DEVICELOST;
-        };
+        }
+        let scene_format = self.scene.as_ref().unwrap().texture().format();
         let frame = match surface.get_current_texture() {
             Ok(f) => f,
-            Err(e) => {
-                let _ = e;
+            Err(_) => {
                 surface.configure(self.ctx.device(), &self.config);
                 match surface.get_current_texture() {
                     Ok(f) => f,
-                    Err(_) => return D3DERR_DEVICELOST,
+                    Err(_) => {
+                        return D3DERR_DEVICELOST;
+                    }
                 }
             }
         };
+
+        // resolve every distinct pipeline once, before any pass starts (the
+        // pipeline cache needs &mut self, which the pass would hold)
+        let mut pipe_keys: Vec<PipeKey> = Vec::new();
+        for c in &self.frame.cmds {
+            if !pipe_keys.contains(&c.pipe) {
+                pipe_keys.push(c.pipe);
+            }
+        }
+        let pipes: Vec<wgpu::RenderPipeline> =
+            pipe_keys.iter().map(|k| self.pipeline_for(*k, scene_format)).collect();
+        let blit_key = PipeKey { blend: 0, alphatest: 0 };
+        let blit_pipe = if self.blit {
+            Some(self.pipeline_for(blit_key, frame.texture.format()))
+        } else {
+            None
+        };
+
+        // one write_buffer per resource kind, then ONE encoder holding the whole
+        // frame: scene draws + present blit/copy, single submit
+        let vneed = self.frame.verts.len() as u64;
+        let uneed = self.frame.uni.len() as u64;
+        if vneed > 0 {
+            let vbuf = self.ensure_vbuf(vneed);
+            self.ctx.queue().write_buffer(&vbuf, 0, &self.frame.verts);
+        }
+        if uneed > 0 {
+            let ubuf = self.ensure_ubuf(uneed);
+            self.ctx.queue().write_buffer(&ubuf, 0, &self.frame.uni);
+        }
+
+        let vbuf = if vneed > 0 {
+            Some(self.ensure_vbuf(vneed))
+        } else {
+            self.vbuf.clone()
+        };
         let mut enc = self.ctx.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("raindrop d9 present"),
+            label: Some("raindrop d9 frame"),
         });
-        enc.copy_texture_to_texture(
-            scene.texture().as_image_copy(),
-            wgpu::TexelCopyTextureInfo {
-                texture: &frame.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d { width: self.scene_w, height: self.scene_h, depth_or_array_layers: 1 },
-        );
+        if !self.frame.cmds.is_empty() || self.clear_color.is_some() {
+            let scene_view = self.scene_view.clone().unwrap();
+            let clear = self.clear_color.take();
+            let load = match clear {
+                Some((_, color)) => wgpu::LoadOp::Clear(wgpu::Color {
+                    r: ((color >> 16) & 0xFF) as f64 / 255.0,
+                    g: ((color >> 8) & 0xFF) as f64 / 255.0,
+                    b: (color & 0xFF) as f64 / 255.0,
+                    a: ((color >> 24) & 0xFF) as f64 / 255.0,
+                }),
+                None => wgpu::LoadOp::Load,
+            };
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("raindrop d9 pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &scene_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            // one vertex buffer serves the whole frame; draws address it by
+            // vertex index (set_vertex_buffer sub-slices misbehave on some
+            // backends, and this form also saves a state change per draw)
+            let vb = vbuf.as_ref().unwrap();
+            pass.set_vertex_buffer(0, vb.slice(..));
+            for c in &self.frame.cmds {
+                let idx = pipe_keys.iter().position(|k| *k == c.pipe).unwrap();
+                pass.set_pipeline(&pipes[idx]);
+                pass.set_bind_group(0, &c.bg, &[c.uni_off]);
+                pass.draw(c.base_v / 40..c.base_v / 40 + c.n_v, 0..1);
+            }
+        }
+        if self.blit {
+            // swapchain without COPY_DST: draw the scene fullscreen onto the frame
+            let frame_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("raindrop d9 blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &frame_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&blit_pipe.unwrap());
+            pass.set_bind_group(0, self.blit_bg.as_ref().unwrap(), &[]);
+            pass.set_vertex_buffer(0, self.blit_vbuf.as_ref().unwrap().slice(..));
+            pass.draw(0..6, 0..1);
+        } else {
+            let scene = self.scene.as_ref().unwrap();
+            enc.copy_texture_to_texture(
+                scene.texture().as_image_copy(),
+                wgpu::TexelCopyTextureInfo {
+                    texture: &frame.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: self.scene_w, height: self.scene_h, depth_or_array_layers: 1 },
+            );
+        }
         self.ctx.queue().submit(Some(enc.finish()));
         frame.present();
+        // reap completed GPU work so staging memory from uploads/write_buffer
+        // doesn't accumulate across frames
+        let _ = self.ctx.device().poll(wgpu::PollType::Poll);
+        // reset the frame batch (capacity is kept for the next frame)
+        self.frame.verts.clear();
+        self.frame.uni.clear();
+        self.frame.cmds.clear();
         S_OK
     }
 
@@ -578,8 +872,14 @@ fn blend_op(v: u32) -> wgpu::BlendOperation {
     }
 }
 
-fn present_mode(interval: u32) -> wgpu::PresentMode {
-    if interval == D3DPRESENT_INTERVAL_IMMEDIATE || interval == D3DPRESENT_INTERVAL_DEFAULT {
+fn present_mode(interval: u32, caps: Option<&wgpu::SurfaceCapabilities>) -> wgpu::PresentMode {
+    let want_immediate =
+        interval == D3DPRESENT_INTERVAL_IMMEDIATE || interval == D3DPRESENT_INTERVAL_DEFAULT;
+    if want_immediate
+        && caps
+            .map(|c| c.present_modes.contains(&wgpu::PresentMode::Immediate))
+            .unwrap_or(false)
+    {
         wgpu::PresentMode::Immediate
     } else {
         wgpu::PresentMode::Fifo
@@ -609,29 +909,24 @@ fn surface_config(
         .as_ref()
         .map(|s| s.get_capabilities(ctx.adapter()))
         .unwrap_or_else(|| wgpu::SurfaceCapabilities::default());
+    let interval = if interval == D3DPRESENT_INTERVAL_ONE { interval } else { interval };
+    // COPY_DST is optional: the present path can blit with a render pass when the
+    // swapchain does not accept it (GL/WGL surfaces)
+    let usage = if caps.usages.contains(wgpu::TextureUsages::COPY_DST) {
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST
+    } else {
+        wgpu::TextureUsages::RENDER_ATTACHMENT
+    };
     wgpu::SurfaceConfiguration {
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
+        usage,
         format: wgpu::TextureFormat::Bgra8Unorm,
         width: w.max(1),
         height: h.max(1),
-        present_mode: present_mode(interval),
+        present_mode: present_mode(interval, Some(&caps)),
         alpha_mode: caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Opaque),
         view_formats: vec![],
         desired_maximum_frame_latency: 2,
     }
-}
-
-unsafe fn create_surface(ctx: &RgContext, hwnd: isize) -> Option<wgpu::Surface<'static>> {
-    use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WindowsDisplayHandle, Win32WindowHandle};
-    use wgpu::SurfaceTargetUnsafe;
-    use core::num::NonZeroIsize;
-    let mut wh = Win32WindowHandle::new(NonZeroIsize::new(hwnd)?);
-    wh.hinstance = None;
-    let rdh = RawDisplayHandle::Windows(WindowsDisplayHandle::new());
-    let rwh = RawWindowHandle::Win32(wh);
-    let target = SurfaceTargetUnsafe::RawHandle { raw_display_handle: rdh, raw_window_handle: rwh };
-    let s = ctx.instance().create_surface_unsafe(target).ok()?;
-    Some(s)
 }
 
 // ---- uploads ----------------------------------------------------------------
@@ -740,4 +1035,114 @@ pub fn upload_surface(ctx: &RgContext, obj: *mut crate::com::ComObj, s: &mut Sur
     // surfaces have no gpu texture of their own; sysmem uploads are only needed
     // for UpdateSurface/ColorFill paths into render targets, which are stubbed.
     let _ = (ctx, obj, s);
+}
+
+/// Reinterpret a &[u8] as a plain byte slice for write_buffer (already &[u8]; kept
+/// as a named helper for symmetry with bytemuck_dst).
+fn bytemuck_bytes(b: &[u8]) -> &[u8] {
+    b
+}
+
+/// Shared bind group layout (uniform + texture + sampler), created once.
+fn create_bind_group_layout(ctx: &RgContext) -> wgpu::BindGroupLayout {
+    ctx.device().create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("raindrop d9 bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    // one bind group per (texture, filter); the per-draw uniform
+                    // slot is selected with a dynamic offset
+                    has_dynamic_offset: true,
+                    min_binding_size: Some(wgpu::BufferSize::new(8 * 4).unwrap()),
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    })
+}
+
+/// Shared sampler (nearest or linear filtering), created once per mode.
+fn create_sampler(ctx: &RgContext, filtering: bool) -> wgpu::Sampler {
+    ctx.device().create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("raindrop d9 samp"),
+        mag_filter: if filtering { wgpu::FilterMode::Linear } else { wgpu::FilterMode::Nearest },
+        min_filter: if filtering { wgpu::FilterMode::Linear } else { wgpu::FilterMode::Nearest },
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        ..Default::default()
+    })
+}
+
+impl Renderer {
+    /// Copy the scene (D3D9 backbuffer) into a system-memory level: the
+    /// GetRenderTargetData path used by the C shim's GetDC readback.
+    pub fn readback_scene(&mut self, dst: &mut crate::vtbl::SysLevel) -> Hr {
+        let Some(scene) = &self.scene else { return D3DERR_NOTAVAILABLE };
+        let (w, h) = (self.scene_w, self.scene_h);
+        if dst.pitch < (w * 4) as usize || dst.data.len() < dst.pitch * h as usize {
+            return D3DERR_INVALIDCALL;
+        }
+        // staging buffer with a 256-aligned bytes-per-row
+        let bpr = (w * 4).div_ceil(256) * 256;
+        let buf = self.ctx.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("raindrop d9 readback"),
+            size: (bpr as u64) * (h as u64),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.ctx.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("raindrop d9 readback enc"),
+        });
+        enc.copy_texture_to_buffer(
+            scene.texture().as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.ctx.queue().submit(Some(enc.finish()));
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), wgpu::BufferAsyncError>>();
+        buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.ctx.device().poll(wgpu::PollType::Wait);
+        if rx.try_recv().is_err() {
+            return D3DERR_NOTAVAILABLE;
+        }
+        let mapped = buf.get_mapped_range(..);
+        for y in 0..h {
+            let src = &mapped[(y * bpr) as usize..(y * bpr + w * 4) as usize];
+            let off = y as usize * dst.pitch;
+            let out = &mut dst.data[off..off + w as usize * 4];
+            out.copy_from_slice(src);
+        }
+        drop(mapped);
+        buf.unmap();
+        S_OK
+    }
 }

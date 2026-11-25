@@ -537,6 +537,7 @@ version = "0.1.0"
 dependencies = [
  "fearless_simd",
  "pollster",
+ "raw-window-handle",
  "wgpu",
 ]
 

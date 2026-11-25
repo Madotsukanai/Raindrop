@@ -2890,40 +2890,11 @@ void __attribute__((naked)) Hook_LoadStart(void) {
 typedef IDirect3D9* (WINAPI *PFN_Direct3DCreate9)(UINT SDKVersion);
 static PFN_Direct3DCreate9 orig_Direct3DCreate9 = NULL;
 
-// ---- Rust wgpu backend (raindrop-d3d9 crate, statically linked) ---------------
-extern void *__stdcall raindrop_d3d9_create9(unsigned int SDKVersion);
-extern unsigned int __stdcall raindrop_d3d9_abi_version(void);
-static int g_rustBackend = -1; /* -1 unknown, 0 off, 1 on */
-
-static int RustBackendEnabled(void) {
-    if (g_rustBackend < 0) {
-        char path[MAX_PATH], value[64];
-        GetModuleFileNameA(NULL, path, MAX_PATH);
-        char *slash = strrchr(path, '\\');
-        if (slash) *(slash + 1) = 0;
-        strcat(path, "raindrop.ini");
-        GetPrivateProfileStringA("Graphics", "Backend", "system", value, sizeof(value), path);
-        g_rustBackend = (_stricmp(value, "wgpu") == 0) ? 1 : 0;
-    }
-    return g_rustBackend == 1;
-}
-
 #if defined(_MSC_VER)
 IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion) {
 #else
 __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion) {
 #endif
-    /* Rust wgpu backend (raindrop.ini [Graphics] Backend=wgpu). Falls back to the
-     * system d3d9 proxy when the backend is unavailable so the game keeps running. */
-    if (RustBackendEnabled()) {
-        void *obj = raindrop_d3d9_create9(SDKVersion);
-        if (obj) {
-            LogMessage("Direct3DCreate9: Rust wgpu backend (abi=%u)", raindrop_d3d9_abi_version());
-            return (IDirect3D9*)obj;
-        }
-        LogMessage("[Warn] Backend=wgpu requested but the wgpu backend is unavailable; falling back to system d3d9");
-    }
-
     if (!orig_Direct3DCreate9) {
         char sysPath[MAX_PATH];
         UINT len = GetSystemDirectoryA(sysPath, MAX_PATH);

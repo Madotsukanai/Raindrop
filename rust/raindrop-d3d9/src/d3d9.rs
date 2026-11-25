@@ -59,6 +59,51 @@ pub const D3DRS_ALPHAFUNC: u32 = 25;
 pub const D3DRS_ALPHABLENDENABLE: u32 = 27;
 pub const D3DRS_BLENDOP: u32 = 171;
 
+// additional render states used by the D3D7 emulation layer
+pub const D3DRS_ZWRITEENABLE: u32 = 14;
+pub const D3DRS_ZFUNC: u32 = 23;
+pub const D3DRS_DITHERENABLE: u32 = 26;
+pub const D3DRS_FOGENABLE: u32 = 28;
+pub const D3DRS_SPECULARENABLE: u32 = 29;
+pub const D3DRS_STENCILENABLE: u32 = 52;
+pub const D3DRS_TEXTUREFACTOR: u32 = 60;
+pub const D3DRS_CLIPPING: u32 = 128;
+pub const D3DRS_LIGHTING: u32 = 137;
+pub const D3DRS_AMBIENT: u32 = 139;
+pub const D3DRS_COLORVERTEX: u32 = 140;
+pub const D3DRS_VERTEXBLEND: u32 = 161;
+pub const D3DRS_BLENDOP2: u32 = 171;
+pub const D3DRS_SCISSORTESTENABLE: u32 = 174;
+
+// D3DCULL
+pub const D3DCULL_NONE: u32 = 1;
+pub const D3DCULL_CW: u32 = 2;
+pub const D3DCULL_CCW: u32 = 3;
+
+// extra texture stage states
+pub const D3DTSS_COLORARG1: u32 = 2;
+pub const D3DTSS_COLORARG2: u32 = 3;
+pub const D3DTSS_ALPHAARG1: u32 = 5;
+pub const D3DTSS_ALPHAARG2: u32 = 6;
+
+// D3DTA
+pub const D3DTA_DIFFUSE: u32 = 0;
+pub const D3DTA_CURRENT: u32 = 1;
+pub const D3DTA_TEXTURE: u32 = 2;
+pub const D3DTA_TFACTOR: u32 = 3;
+pub const D3DTA_SPECULAR: u32 = 4;
+
+// D3DTEXTUREFILTERTYPE
+pub const D3DTEXF_NONE: u32 = 0;
+pub const D3DTEXF_POINT: u32 = 1;
+pub const D3DTEXF_LINEAR: u32 = 2;
+pub const D3DTEXF_ANISOTROPIC: u32 = 3;
+
+// D3DTEXTUREADDRESS
+pub const D3DTADDRESS_WRAP: u32 = 1;
+pub const D3DTADDRESS_MIRROR: u32 = 2;
+pub const D3DTADDRESS_CLAMP: u32 = 3;
+
 // D3DBLEND
 pub const D3DBLEND_ZERO: u32 = 1;
 pub const D3DBLEND_ONE: u32 = 2;
