@@ -24,7 +24,7 @@ pub mod vtbl_gen;
 use com::*;
 
 // Note: this crate does not export Direct3DCreate9 itself. Consumers own the
-// export surface: raindrop-ddraw7 (五月雨 DirectDraw emulation) links it
+// export surface: raindrop-ddraw (五月雨 DirectDraw emulation) links it
 // statically, and the standalone raindrop_d3d9.dll below exposes
 // raindrop_d3d9_create9 for a thin C shim if needed.
 

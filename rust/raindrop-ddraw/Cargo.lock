@@ -542,7 +542,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "raindrop-ddraw7"
+name = "raindrop-ddraw"
 version = "0.1.0"
 dependencies = [
  "raindrop-d3d9",

@@ -5,7 +5,7 @@
 
 - RefRain 本体の `d3d9.dll` は C のみのプロキシ shim に戻したため、
   本クレートは RefRain にはリンクされない。
-- 現在の利用者: `raindrop-ddraw7`(五月雨 DirectDraw エミュレーション、
+- 現在の利用者: `raindrop-ddraw`(五月雨 DirectDraw エミュレーション、
   静的リンク)。
 - バックエンド設定は廃止済み。wgpu が唯一のバックエンド。
 
