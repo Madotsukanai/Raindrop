@@ -172,21 +172,39 @@ static void IniAddGraphicsSection(const char *path) {
     free(buf);
 }
 
+/* raindrop.ini files written by 0.3.2 or earlier still contain the now-unused
+   `API=` entry; the first run of this version detects it, deletes the file and
+   recreates it with the new defaults. */
+static const char g_iniDefaults[] = "[General]\r\nPrEx=1\r\nUpdateCheck=1\r\nUpdateSkip=\r\n\r\n[Graphics]\r\nBackend=wgpu\r\nVSync=auto\r\n";
+
+static void WriteDefaultIni(const char *path) {
+    HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file != INVALID_HANDLE_VALUE) {
+        DWORD written;
+        WriteFile(file, g_iniDefaults, (DWORD)(sizeof(g_iniDefaults) - 1), &written, NULL);
+        CloseHandle(file);
+    }
+}
+
 static void LoadGeneralConfig(void) {
     char path[MAX_PATH];
     char value[32];
     ExeDirFile("raindrop.ini", path);
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
-        HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
-                                  FILE_ATTRIBUTE_NORMAL, NULL);
-        if (file != INVALID_HANDLE_VALUE) {
-            static const char defaults[] = "[General]\r\nPrEx=1\r\nUpdateCheck=1\r\nUpdateSkip=\r\n\r\n[Graphics]\r\nBackend=wgpu\r\nVSync=auto\r\n";
-            DWORD written;
-            WriteFile(file, defaults, (DWORD)(sizeof(defaults) - 1), &written, NULL);
-            CloseHandle(file);
-            Log("Created raindrop.ini with default General/Graphics sections");
-        }
+        WriteDefaultIni(path);
+        Log("Created raindrop.ini with default General/Graphics sections");
     } else {
+        char apiVal[32];
+        GetPrivateProfileStringA("Graphics", "API", "\x1notfound", apiVal, sizeof(apiVal), path);
+        if (strcmp(apiVal, "\x1notfound") != 0) {
+            /* The ini predates the current config format (0.3.2 or earlier,
+               still carrying the unused API= entry): reset it once so the new
+               defaults apply from scratch. */
+            DeleteFileA(path);
+            WriteDefaultIni(path);
+            Log("raindrop.ini was created by an older version; deleted and recreated with the new defaults");
+        }
         IniAddGeneralSection(path);
         IniAddGraphicsSection(path);
         if ((int)GetPrivateProfileIntA("General", "PrEx", -1, path) < 0) {
