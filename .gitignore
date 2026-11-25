@@ -5,3 +5,4 @@ build/
 d3d9.dll
 ddraw.dll
 extract_smd.sh
+rust/target/

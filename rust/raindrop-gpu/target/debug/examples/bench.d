@@ -1,0 +1,1 @@
+/home/madotsukanai/Projects/RefRain/rust/raindrop-gpu/target/debug/examples/bench: /home/madotsukanai/Projects/RefRain/rust/raindrop-gpu/examples/bench.rs /home/madotsukanai/Projects/RefRain/rust/raindrop-gpu/src/kernels.rs /home/madotsukanai/Projects/RefRain/rust/raindrop-gpu/src/lib.rs

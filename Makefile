@@ -16,7 +16,14 @@ $(VERSION_STAMP): VERSION | $(BUILD)
 CFLAGS = -O2 -Wall
 SMD_CFLAGS = -O2 -Wall -Wno-unused-function -Wno-unused-variable
 SMD_DEFS =
-LDFLAGS = -shared -static-libgcc -s -Wl,--kill-at
+SMD_INCLUDES = -Irust/raindrop-gpu/include
+RUST = cargo
+RUST_TARGET_DIR = rust/raindrop-gpu/target/i686-pc-windows-gnu/release
+RUSTLIB = $(RUST_TARGET_DIR)/libraindrop_gpu.a
+RUST_RUNTIME_LIBS = -ladvapi32 -lws2_32 -lbcrypt -luserenv -lole32 -loleaut32 -lsynchronization -lntdll
+# -static keeps libwinpthread / libgcc from becoming DLL imports, so the shims
+# stay single-file deployable now that the Rust kernels are linked in.
+LDFLAGS = -shared -static -static-libgcc -s -Wl,--kill-at
 
 all: refrain smd
 
@@ -50,29 +57,34 @@ smd: $(BUILD)/ddraw.dll
 # make smd-debug : Debug Smd sources -> build/debug/ddraw.dll
 smd-debug: $(BUILD)/debug/ddraw.dll
 
-$(BUILD)/debug/ddraw.dll: $(BUILD)/Smd_debug.o $(BUILD)/Smd_d3d9_debug.o $(BUILD)/Smd_controller_debug.o | $(BUILD)/debug
-	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldxguid
+$(BUILD)/debug/ddraw.dll: $(BUILD)/Smd_debug.o $(BUILD)/Smd_d3d9_debug.o $(BUILD)/Smd_controller_debug.o $(RUSTLIB) | $(BUILD)/debug
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldxguid $(RUST_RUNTIME_LIBS)
 
 $(BUILD)/Smd_debug.o: src/Smd/Smd.c src/Smd/Smd_internal.h src/RainUpdate.h $(VERSION_STAMP) | $(BUILD)
-	$(CC) -c -o $@ src/Smd/Smd.c $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS)
+	$(CC) -c -o $@ src/Smd/Smd.c $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS) $(SMD_INCLUDES)
 
-$(BUILD)/Smd_d3d9_debug.o: src/Smd/Smd_d3d9.c src/Smd/Smd_internal.h | $(BUILD)
-	$(CC) -c -o $@ $< $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS)
+$(BUILD)/Smd_d3d9_debug.o: src/Smd/Smd_d3d9.c src/Smd/Smd_internal.h rust/raindrop-gpu/include/raindrop_gpu.h | $(BUILD)
+	$(CC) -c -o $@ $< $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS) $(SMD_INCLUDES)
 
 $(BUILD)/Smd_controller_debug.o: src/Smd/Smd_controller.c src/Smd/Smd_internal.h | $(BUILD)
-	$(CC) -c -o $@ $< $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS)
+	$(CC) -c -o $@ $< $(SMD_CFLAGS) -DSMD_DEBUG_BUILD $(SMD_DEFS) $(SMD_INCLUDES)
 
-$(BUILD)/ddraw.dll: $(BUILD)/Smd.o $(BUILD)/Smd_d3d9.o $(BUILD)/Smd_controller.o
-	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldxguid
+# Rust pixel kernels (raindrop-gpu crate). Release build is shared by debug DLLs too:
+# the kernels carry no logging of their own and differ from a debug build only in speed.
+$(RUSTLIB): rust/raindrop-gpu/Cargo.toml rust/raindrop-gpu/src/lib.rs rust/raindrop-gpu/src/kernels.rs
+	cd rust/raindrop-gpu && $(RUST) build --target i686-pc-windows-gnu --release
+
+$(BUILD)/ddraw.dll: $(BUILD)/Smd.o $(BUILD)/Smd_d3d9.o $(BUILD)/Smd_controller.o $(RUSTLIB)
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--allow-multiple-definition -lgdi32 -ldxguid $(RUST_RUNTIME_LIBS)
 
 $(BUILD)/Smd.o: src/Smd/Smd.c src/Smd/Smd_internal.h src/RainUpdate.h $(VERSION_STAMP) | $(BUILD)
-	$(CC) -c -o $@ src/Smd/Smd.c $(SMD_CFLAGS) $(SMD_DEFS)
+	$(CC) -c -o $@ src/Smd/Smd.c $(SMD_CFLAGS) $(SMD_DEFS) $(SMD_INCLUDES)
 
-$(BUILD)/Smd_d3d9.o: src/Smd/Smd_d3d9.c src/Smd/Smd_internal.h | $(BUILD)
-	$(CC) -c -o $@ $< $(SMD_CFLAGS) $(SMD_DEFS)
+$(BUILD)/Smd_d3d9.o: src/Smd/Smd_d3d9.c src/Smd/Smd_internal.h rust/raindrop-gpu/include/raindrop_gpu.h | $(BUILD)
+	$(CC) -c -o $@ $< $(SMD_CFLAGS) $(SMD_DEFS) $(SMD_INCLUDES)
 
 $(BUILD)/Smd_controller.o: src/Smd/Smd_controller.c src/Smd/Smd_internal.h | $(BUILD)
-	$(CC) -c -o $@ $< $(SMD_CFLAGS) $(SMD_DEFS)
+	$(CC) -c -o $@ $< $(SMD_CFLAGS) $(SMD_DEFS) $(SMD_INCLUDES)
 
 $(BUILD):
 	mkdir -p $@

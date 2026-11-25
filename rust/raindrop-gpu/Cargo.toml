@@ -1,0 +1,26 @@
+[package]
+name = "raindrop-gpu"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "wgpu backend + fearless_simd pixel kernels for the Raindrop DirectDraw/D3D9 shims"
+
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+fearless_simd = "1.3.0"
+pollster = "1.0.3"
+wgpu = { version = "26", optional = true, default-features = false, features = ["vulkan", "gles", "wgsl"] }
+
+[features]
+default = []
+wgpu-backend = ["dep:wgpu"]
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+strip = "debuginfo"
+
+[profile.release-32bit]
+inherits = "release"

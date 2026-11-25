@@ -1,0 +1,1 @@
+/home/madotsukanai/Projects/RefRain/rust/raindrop-gpu/target/i686-pc-windows-gnu/release/libraindrop_gpu.a: /home/madotsukanai/Projects/RefRain/rust/raindrop-gpu/src/kernels.rs /home/madotsukanai/Projects/RefRain/rust/raindrop-gpu/src/lib.rs

@@ -18,6 +18,7 @@
 #include <intrin.h>
 #endif
 #include "Smd_internal.h"
+#include "raindrop_gpu.h"
 
 static int g_fullscreenRequested = 0;
 static int g_displayModeFailures = 0;
@@ -269,6 +270,19 @@ static const struct { DWORD flags, bpp, r, g, b, a; } k_d7Fmts[] = {
     { DDPF_RGB,                    16, 0x00007C00, 0x000003E0, 0x0000001F, 0 }
 };
 
+/* Map a D7Fmt to a RAINDROP_FMT_* code for the Rust kernels, or -1 when generic. */
+static int D7_FmtCode(const D7Fmt *f) {
+    if (f->m[0] == 0x0000F800u && f->m[1] == 0x000007E0u && f->m[2] == 0x0000001Fu && f->m[3] == 0)
+        return RAINDROP_FMT_565;
+    if (f->m[0] == 0x00007C00u && f->m[1] == 0x000003E0u && f->m[2] == 0x0000001Fu && f->m[3] == 0)
+        return RAINDROP_FMT_555;
+    if (f->m[0] == 0x00007C00u && f->m[1] == 0x000003E0u && f->m[2] == 0x0000001Fu && f->m[3] == 0x00008000u)
+        return RAINDROP_FMT_5551;
+    if (f->m[0] == 0x00000F00u && f->m[1] == 0x000000F0u && f->m[2] == 0x0000000Fu && f->m[3] == 0x0000F000u)
+        return RAINDROP_FMT_4444;
+    return -1;
+}
+
 static D7Surf *D7_SurfNew(int w, int h, const DDPIXELFORMAT *pf, DWORD caps) {
     D7Surf *s = (D7Surf*)calloc(1, sizeof(*s));
     if (!s) return NULL;
@@ -403,31 +417,51 @@ static IDirect3DTexture9 *D7_GetTex(D7Surf *s) {
         n = rc.right - rc.left;
         lut = (s->bpp == 16) ? D7_Lut16(&s->fmt) : NULL;
         if (SUCCEEDED(IDirect3DTexture9_LockRect(s->tex, 0, &lr, partial ? &rc : NULL, 0))) {
-            for (y = rc.top; y < rc.bottom; y++) {
-                const unsigned char *sp = s->bits + (size_t)y * (size_t)s->pitch + (size_t)rc.left * (size_t)bytes;
-                DWORD *dp = (DWORD*)((unsigned char*)lr.pBits + (size_t)(y - rc.top) * (size_t)lr.Pitch);
-                if (s->bpp == 32 && s->fmt.m[0] == 0x00FF0000u && s->fmt.m[1] == 0x0000FF00u &&
-                    s->fmt.m[2] == 0x000000FFu && (s->fmt.m[3] == 0 || s->fmt.m[3] == 0xFF000000u)) {
-                    if (!s->hasKey && s->fmt.m[3] == 0xFF000000u) {
-                        memcpy(dp, sp, (size_t)n * sizeof(DWORD));
-                        continue;
-                    }
-                    DWORD m3 = s->fmt.m[3], addA = m3 ? 0u : 0xFF000000u, keyv = s->keyLo & ~m3;
-                    const DWORD *sd = (const DWORD*)sp;
+            int hgt = rc.bottom - rc.top;
+            DWORD m3 = s->fmt.m[3];
+            const unsigned char *sp0 = s->bits + (size_t)rc.top * (size_t)s->pitch + (size_t)rc.left * (size_t)bytes;
+            DWORD *dp0 = (DWORD*)lr.pBits;
+            int done = 0;
+            /* 32bpp A8R8G8B8 / X8R8G8B8 fast formats -> Rust kernel (raw | addA, keyed alpha 0) */
+            if (s->bpp == 32 && s->fmt.m[0] == 0x00FF0000u && s->fmt.m[1] == 0x0000FF00u &&
+                s->fmt.m[2] == 0x000000FFu && (m3 == 0 || m3 == 0xFF000000u)) {
+                if (!s->hasKey && m3 == 0xFF000000u) {
+                    /* plain copy */
+                    for (y = rc.top; y < rc.bottom; y++)
+                        memcpy((unsigned char*)dp0 + (size_t)(y - rc.top) * (size_t)lr.Pitch,
+                               s->bits + (size_t)y * (size_t)s->pitch + (size_t)rc.left * 4,
+                               (size_t)n * sizeof(DWORD));
+                    done = 1;
+                } else {
+                    raindrop_upload_xrgb32((uint32_t*)dp0, (size_t)lr.Pitch / 4, (const uint32_t*)sp0,
+                                           (size_t)s->pitch / 4, (size_t)n, (size_t)hgt,
+                                           m3 ? 0u : 0xFF000000u,
+                                           s->hasKey, s->keyLo & ~m3, ~m3);
+                    done = 1;
+                }
+            } else if (s->bpp == 16 && D7_FmtCode(&s->fmt) >= 0) {
+                /* known 16bpp layouts -> Rust kernel (expand + optional color key).
+                 * The kernel compares in 16-bit domain; if the key has bits set above
+                 * the pixel width, C semantics would never match -> disable keying. */
+                int hasKey16 = s->hasKey && ((s->keyLo & ~m3 & 0xFFFF0000u) == 0);
+                raindrop_upload_conv16((uint32_t*)dp0, (size_t)lr.Pitch / 4, (const uint16_t*)sp0,
+                                       (size_t)s->pitch / 2, (size_t)n, (size_t)hgt,
+                                       D7_FmtCode(&s->fmt),
+                                       hasKey16, (uint16_t)(s->keyLo & ~(uint32_t)(WORD)m3),
+                                       (uint16_t)~(uint32_t)(WORD)m3);
+                done = 1;
+            }
+            if (!done) {
+                for (y = rc.top; y < rc.bottom; y++) {
+                    const unsigned char *sp = s->bits + (size_t)y * (size_t)s->pitch + (size_t)rc.left * (size_t)bytes;
+                    DWORD *dp = (DWORD*)((unsigned char*)lr.pBits + (size_t)(y - rc.top) * (size_t)lr.Pitch);
                     for (x = 0; x < n; x++) {
-                        DWORD raw = sd[x];
-                        DWORD argb = raw | addA;
-                        if (s->hasKey && (raw & ~m3) == keyv) argb &= 0x00FFFFFFu;
+                        DWORD raw = D7_Rd(s, sp + x * bytes);
+                        DWORD argb = lut ? lut[raw & 0xFFFFu] : D7_ToArgb(&s->fmt, raw);
+                        if (s->hasKey && (raw & ~s->fmt.m[3]) == (s->keyLo & ~s->fmt.m[3]))
+                            argb &= 0x00FFFFFFu;
                         dp[x] = argb;
                     }
-                    continue;
-                }
-                for (x = 0; x < n; x++) {
-                    DWORD raw = D7_Rd(s, sp + x * bytes);
-                    DWORD argb = lut ? lut[raw & 0xFFFFu] : D7_ToArgb(&s->fmt, raw);
-                    if (s->hasKey && (raw & ~s->fmt.m[3]) == (s->keyLo & ~s->fmt.m[3]))
-                        argb &= 0x00FFFFFFu;
-                    dp[x] = argb;
                 }
             }
             IDirect3DTexture9_UnlockRect(s->tex, 0);
