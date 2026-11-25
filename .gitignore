@@ -5,4 +5,9 @@ build/
 d3d9.dll
 ddraw.dll
 extract_smd.sh
-rust/target/
+# Rust (raindrop-gpu crate): build artifacts only; Cargo.lock is tracked to pin
+# the fearless_simd version (its API is still unstable).
+rust/raindrop-gpu/target/
+rust/**/target/
+Cargo.lock.bak
+*.rs.bk
