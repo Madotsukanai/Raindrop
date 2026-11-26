@@ -33,7 +33,6 @@ Boolean values use the same format for `PrEx`, `UpdateCheck`, `VSync` and the `S
 Missing entries are added automatically at startup.
 
 `API=DirectDraw` uses the system DirectDraw implementation and falls back to D3D9 if it is unavailable. Set `API=D3D9` to use the built-in D3D9 implementation from startup. If the file or setting is missing, `DirectDraw` is used.<br>
-On Wine/Proton, keeping the default `DirectDraw` is recommended.
 
 Display synchronisation of the built-in D3D9 implementation (`API=D3D9`) is selected with `VSync`.
 

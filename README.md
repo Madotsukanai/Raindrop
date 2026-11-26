@@ -35,7 +35,6 @@ VSync=auto
 存在しない項目は起動時に自動で追加されます。
 
 `API=DirectDraw`はシステムのDirectDrawを使用します。利用できない場合はD3D9へフォールバックします。`API=D3D9`にすると、起動時から内蔵D3D9実装を使用します。ファイルまたは設定がない場合は`DirectDraw`を使用します。<br>
-Wine/Protonではデフォルトの`DirectDraw`のままにすることを推奨します。
 
 内蔵D3D9実装（`API=D3D9`）の表示同期は`VSync`で選択できます。
 
