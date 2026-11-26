@@ -490,7 +490,52 @@ static int UpdateMessageBox(const char *title, const char *text, DWORD type) {
     return MessageBoxW(NULL, textW, titleW, type);
 }
 
-static void UpdateScheduleRestart(const char *dllPath) {
+static int UpdateScheduleRestartVbs(const char *dllPath) {
+    char scriptPath[MAX_PATH], exePath[MAX_PATH], exeDir[MAX_PATH], sysDir[MAX_PATH];
+    char cmd[MAX_PATH * 3], *slash;
+    FILE *f;
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    DWORD pid = GetCurrentProcessId();
+
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    strcpy(exeDir, exePath);
+    slash = strrchr(exeDir, '\\');
+    if (slash) *slash = 0;
+    else exeDir[0] = 0;
+
+    UpdateSiblingPath(dllPath, "raindrop_restart.vbs", scriptPath);
+    f = fopen(scriptPath, "wb");
+    if (!f) {
+        Log("Update: cannot create restart script %s", scriptPath);
+        return 0;
+    }
+    fprintf(f, "Set sh = CreateObject(\"WScript.Shell\")\r\n");
+    fprintf(f, "WScript.Sleep 6000\r\n");
+    fprintf(f, "sh.CurrentDirectory = \"%s\"\r\n", exeDir);
+    fprintf(f, "sh.Run \"\"\"%s\"\"\", 1, False\r\n", exePath);
+    fprintf(f, "Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n");
+    fprintf(f, "On Error Resume Next\r\n");
+    fprintf(f, "fso.DeleteFile WScript.ScriptFullName, True\r\n");
+    fclose(f);
+
+    GetSystemDirectoryA(sysDir, MAX_PATH);
+    snprintf(cmd, sizeof(cmd), "\"%s\\wscript.exe\" //B //Nologo \"%s\"", sysDir, scriptPath);
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+                       CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        Log("Update: restart scheduled for pid %lu -> %s", (unsigned long)pid, exePath);
+        return 1;
+    }
+    Log("Update: failed to start restart script (err=%lu)", (unsigned long)GetLastError());
+    return 0;
+}
+
+static void UpdateScheduleRestartBat(const char *dllPath) {
     char batPath[MAX_PATH], exePath[MAX_PATH], cmd[MAX_PATH * 2];
     FILE *f;
     STARTUPINFOA si;
@@ -499,19 +544,15 @@ static void UpdateScheduleRestart(const char *dllPath) {
 
     GetModuleFileNameA(NULL, exePath, MAX_PATH);
     UpdateSiblingPath(dllPath, "raindrop_restart.bat", batPath);
-    f = fopen(batPath, "w");
+    f = fopen(batPath, "wb");
     if (!f) {
         Log("Update: cannot create restart script %s", batPath);
         return;
     }
-    fprintf(f, "@echo off\n");
-    fprintf(f, ":wait\n");
-    fprintf(f, "tasklist /FI \"PID eq %lu\" 2>NUL | find \"%lu\" >NUL\n",
-            (unsigned long)pid, (unsigned long)pid);
-    fprintf(f, "if not errorlevel 1 (\n  ping -n 2 127.0.0.1 >NUL\n  goto wait\n)\n");
-    fprintf(f, "ping -n 3 127.0.0.1 >NUL\n");
-    fprintf(f, "start \"\" \"%s\"\n", exePath);
-    fprintf(f, "del \"%%~f0\"\n");
+    fprintf(f, "@echo off\r\n");
+    fprintf(f, "ping -n 7 127.0.0.1 >NUL\r\n");
+    fprintf(f, "start \"\" \"%s\"\r\n", exePath);
+    fprintf(f, "del \"%%~f0\"\r\n");
     fclose(f);
 
     snprintf(cmd, sizeof(cmd), "cmd.exe /c \"%s\"", batPath);
@@ -522,10 +563,20 @@ static void UpdateScheduleRestart(const char *dllPath) {
                        CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, NULL, &si, &pi)) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
-        Log("Update: restart scheduled for pid %lu -> %s", (unsigned long)pid, exePath);
+        Log("Update: restart scheduled (bat) for pid %lu -> %s", (unsigned long)pid, exePath);
     } else {
         Log("Update: failed to start restart script (err=%lu)", (unsigned long)GetLastError());
     }
+}
+
+static void UpdateScheduleRestart(const char *dllPath) {
+    if (UpdateScheduleRestartVbs(dllPath)) {
+        char batPath[MAX_PATH];
+        UpdateSiblingPath(dllPath, "raindrop_restart.bat", batPath);
+        DeleteFileA(batPath);
+        return;
+    }
+    UpdateScheduleRestartBat(dllPath);
 }
 
 static void RainUpdateTick(void) {

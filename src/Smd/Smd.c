@@ -1,4 +1,4 @@
-#define VERSION "0.3.4"
+#define VERSION "0.3.5"
 #define CINTERFACE
 #define COBJMACROS
 #define DIRECTINPUT_VERSION 0x0800
