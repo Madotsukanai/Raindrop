@@ -1,4 +1,4 @@
-#define VERSION "0.3.2"
+#define VERSION "0.3.4"
 #include <windows.h>
 #include <d3d9.h>
 #include <mmsystem.h>

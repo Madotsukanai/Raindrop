@@ -85,6 +85,7 @@ typedef struct D7Surf {
     RECT drc;
     int lockRO, lockFull;
     RECT lockRc;
+    unsigned char *snap;   /* pre-GDI snapshot for ReleaseDC dirty-rect diff */
     IDirect3DTexture9 *tex;
     struct D7Surf *back, *zbuf;
     int isPrimary;
@@ -120,12 +121,21 @@ static struct {
     unsigned warned;
     unsigned surfLogged;
     int inScene;
+    IDirect3DSurface9 *rb;      /* cached systemmem readback surface for GetDC pulls */
+    UINT rbW, rbH;
+    D3DFORMAT rbFmt;
+    int bbDirty;                /* D3D9 backbuffer changed since the last GetDC pull */
     int fs;            
     int fsCw, fsCh;    
     IDirect3DStateBlock9 *sb;   
     DWORD fvf;                  
     void *devTex[8];            
 } g_d7 = { 0, NULL, 640, 480 };
+
+/* Software DirectDraw fallback: set when the Direct3D9 device could not be
+   created. Device draws become no-ops, 2D blits run on the CPU and Present
+   paints the composed frame with GDI. */
+static int g_d7Soft = 0;
 
 static void D7_SetFVF(DWORD fvf) {
     if (!g_d7.dev || g_d7.fvf == fvf) return;
@@ -165,6 +175,7 @@ static void D7_BatchFlush(void) {
     if (g_d7bTex) tex = D7_GetTex(g_d7bTex);
     D7_SetTex(0, tex);
     D7_SetFVF(D7_BATCH_FVF);
+    g_d7.bbDirty = 1;
     IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, quads * 2,
                                      g_d7bv, 8 * sizeof(DWORD));
     g_d7bTex = NULL;
@@ -326,6 +337,7 @@ static ULONG STDMETHODCALLTYPE ES_Release(void *self) {
     if (s->dc) DeleteDC(s->dc);
     if (s->dib) DeleteObject(s->dib);
     else if (s->ownBits) free(s->bits);
+    free(s->snap);
     if (s->tex) IDirect3DTexture9_Release(s->tex);
     free(s);
     return 0;
@@ -724,6 +736,7 @@ static int D7_InitD3D9(void) {
     IDirect3DDevice9_SetRenderState(g_d7.dev, D3DRS_LIGHTING, FALSE);
     g_d7.sb = NULL;
     D7_SeedState();
+    g_d7.bbDirty = 1;
     SmdLog("D3D7 emu: Direct3D9 device created (%dx%d, hwnd=%p)", g_d7.dispW, g_d7.dispH, (void*)hwnd);
     D7_BringToFront(hwnd);
     return 1;
@@ -820,12 +833,49 @@ static void D7RateGuard(void) {
     g_rateFrames = 0;
 }
 
+/* GDI present for the software DirectDraw fallback (no Direct3D9 device). */
+static void D7_SoftPaint(D7Surf *s) {
+    HDC wdc, mdc;
+    HGDIOBJ ob;
+    RECT cr;
+    int cw, ch;
+    if (!g_d7Soft || !s || !s->dib || !g_d7.hwnd) return;
+    if (!GetClientRect(g_d7.hwnd, &cr)) return;
+    cw = cr.right - cr.left;
+    ch = cr.bottom - cr.top;
+    if (cw <= 0 || ch <= 0) return;
+    wdc = GetDC(g_d7.hwnd);
+    if (!wdc) return;
+    mdc = CreateCompatibleDC(wdc);
+    if (mdc) {
+        ob = SelectObject(mdc, s->dib);
+        SetStretchBltMode(wdc, COLORONCOLOR);
+        if (cw == s->w && ch == s->h)
+            BitBlt(wdc, 0, 0, cw, ch, mdc, 0, 0, SRCCOPY);
+        else
+            StretchBlt(wdc, 0, 0, cw, ch, mdc, 0, 0, s->w, s->h, SRCCOPY);
+        SelectObject(mdc, ob);
+        DeleteDC(mdc);
+    }
+    ReleaseDC(g_d7.hwnd, wdc);
+}
+
 static void D7_Present(void) {
     LARGE_INTEGER t0, t1;
     TraceHit("Dev.Present(emu)");
     HRESULT hr;
     double cost, paceMs;
-    if (!g_d7.dev) return;
+    if (!g_d7.dev) {
+        /* software fallback: compose the frame into the primary DIB and paint */
+        if (g_d7Soft && g_d7.primary && g_d7.back3d &&
+            g_d7.primary->bits && g_d7.back3d->bits) {
+            RECT fr;
+            fr.left = 0; fr.top = 0; fr.right = g_d7.back3d->w; fr.bottom = g_d7.back3d->h;
+            D7_Blit(g_d7.primary, &fr, g_d7.back3d, &fr, 0);
+        }
+        D7_SoftPaint(g_d7.primary);
+        return;
+    }
     if (!g_paceFreq.QuadPart) QueryPerformanceFrequency(&g_paceFreq);
     paceMs = D7PaceWait();
     QueryPerformanceCounter(&t0);
@@ -849,6 +899,7 @@ static void D7_Present(void) {
             }
             if (SUCCEEDED(IDirect3DDevice9_Reset(g_d7.dev, &g_d7.pp))) {
                 D7_Reapply();
+                g_d7.bbDirty = 1;
                 SmdLog("D3D7 emu: device reset");
             }
         }
@@ -927,6 +978,7 @@ static int D7_BltToDev(const RECT *drIn, D7Surf *s, const RECT *srIn, int useKey
     D7_SetTex(0, t);
     D7_SetFVF(D7_QUAD_FVF);
     IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLESTRIP, 2, q, sizeof(D7Quad));
+    g_d7.bbDirty = 1;
 
     for (i = 0; i < NRS; i++) D7_ApplyRS(rsId[i], rsOld[i]);
     for (i = 0; i < 6; i++) D7_ApplyTss(tssStage[i], tssType[i], tssOld[i]);
@@ -971,6 +1023,13 @@ static HRESULT STDMETHODCALLTYPE ES_Blt(void *self, RECT *dr, void *srcp, RECT *
             if (!D7_BltToDev(dr, s, sr, (flags & DDBLT_KEYSRC) ? 1 : 0) && D7_Warn(D7W_PRIMBLT))
                 SmdLog("D3D7 emu: Blt to the primary surface failed (invalid rectangle or texture)");
             D7_Present();
+        } else if (s && g_d7Soft) {
+            /* software fallback: CPU-blit the overlay into the primary DIB and repaint */
+            RECT dr2;
+            if (dr) dr2 = *dr;
+            else { dr2.left = 0; dr2.top = 0; dr2.right = s->w; dr2.bottom = s->h; }
+            D7_Blit(d, &dr2, s, sr, (flags & DDBLT_KEYSRC) ? 1 : 0);
+            D7_SoftPaint(d);
         } else if (D7_Warn(D7W_PRIMBLT)) {
             SmdLog("D3D7 emu: Blt to the primary surface is not possible (no source or no Direct3D9 device yet)");
         }
@@ -982,6 +1041,7 @@ static HRESULT STDMETHODCALLTYPE ES_Blt(void *self, RECT *dr, void *srcp, RECT *
             DWORD argb = D7_ToArgb(&d->fmt, fx->dwFillColor);
             if (dr) { rc.x1 = dr->left; rc.y1 = dr->top; rc.x2 = dr->right; rc.y2 = dr->bottom; }
             IDirect3DDevice9_Clear(g_d7.dev, dr ? 1 : 0, dr ? &rc : NULL, D3DCLEAR_TARGET, argb | 0xFF000000u, 1.0f, 0);
+            g_d7.bbDirty = 1;
         } else if (s && s != d && !(flags & DDBLT_DEPTHFILL)) {
             if (!D7_BltToDev(dr, s, sr, (flags & DDBLT_KEYSRC) ? 1 : 0) && D7_Warn(D7W_BACKBLT))
                 SmdLog("D3D7 emu: Blt into the 3D back buffer failed (flags=%08X)", (unsigned)flags);
@@ -1006,6 +1066,12 @@ static HRESULT STDMETHODCALLTYPE ES_BltFast(void *self, DWORD x, DWORD y, void *
         if (!D7_BltToDev(&dr, s, &src, (trans & DDBLTFAST_SRCCOLORKEY) ? 1 : 0) && D7_Warn(D7W_BACKBLT))
             SmdLog("D3D7 emu: BltFast into the 3D back buffer / primary failed");
         if (d->isPrimary) D7_Present();
+        return DD_OK;
+    }
+    if (!g_d7.dev && g_d7Soft && s != d && (d == g_d7.back3d || d->isPrimary)) {
+        /* software fallback: CPU-blit, repaint only when it hit the primary */
+        D7_Blit(d, &dr, s, &src, (trans & DDBLTFAST_SRCCOLORKEY) ? 1 : 0);
+        if (d->isPrimary) D7_SoftPaint(d);
         return DD_OK;
     }
     D7_Blit(d, &dr, s, &src, (trans & DDBLTFAST_SRCCOLORKEY) ? 1 : 0);
@@ -1045,41 +1111,95 @@ static HRESULT STDMETHODCALLTYPE ES_GetColorKey(void *self, DWORD flags, DDCOLOR
     return DD_OK;
 }
 
+/* Cached scale-mapping tables for the backbuffer -> DIB copy. Rebuilt only
+   when the backbuffer or the surface size changes; removes the two 64-bit
+   divisions per pixel the old per-call loop did. */
+static void D7_ScaleCache(int dw, int dh, int sw, int sh, const int **px, const int **py) {
+    static int cdw, cdh, csw, csh, *tx, *ty;
+    int i;
+    if (tx && cdw == dw && cdh == dh && csw == sw && csh == sh) { *px = tx; *py = ty; return; }
+    free(tx);
+    free(ty);
+    tx = (int*)malloc(sizeof(int) * (size_t)(sw > 0 ? sw : 1));
+    ty = (int*)malloc(sizeof(int) * (size_t)(sh > 0 ? sh : 1));
+    if (tx) for (i = 0; i < sw; i++) tx[i] = (int)((long long)i * dw / sw);
+    if (ty) for (i = 0; i < sh; i++) ty[i] = (int)((long long)i * dh / sh);
+    cdw = dw; cdh = dh; csw = sw; csh = sh;
+    *px = tx;
+    *py = ty;
+}
+
+static void D7_RbRelease(void) {
+    if (g_d7.rb) IDirect3DSurface9_Release(g_d7.rb);
+    g_d7.rb = NULL;
+    g_d7.rbW = 0;
+    g_d7.rbH = 0;
+    g_d7.rbFmt = 0;
+}
+
 static void D7_SyncD3D9PixelsToDib(D7Surf *s) {
-    IDirect3DSurface9 *back = NULL, *readback = NULL;
+    IDirect3DSurface9 *back = NULL;
     D3DSURFACE_DESC desc;
     D3DLOCKED_RECT lock;
     HRESULT hr;
-    int x, y;
+    int y;
     if (!s || !s->bits || (s->bpp != 16 && s->bpp != 32) || !g_d7.dev ||
         (s != g_d7.back3d && !s->isPrimary)) return;
+    /* Skip the whole GPU->CPU pull when nothing has drawn into the backbuffer
+       since the last pull: the DIB already matches and any GDI content on top
+       of it must be preserved. */
+    if (!g_d7.bbDirty) return;
     TraceHit("Surf.SyncBackbuffer");
     hr = IDirect3DDevice9_GetBackBuffer(g_d7.dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &back);
 
     if (FAILED(hr) || !back) return;
     hr = IDirect3DSurface9_GetDesc(back, &desc);
-    if (SUCCEEDED(hr))
+    if (SUCCEEDED(hr) && (!g_d7.rb || g_d7.rbW != desc.Width || g_d7.rbH != desc.Height ||
+                          g_d7.rbFmt != desc.Format)) {
+        D7_RbRelease();
         hr = IDirect3DDevice9_CreateOffscreenPlainSurface(g_d7.dev, desc.Width, desc.Height, desc.Format,
-                                                          D3DPOOL_SYSTEMMEM, &readback, NULL);
-    if (SUCCEEDED(hr) && readback)
-        hr = IDirect3DDevice9_GetRenderTargetData(g_d7.dev, back, readback);
-    if (SUCCEEDED(hr) && readback)
-        hr = IDirect3DSurface9_LockRect(readback, &lock, NULL, D3DLOCK_READONLY);
-    if (SUCCEEDED(hr) && readback) {
+                                                          D3DPOOL_SYSTEMMEM, &g_d7.rb, NULL);
+        if (SUCCEEDED(hr) && g_d7.rb) {
+            g_d7.rbW = desc.Width;
+            g_d7.rbH = desc.Height;
+            g_d7.rbFmt = desc.Format;
+        } else {
+            g_d7.rb = NULL;
+        }
+    }
+    if (SUCCEEDED(hr) && g_d7.rb)
+        hr = IDirect3DDevice9_GetRenderTargetData(g_d7.dev, back, g_d7.rb);
+    if (SUCCEEDED(hr) && g_d7.rb)
+        hr = IDirect3DSurface9_LockRect(g_d7.rb, &lock, NULL, D3DLOCK_READONLY);
+    if (SUCCEEDED(hr) && g_d7.rb) {
+        const int *sxt = NULL, *syt = NULL;
+        int oneToOne = (desc.Width == (UINT)s->w && desc.Height == (UINT)s->h);
+        if (!oneToOne) D7_ScaleCache((int)desc.Width, (int)desc.Height, s->w, s->h, &sxt, &syt);
+        if (!s->snap) s->snap = (unsigned char*)malloc((size_t)s->pitch * (size_t)s->h);
         for (y = 0; y < s->h; y++) {
-            int sy = (int)((long long)y * desc.Height / s->h);
+            int sy = syt ? syt[y] : y;
             const DWORD *src = (const DWORD*)((const unsigned char*)lock.pBits + (size_t)sy * lock.Pitch);
             unsigned char *dst = s->bits + (size_t)y * s->pitch;
-            for (x = 0; x < s->w; x++) {
-                int sx = (int)((long long)x * desc.Width / s->w);
-                D7_Wr(s, dst + (size_t)x * (s->bpp / 8), D7_FromArgb(&s->fmt, src[sx] | 0xff000000u));
+            if (oneToOne && s->bpp == 32 && s->fmt.m[0] == 0x00FF0000u && s->fmt.m[1] == 0x0000FF00u &&
+                s->fmt.m[2] == 0x000000FFu && (s->fmt.m[3] == 0 || s->fmt.m[3] == 0xFF000000u)) {
+                DWORD *dp = (DWORD*)dst;
+                int x;
+                for (x = 0; x < s->w; x++) dp[x] = src[x] | 0xFF000000u;
+            } else {
+                int x;
+                for (x = 0; x < s->w; x++) {
+                    int sx = sxt ? sxt[x] : x;
+                    D7_Wr(s, dst + (size_t)x * (s->bpp / 8), D7_FromArgb(&s->fmt, src[sx] | 0xff000000u));
+                }
             }
+            if (s->snap)
+                memcpy(s->snap + (size_t)y * s->pitch, dst, (size_t)s->w * (s->bpp / 8));
         }
-        IDirect3DSurface9_UnlockRect(readback);
+        IDirect3DSurface9_UnlockRect(g_d7.rb);
         D7_MarkDirty(s, NULL);
+        g_d7.bbDirty = 0;
     }
-    if (readback) IDirect3DSurface9_Release(readback);
-    IDirect3DSurface9_Release(back);
+    if (back) IDirect3DSurface9_Release(back);
 }
 
 static HRESULT STDMETHODCALLTYPE ES_GetDC(void *self, HDC *out) {
@@ -1100,6 +1220,38 @@ static HRESULT STDMETHODCALLTYPE ES_GetDC(void *self, HDC *out) {
 static HRESULT STDMETHODCALLTYPE ES_ReleaseDC(void *self, HDC dc) {
     D7Surf *s = (D7Surf*)self;
     GdiFlush();
+    if (s->snap && s->bits) {
+        /* Diff the DIB against the pre-GDI snapshot so only the region GDI
+           actually drew is marked dirty (and re-uploaded as a texture). */
+        int y, db = s->bpp / 8;
+        size_t rowb = (size_t)s->w * (size_t)db;
+        int miny = -1, maxy = -1, minx = s->w, maxx = -1;
+        for (y = 0; y < s->h; y++) {
+            const unsigned char *a = s->bits + (size_t)y * s->pitch;
+            const unsigned char *b = s->snap + (size_t)y * s->pitch;
+            if (memcmp(a, b, rowb) != 0) {
+                const DWORD *ad = (const DWORD*)a;
+                const DWORD *bd = (const DWORD*)b;
+                int x, lo = -1, hi = -1;
+                for (x = 0; x < s->w; x++)
+                    if (ad[x] != bd[x]) { if (lo < 0) lo = x; hi = x; }
+                if (miny < 0) miny = y;
+                maxy = y;
+                if (lo < minx) minx = lo;
+                if (hi > maxx) maxx = hi;
+                memcpy(s->snap + (size_t)y * s->pitch, a, rowb);
+            }
+        }
+        if (miny >= 0) {
+            RECT r;
+            r.left = minx;
+            r.top = miny;
+            r.right = maxx + 1;
+            r.bottom = maxy + 1;
+            D7_MarkDirty(s, &r);
+        }
+        return DD_OK;
+    }
     D7_MarkDirty(s, NULL);
     return DD_OK;
 }
@@ -1292,8 +1444,20 @@ static HRESULT STDMETHODCALLTYPE EV_GetDirect3D(void *self, void **out) {
 
 static HRESULT STDMETHODCALLTYPE EV_Clear(void *self, DWORD count, void *rects, DWORD flags, DWORD color, float z, DWORD stencil) {
     TraceHitN("Dev.Clear", count, flags);
-    if (g_d7.dev && (flags & D3DCLEAR_TARGET))
+    if (g_d7.dev && (flags & D3DCLEAR_TARGET)) {
         IDirect3DDevice9_Clear(g_d7.dev, count, (const D3DRECT*)rects, D3DCLEAR_TARGET, color, z, stencil);
+        g_d7.bbDirty = 1;
+    } else if (!g_d7.dev && g_d7Soft && g_d7.back3d && g_d7.back3d->bits) {
+        /* software fallback: clear the back buffer on the CPU */
+        DWORD raw = D7_FromArgb(&g_d7.back3d->fmt, (DWORD)color);
+        RECT r;
+        if (count == 1 && rects) {
+            r = *(const RECT*)rects;
+            D7_Fill(g_d7.back3d, &r, raw);
+        } else {
+            D7_Fill(g_d7.back3d, NULL, raw);
+        }
+    }
     return DD_OK;
 }
 
@@ -1431,6 +1595,7 @@ static HRESULT STDMETHODCALLTYPE EV_DrawPrimitive(void *self, DWORD type, DWORD 
         D7_CkBegin();
         D7_SetFVF(fvf);
         IDirect3DDevice9_DrawPrimitiveUP(g_d7.dev, (D3DPRIMITIVETYPE)type, prims, verts, stride);
+        g_d7.bbDirty = 1;
         D7_ApplyRS(D3DRS_ALPHATESTENABLE, at);
         D7_ApplyRS(D3DRS_ALPHAFUNC, af);
         D7_ApplyRS(D3DRS_ALPHAREF, ar);
@@ -1441,6 +1606,7 @@ static HRESULT STDMETHODCALLTYPE EV_DrawPrimitive(void *self, DWORD type, DWORD 
     }
     D7_SetFVF(fvf);
     IDirect3DDevice9_DrawPrimitiveUP(g_d7.dev, (D3DPRIMITIVETYPE)type, prims, verts, stride);
+    g_d7.bbDirty = 1;
     return DD_OK;
 }
 
@@ -1518,7 +1684,16 @@ static ULONG STDMETHODCALLTYPE E3_Release(void *self) { return (ULONG)(g_d7D3D.r
 static HRESULT STDMETHODCALLTYPE E3_CreateDevice(void *self, const GUID *cls, void *surf, void **dev) {
     if (!dev || !surf) return DDERR_INVALIDPARAMS;
     g_d7.back3d = (D7Surf*)surf;
-    if (!D7_InitD3D9()) return DDERR_GENERIC;
+    if (!D7_InitD3D9()) {
+        /* Software DirectDraw fallback: keep the game alive with CPU blits and
+           a GDI present when the Direct3D9 device cannot be created. */
+        SmdLog("D3D7 emu: Direct3D9 device unavailable; using the software DirectDraw fallback");
+        g_d7Soft = 1;
+        g_d7Dev.ref++;
+        *dev = &g_d7Dev;
+        return DD_OK;
+    }
+    g_d7Soft = 0;
     g_d7Dev.ref++;
     *dev = &g_d7Dev;
     SmdLog("D3D7 emu: IDirect3D7::CreateDevice ok (back buffer surface %p)", surf);
@@ -1527,7 +1702,25 @@ static HRESULT STDMETHODCALLTYPE E3_CreateDevice(void *self, const GUID *cls, vo
 
 D7FN(E3_EnumDevices, DDERR_UNSUPPORTED, DWORD a, DWORD b)
 D7FN(E3_CreateVertexBuffer, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
-D7FN(E3_EnumZBufferFormats, DDERR_UNSUPPORTED, DWORD a, DWORD b, DWORD c)
+static HRESULT STDMETHODCALLTYPE E3_EnumZBufferFormats(void *self, const GUID *dev, void *cb, void *ctx) {
+    /* the game needs a z-buffer before it will continue; enumerate D16/D32 so
+       surface creation succeeds (depth is unused by the emulation) */
+    typedef HRESULT (STDMETHODCALLTYPE *PF_ZCB)(DDPIXELFORMAT *, void *);
+    DDPIXELFORMAT pfs[2];
+    unsigned i;
+    PF_ZCB f = (PF_ZCB)cb;
+    if (!f) return DDERR_INVALIDPARAMS;
+    memset(pfs, 0, sizeof(pfs));
+    for (i = 0; i < 2; i++) {
+        pfs[i].dwSize = sizeof(DDPIXELFORMAT);
+        pfs[i].dwFlags = DDPF_ZBUFFER;
+        pfs[i].dwZBufferBitDepth = i ? 32 : 16;
+        pfs[i].dwZBitMask = i ? 0xFFFFFFFFu : 0x0000FFFFu;
+    }
+    for (i = 0; i < 2; i++)
+        if (f(&pfs[i], ctx) != DDENUMRET_OK) break;
+    return DD_OK;
+}
 D7FN(E3_EvictManagedTextures, DD_OK)
 
 static void *g_d7D3DVt[8] = {
@@ -2084,6 +2277,8 @@ static void D7E_BindPrivateExports(HMODULE real) {
     SmdLog("Real ddraw: %d private export(s) bound", n);
 }
 
+typedef HRESULT (WINAPI *PF_DDCEx)(GUID*, LPVOID*, REFIID, IUnknown*);
+
 static void D7E_SaveFallbackAPI(void) {
     D7E_WriteConfigAPI("D3D9");
     g_D7E_ConfigCreated = 0;
@@ -2098,6 +2293,101 @@ static HRESULT D7E_CreateDD7(void **out) {
     SmdKeyLatInit();   
     SmdLog("D3D7 emu: using the built-in DirectDraw7/Direct3D7 -> Direct3D9 layer");
     return DD_OK;
+}
+
+/* Minimal Direct3D7 COM declarations for the deep probe (d3d.h cannot be
+   included here: its D3D7-era types collide with d3d9.h). IDirect3D7 vtable
+   slots: 0 QueryInterface, 1 AddRef, 2 Release, 3 EnumDevices,
+   4 CreateDevice; IDirect3DDevice7 Release is slot 2. */
+typedef struct SmdI3D7Vt SmdI3D7Vt;
+typedef struct SmdI3D7DevVt SmdI3D7DevVt;
+typedef struct { SmdI3D7Vt *vt; } SmdI3D7;
+typedef struct { SmdI3D7DevVt *vt; } SmdI3D7Dev;
+struct SmdI3D7Vt {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(SmdI3D7*, const GUID*, void**);
+    ULONG (STDMETHODCALLTYPE *AddRef)(SmdI3D7*);
+    ULONG (STDMETHODCALLTYPE *Release)(SmdI3D7*);
+    HRESULT (STDMETHODCALLTYPE *EnumDevices)(SmdI3D7*, void*, void*);
+    HRESULT (STDMETHODCALLTYPE *CreateDevice)(SmdI3D7*, const GUID*, IDirectDrawSurface7*, SmdI3D7Dev**);
+    void *CreateVertexBuffer;
+    void *EnumZBufferFormats;
+    void *EvictManagedTextures;
+};
+struct SmdI3D7DevVt {
+    void *QueryInterface;
+    void *AddRef;
+    ULONG (STDMETHODCALLTYPE *Release)(SmdI3D7Dev*);
+};
+
+/* Deep Direct3D7 probe: mirror the game's init pattern (create device, then
+   create a SECOND device on the same render-target surface) on a hidden
+   window. The QueryInterface probe alone can pass while the actual
+   IDirect3D7::CreateDevice fails at runtime (observed under Wine); catching
+   it here lets the game start on the built-in Direct3D9 emulation instead of
+   aborting mid-init. */
+static int D7E_DeepProbeD3D7(PF_DDCEx fn, REFIID riid) {
+    /* IID_IDirect3DHALDevice */
+    static const GUID k_HalDev = { 0x84E58DD7, 0x4B47, 0x11D1,
+        { 0x8C, 0xBE, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B } };
+    WNDCLASSA wc;
+    HWND w;
+    IDirectDraw7 *dd = NULL;
+    SmdI3D7 *d3d = NULL;
+    IDirectDrawSurface7 *bs = NULL;
+    SmdI3D7Dev *d1 = NULL, *d2 = NULL;
+    int ok = 0;
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "SmdD7Probe";
+    RegisterClassA(&wc);   /* ok to fail if already registered */
+    w = CreateWindowExA(0, "SmdD7Probe", "", WS_OVERLAPPED, 0, 0, 8, 8,
+                        NULL, NULL, wc.hInstance, NULL);
+    if (!w) return 0;
+    if (fn(NULL, (void**)&dd, (IID*)riid, NULL) >= 0 && dd) {
+        if (dd->lpVtbl->QueryInterface(dd, &k_D7_IID_D3D7, (void**)&d3d) >= 0 && d3d) {
+            /* mirror the game: primary surface + back buffer as the 3D target */
+            DDSURFACEDESC2 sd;
+            memset(&sd, 0, sizeof(sd));
+            sd.dwSize = sizeof(sd);
+            sd.dwFlags = DDSD_CAPS | DDSD_BACKBUFFERCOUNT;
+            sd.ddsCaps.dwCaps = DDSCAPS_PRIMARYSURFACE | DDSCAPS_3DDEVICE |
+                                DDSCAPS_COMPLEX | DDSCAPS_FLIP;
+            sd.dwBackBufferCount = 1;
+            if (IDirectDraw7_CreateSurface(dd, &sd, &bs, NULL) >= 0 && bs) {
+                DDSCAPS2 bc;
+                IDirectDrawSurface7 *back = NULL;
+                memset(&bc, 0, sizeof(bc));
+                bc.dwCaps = DDSCAPS_BACKBUFFER;
+                IDirectDrawSurface7_GetAttachedSurface(bs, &bc, &back);
+                if (back) {
+                    IDirectDrawSurface7_Release(bs);
+                    bs = back;
+                }
+                if (d3d->vt->CreateDevice(d3d, &k_HalDev, bs, &d1) >= 0 && d1) {
+                    if (d3d->vt->CreateDevice(d3d, &k_HalDev, bs, &d2) >= 0 && d2)
+                        ok = 1;
+                    else
+                        SmdLog("Deep probe: second IDirect3D7::CreateDevice failed");
+                } else {
+                    SmdLog("Deep probe: IDirect3D7::CreateDevice failed");
+                }
+            } else {
+                SmdLog("Deep probe: 3D render target surface creation failed");
+            }
+        } else {
+            SmdLog("Deep probe: IDirect3D7 QueryInterface failed");
+        }
+    } else {
+        SmdLog("Deep probe: DirectDrawCreateEx failed");
+    }
+    if (d2) d2->vt->Release(d2);
+    if (d1) d1->vt->Release(d1);
+    if (bs) IDirectDrawSurface7_Release(bs);
+    if (d3d) d3d->vt->Release(d3d);
+    if (dd) IDirectDraw7_Release(dd);
+    DestroyWindow(w);
+    return ok;
 }
 
 static HMODULE g_real = NULL;
@@ -2143,7 +2433,6 @@ static void LoadReal(void) {
 
 typedef HRESULT (WINAPI *PF_DDC)(GUID*, LPDIRECTDRAW*, IUnknown*);
 typedef HRESULT (WINAPI *PF_DDClip)(DWORD, LPDIRECTDRAWCLIPPER*, IUnknown*);
-typedef HRESULT (WINAPI *PF_DDCEx)(GUID*, LPVOID*, REFIID, IUnknown*);
 typedef HRESULT (WINAPI *PF_DDEnum)(LPDDENUMCALLBACKA, LPVOID);
 typedef HRESULT (WINAPI *PF_DDEnumEx)(LPDDENUMCALLBACKEXA, LPVOID, DWORD);
 typedef HRESULT (WINAPI *PF_FPOCH)(void);
@@ -2521,6 +2810,16 @@ static HRESULT WINAPI Hook_DirectDrawCreateEx(GUID *guid, LPVOID *out, REFIID ri
             return d3dHr;
         }
 ddraw_ready:
+    /* the D3D7 interface exists, but device creation may still fail at runtime
+       (seen under Wine): probe it for real before committing to it. Session
+       only - the user's raindrop.ini API choice is left untouched. */
+    if (!D7E_DeepProbeD3D7(fn, riid)) {
+        if (g_D7Emu) {
+            SmdLog("System Direct3D7 device probe failed; switching to Direct3D9 emulation");
+            IDirectDraw7_Release(orig);
+            return D7E_CreateDD7(out);
+        }
+    }
     IDirectDraw7 *wrapped = WrapDD7(orig);
     if (wrapped != orig) {
         SmdLog("DD7 wrapped ok");
