@@ -426,7 +426,7 @@ static void JoyDirectInputScan(void) {
     LARGE_INTEGER s0, s1, sfreq;
     unsigned seq;
 
-    if (g_di8 && now - g_diLastScan < (g_diCount && stableScans >= 3 ? 5000 : 1000)) return;
+    if (g_di8 && now - g_diLastScan < (stableScans >= 3 ? 5000 : 1000)) return;
     g_diLastScan = now;
     seq = ++scanSeq;
     QueryPerformanceCounter(&s0);

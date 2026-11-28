@@ -2213,7 +2213,7 @@ static int D7E_ConfigVsync(UINT refresh) {
 }
 
 int SmdD3D9GetVsync(void) {
-    return g_d7Vsync;
+    return (g_d7.active && g_d7Vsync) ? 1 : 0;
 }
 
 static int D7E_ConfigD3D9(void) {

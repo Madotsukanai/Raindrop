@@ -6281,7 +6281,14 @@ static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
         }
     }
 
-    g_ftNextTick.QuadPart += targetCounts;
+    if (now.QuadPart >= g_ftNextTick.QuadPart) {
+        /* When frame processing ran late, schedule the next frame 1 frame interval from now
+           instead of carrying the debt forward, preventing frame-drop cascades and stutter. */
+        g_ftNextTick.QuadPart = now.QuadPart + targetCounts;
+    } else {
+        /* Advance next target tick by exactly 1 frame interval (preserves 60.0 Hz phase) */
+        g_ftNextTick.QuadPart += targetCounts;
+    }
 
     TitleCancelFrameTick();
     SmdControllerPoll();
@@ -6295,7 +6302,7 @@ static unsigned __attribute__((fastcall)) FrameTimerHook(int *ctx) {
         ((unsigned char*)ctx)[0x109] = 1; 
 
         if (idx >= 0 && idx < 60) {
-            ctx[5 + idx] = (int)((double)now.QuadPart * 1800000.0 / (double)g_ftFreq.QuadPart);
+            ctx[5 + idx] = (int)(DWORD)((uint64_t)now.QuadPart * 1800000ULL / (uint64_t)g_ftFreq.QuadPart);
             idx = (idx + 1) % 60;
             ctx[65] = idx;
             if (idx == 0) ((unsigned char*)ctx)[0x10a] = 1;
