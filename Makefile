@@ -5,7 +5,6 @@ VERSION := $(shell tr -d '\r\n' < VERSION)
 VERSION_SOURCES := src/Smd/Smd.c src/RefRain.c
 VERSION_STAMP := $(BUILD)/.version
 
-# Keep the VERSION macro in the sources in sync with the VERSION file.
 $(VERSION_STAMP): VERSION | $(BUILD)
 	@for f in $(VERSION_SOURCES); do \
 	  sed -i 's|^#define VERSION .*|#define VERSION "$(VERSION)"|' $$f; \
@@ -20,13 +19,8 @@ LDFLAGS = -shared -static-libgcc -s -Wl,--kill-at
 
 all: refrain smd
 
-# make debug : every debug build (logging enabled) -> build/debug/d3d9.dll and build/debug/ddraw.dll
 debug: refrain-debug smd-debug
 
-# make refrain : src/RefRain.c -> build/d3d9.dll
-# Standalone deployment: place d3d9.dll beside RefRain.exe.  Windows loads
-# it in preference to the system DLL, and it forwards Direct3DCreate9 to the
-# real system d3d9.dll after installing this mod's hooks.
 refrain: $(BUILD)/d3d9.dll
 
 $(BUILD)/d3d9.dll: $(BUILD)/RefRain.o
